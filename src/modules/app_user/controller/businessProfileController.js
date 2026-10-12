@@ -693,8 +693,23 @@ export const selectBusinessProfile = async (req, res) => {
  * "continue despite non-fatal failure" pattern used by syncBusinessProfileData's
  * own metadata-update step.
  */
-async function runReviewsAndMetadataSync(googleConnection, userId, projectId, accountId, locationId) {
-  const result = { metadataSynced: false, detailsSynced: false, reviewsCapability: null, reviewCount: 0, mediaCapability: null, mediaCount: 0, postsCapability: null, postCount: 0, error: null };
+// One sync per project at a time (the backend runs as a single process). Two
+// overlapping syncs would interleave upserts and stale-marking: the older run's
+// writes carry an older last_seen_at, so the newer run's markStaleAsDeleted
+// could hide live reviews. A second caller simply shares the run in flight.
+const reviewSyncsInFlight = new Map();
+function runReviewsAndMetadataSync(googleConnection, userId, projectId, accountId, locationId) {
+  const key = String(projectId);
+  const running = reviewSyncsInFlight.get(key);
+  if (running) return running;
+  const run = runReviewsAndMetadataSyncOnce(googleConnection, userId, projectId, accountId, locationId)
+    .finally(() => reviewSyncsInFlight.delete(key));
+  reviewSyncsInFlight.set(key, run);
+  return run;
+}
+
+async function runReviewsAndMetadataSyncOnce(googleConnection, userId, projectId, accountId, locationId) {
+  const result = { metadataSynced: false, detailsSynced: false, reviewsCapability: null, reviewCount: 0, reviewsComplete: null, reviewsMissing: null, mediaCapability: null, mediaCount: 0, postsCapability: null, postCount: 0, error: null };
 
   try {
     const metadata = await fetchBusinessMetadata(googleConnection, locationId);
@@ -792,11 +807,56 @@ async function runReviewsAndMetadataSync(googleConnection, userId, projectId, ac
     });
   } else {
     try {
-      const { reviews, averageRating, totalReviewCount } = await fetchAllReviews(googleConnection, accountId, locationId);
+      const fetched = await fetchAllReviews(googleConnection, accountId, locationId);
+      const { reviews, averageRating, totalReviewCount, complete, missingCount } = fetched;
       const syncedAt = new Date();
 
-      await BusinessProfileReview.bulkUpsertReviews(reviews, userId, projectId, accountId, locationId, syncedAt);
-      const deletedCount = await BusinessProfileReview.markStaleAsDeleted(projectId, syncedAt);
+      const write = await BusinessProfileReview.bulkUpsertReviews(reviews, userId, projectId, accountId, locationId, syncedAt);
+      // "Not returned this time" only means "removed by the reviewer" when we
+      // saw everything Google says exists. After an incomplete fetch (fewer
+      // distinct reviews than Google's own total, or the page ceiling was hit)
+      // an unseen review may simply have been missed, so nothing is hidden -
+      // the next complete sync reconciles deletions.
+      const notReturnedThisSync = await BusinessProfileReview.countDocuments({
+        project_id: projectId, business_location_id: locationId, is_deleted: false, last_seen_at: { $lt: syncedAt }
+      });
+      const deletedCount = complete
+        ? await BusinessProfileReview.markStaleAsDeleted(projectId, syncedAt)
+        : 0;
+      result.reviewsComplete = complete;
+      result.reviewsMissing = missingCount;
+
+      // One line that says where every review went (counts only - no tokens, no
+      // review text, no ids). `storedLive` uses the SAME filter as the Insights
+      // aggregation, so it is exactly the number the dashboard counts.
+      const [storedLive, storedSoftDeleted, liveInOtherLocations] = await Promise.all([
+        BusinessProfileReview.countDocuments({ project_id: projectId, business_location_id: locationId, is_deleted: false }),
+        BusinessProfileReview.countDocuments({ project_id: projectId, business_location_id: locationId, is_deleted: true }),
+        BusinessProfileReview.countDocuments({ project_id: projectId, business_location_id: { $ne: locationId }, is_deleted: false })
+      ]);
+      result.reviewsReconciliation = {
+        googleReportedTotal: totalReviewCount,
+        fetchedRecords: fetched.rawFetched,
+        fetchedUniqueIds: fetched.uniqueFetched,
+        duplicatesWithinPass: fetched.duplicatesWithinPass,
+        skippedWithoutId: fetched.skippedWithoutId,
+        recoveryPassUsed: fetched.retried,
+        pageCeilingHit: fetched.truncated,
+        writeAttempted: write.attempted,
+        writeInserted: write.upserted,
+        writeUpdated: write.modified,
+        storedLive,
+        storedSoftDeleted,
+        liveInOtherLocations,
+        notReturnedThisSync,
+        markedDeletedThisSync: deletedCount,
+        // storedLive - googleReportedTotal: 0 means Odito shows exactly what Google reports
+        differenceVsGoogle: typeof totalReviewCount === 'number' ? storedLive - totalReviewCount : null
+      };
+      LoggerUtil.info('Reviews sync reconciliation', { projectId, locationId, ...result.reviewsReconciliation });
+      if (!complete) {
+        LoggerUtil.warn('Reviews fetch incomplete - deletions not applied this sync', { projectId, fetched: reviews.length, googleTotal: totalReviewCount, missingCount });
+      }
 
       await BusinessProfileMetadata.upsertForProject(projectId, userId, {
         business_account_id: accountId,
@@ -871,6 +931,19 @@ async function runReviewsAndMetadataSync(googleConnection, userId, projectId, ac
 }
 
 /**
+ * The location this user's Business Profile connection for the project is on,
+ * or null when none is selected (callers then keep the previous, project-wide
+ * behaviour). Always read from the stored connection, never from the client.
+ */
+async function resolveConnectedLocationId(userId, projectId) {
+  const connection = await GoogleConnection
+    .findOne({ user_id: userId, project_id: projectId, purpose: 'business_profile' })
+    .select('business_location_id')
+    .lean();
+  return connection?.business_location_id || null;
+}
+
+/**
  * GET /projects/:projectId/business-profile/rating
  *
  * Returns the average rating / review count summary, or an explicit
@@ -902,16 +975,23 @@ export const getBusinessProfileRatingController = async (req, res) => {
 
     // Distribution / replied count come from the locally synced reviews
     // (Google only exposes the average + total), used by the Reviews page.
-    const stats = await BusinessProfileReview.getStats(projectId);
+    const locationId = await resolveConnectedLocationId(userId, projectId);
+    const stats = await BusinessProfileReview.getStats(projectId, locationId);
 
     return res.json(ResponseUtil.success({
       available: true,
       status: 'available',
       reason: null,
+      // Google's own figures at the last sync. NOT the same population as the
+      // counts below, which are the reviews stored in Odito (what the list and
+      // the Insights page both show) - compare the two to see a lagging sync.
       averageRating: metadata.average_rating,
       totalReviewCount: metadata.total_review_count,
       lastSyncedAt: metadata.reviews_last_synced_at,
+      // Stored, non-deleted reviews of the connected location. This is the
+      // list's "Total Reviews" and equals the Insights lifetime total.
       syncedReviewCount: stats.count,
+      unratedCount: stats.unrated,
       repliedCount: stats.repliedCount,
       distribution: stats.distribution
     }));
@@ -961,7 +1041,8 @@ export const getBusinessProfileReviewsController = async (req, res) => {
       }));
     }
 
-    const result = await BusinessProfileReview.getPaginated(projectId, { page, limit, search, rating, replied, sort });
+    const locationId = await resolveConnectedLocationId(userId, projectId);
+    const result = await BusinessProfileReview.getPaginated(projectId, { page, limit, search, rating, replied, sort, locationId });
 
     return res.json(ResponseUtil.success({
       available: true,

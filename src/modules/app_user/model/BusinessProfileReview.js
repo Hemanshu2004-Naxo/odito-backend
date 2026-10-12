@@ -107,7 +107,7 @@ businessProfileReviewSchema.index(
  * @param {Array} reviews - normalized review objects (see businessProfileReviewService.js)
  */
 businessProfileReviewSchema.statics.bulkUpsertReviews = async function(reviews, userId, projectId, accountId, locationId, syncedAt) {
-  if (!reviews.length) return { upserted: 0, modified: 0 };
+  if (!reviews.length) return { upserted: 0, modified: 0, matched: 0, attempted: 0 };
 
   const bulkOps = reviews.map(r => ({
     updateOne: {
@@ -135,7 +135,7 @@ businessProfileReviewSchema.statics.bulkUpsertReviews = async function(reviews, 
   }));
 
   const result = await this.bulkWrite(bulkOps, { ordered: false });
-  return { upserted: result.upsertedCount, modified: result.modifiedCount };
+  return { upserted: result.upsertedCount, modified: result.modifiedCount, matched: result.matchedCount, attempted: bulkOps.length };
 };
 
 /**
@@ -168,8 +168,9 @@ const REVIEW_SORTS = {
  *  - sort:    newest | oldest | highest | lowest. With an active search and no
  *             explicit sort, results stay ranked by text relevance.
  */
-businessProfileReviewSchema.statics.getPaginated = async function(projectId, { page = 1, limit = 20, search = '', rating, replied, sort } = {}) {
+businessProfileReviewSchema.statics.getPaginated = async function(projectId, { page = 1, limit = 20, search = '', rating, replied, sort, locationId = null } = {}) {
   const query = { project_id: projectId, is_deleted: false };
+  if (locationId) query.business_location_id = locationId; // same population as stats + analytics
   const hasSearch = !!(search && search.trim());
   if (hasSearch) {
     query.$text = { $search: search.trim() };
@@ -213,11 +214,16 @@ businessProfileReviewSchema.statics.getPaginated = async function(projectId, { p
  * (which are stored directly on BusinessProfileMetadata), and reusable by a
  * future trend graph feature.
  */
-businessProfileReviewSchema.statics.getStats = async function(projectId) {
+businessProfileReviewSchema.statics.getStats = async function(projectId, locationId = null) {
+  // Same population as the Insights analytics (project + connected location,
+  // not deleted). `locationId` is optional only so older callers keep working.
+  const match = { project_id: new mongoose.Types.ObjectId(String(projectId)), is_deleted: false };
+  if (locationId) match.business_location_id = locationId;
+
   // Grouped by star rating (max 5 buckets) instead of pushing every rating
   // into an array, so cost doesn't grow with the review count.
   const groups = await this.aggregate([
-    { $match: { project_id: new mongoose.Types.ObjectId(projectId), is_deleted: false } },
+    { $match: match },
     {
       $group: {
         _id: '$star_rating',
@@ -228,20 +234,23 @@ businessProfileReviewSchema.statics.getStats = async function(projectId) {
   ]);
 
   const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-  let count = 0;
+  let count = 0;     // EVERY stored review - the same total the Insights page shows
+  let rated = 0;     // reviews with a 1-5 rating: the denominator of the average
   let ratingSum = 0;
   let repliedCount = 0;
   for (const g of groups) {
-    if (!distribution.hasOwnProperty(g._id)) continue;
-    distribution[g._id] = g.count;
     count += g.count;
-    ratingSum += g._id * g.count;
     repliedCount += g.replied;
+    if (!Object.prototype.hasOwnProperty.call(distribution, g._id)) continue; // unrated: counted, never averaged
+    distribution[g._id] = g.count;
+    rated += g.count;
+    ratingSum += g._id * g.count;
   }
 
   return {
     count,
-    avgRating: count ? Math.round((ratingSum / count) * 10) / 10 : 0,
+    unrated: count - rated,
+    avgRating: rated ? Math.round((ratingSum / rated) * 10) / 10 : 0,
     distribution,
     repliedCount
   };

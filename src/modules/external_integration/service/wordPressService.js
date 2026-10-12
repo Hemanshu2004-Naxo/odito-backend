@@ -64,11 +64,81 @@ const SEO_PROVIDER_REST_NAMESPACES = {
 };
 
 export class WordPressConnectionError extends Error {
-  constructor(code, message, statusCode = 502) {
+  constructor(code, message, statusCode = 502, wpCode = null) {
     super(message);
     this.name = 'WordPressConnectionError';
     this.code = code;
     this.statusCode = statusCode;
+    // WordPress's own REST error code (e.g. "incorrect_password"), already
+    // sanitized by extractWpErrorCode() — safe to log and to show.
+    this.wpCode = wpCode;
+  }
+}
+
+/**
+ * The WordPress REST error `code` from a response body ("rest_not_logged_in",
+ * "incorrect_password", "invalid_username", ...) — only ever a short
+ * [a-z0-9_-] token, so nothing attacker- or credential-shaped can pass
+ * through it. Null when the body isn't a WP_Error JSON object.
+ */
+function extractWpErrorCode(response) {
+  const code = response?.data?.code;
+  if (typeof code !== 'string') return null;
+  return /^[a-z0-9_-]{1,64}$/i.test(code) ? code : null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TEMPORARY per-domain diagnostics. Active only for hostnames listed in
+//  WP_DIAGNOSTIC_HOSTS (comma-separated; default: krishnaeyecentre.com) —
+//  every other site logs nothing. Logs ONLY: step, requested/final URL
+//  (origin+path, never query or userinfo), status, redirect target
+//  (origin+path), WordPress error code + a tag-stripped/truncated message,
+//  and a boolean for "Authorization header attached". Never the header, the
+//  Base64 token, the username, the password, or cookies. Remove once the
+//  krishnaeyecentre.com investigation is closed.
+// ═══════════════════════════════════════════════════════════════════════
+function diagnosticHosts() {
+  return (process.env.WP_DIAGNOSTIC_HOSTS ?? 'krishnaeyecentre.com')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function safeUrlForLog(raw) {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`; // drops userinfo, query and hash
+  } catch {
+    return null;
+  }
+}
+
+function logWordPressDiagnostic(step, requestedUrl, { response, error, authAttached = false } = {}) {
+  try {
+    const safeRequested = safeUrlForLog(requestedUrl);
+    if (!safeRequested) return;
+    const host = new URL(safeRequested).hostname.toLowerCase().replace(/^www\./, '');
+    if (!diagnosticHosts().includes(host)) return;
+
+    const location = response?.headers?.location;
+    const message = typeof response?.data?.message === 'string'
+      ? response.data.message.replace(/<[^>]*>/g, '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 200)
+      : null;
+    console.log('[WORDPRESS-DIAG]', JSON.stringify({
+      step,
+      requestedUrl: safeRequested,
+      finalUrl: safeUrlForLog(response?.request?.res?.responseUrl) || safeRequested,
+      status: response?.status ?? null,
+      networkError: error?.code || null,
+      redirectTo: location ? safeUrlForLog(new URL(location, safeRequested).href) : null,
+      wpErrorCode: extractWpErrorCode(response),
+      wpErrorMessage: message,
+      authorizationAttached: Boolean(authAttached),
+      wwwAuthenticatePresent: Boolean(response?.headers?.['www-authenticate']),
+      server: String(response?.headers?.server || '').slice(0, 40) || null,
+    }));
+  } catch {
+    // diagnostics must never affect the real request
   }
 }
 
@@ -89,7 +159,7 @@ function wpApiUrl(siteUrl, path) {
  * includes credentials, raw Authorization headers, or stack traces in the
  * resulting message — only what's safe to show a user.
  */
-function classifyError(error) {
+function classifyError(error, { authAttached = false } = {}) {
   if (error instanceof WordPressConnectionError) return error;
 
   if (error.code === 'ECONNABORTED') {
@@ -103,11 +173,28 @@ function classifyError(error) {
   }
 
   const status = error.response?.status;
+  const wpCode = extractWpErrorCode(error.response);
   if (status === 401) {
-    return new WordPressConnectionError('INVALID_CREDENTIALS', 'Invalid WordPress username or Application Password.', 401);
+    // A real credential mismatch is answered by WordPress itself with
+    // `incorrect_password` / `invalid_username`. `rest_not_logged_in` to a
+    // request that DID carry an Authorization header means WordPress never
+    // evaluated those credentials at all (header stripped by the web server /
+    // CDN / firewall, or Application Passwords blocked) — telling the user
+    // their password is wrong in that case is wrong and unfixable by them.
+    if (authAttached && wpCode === 'rest_not_logged_in') {
+      return new WordPressConnectionError(
+        'AUTH_NOT_RECEIVED',
+        'The site answered "not logged in" even though Odito sent the Application Password, so WordPress did not evaluate it. ' +
+          'This usually means the server, CDN or a security plugin is dropping the Authorization header, or Application Passwords are blocked. ' +
+          'The credentials themselves have not been judged invalid.',
+        401,
+        wpCode
+      );
+    }
+    return new WordPressConnectionError('INVALID_CREDENTIALS', 'Invalid WordPress username or Application Password.', 401, wpCode);
   }
   if (status === 403) {
-    return new WordPressConnectionError('INSUFFICIENT_PERMISSIONS', 'This WordPress account does not have permission to complete this action.', 403);
+    return new WordPressConnectionError('INSUFFICIENT_PERMISSIONS', 'This WordPress account does not have permission to complete this action.', 403, wpCode);
   }
   if (status === 404) {
     return new WordPressConnectionError('REST_API_DISABLED', 'The WordPress REST API could not be found at this URL.', 422);
@@ -177,16 +264,19 @@ function classifyWriteError(error) {
  */
 async function checkWordPressRoot(siteUrl) {
   let response;
+  const url = wpApiUrl(siteUrl, '/wp-json/');
   try {
-    response = await axios.get(wpApiUrl(siteUrl, '/wp-json/'), {
+    response = await axios.get(url, {
       timeout: WP_ROOT_TIMEOUT_MS,
       maxRedirects: 0,
       validateStatus: () => true,
     });
   } catch (error) {
+    logWordPressDiagnostic('root-check', url, { error });
     throw classifyError(error);
   }
 
+  logWordPressDiagnostic('root-check', url, { response });
   if (response.status !== 200) {
     throw classifyError({ response });
   }
@@ -259,19 +349,22 @@ function detectSeoProvider({ pluginSummary, namespaces }) {
  */
 async function verifyCredentials(siteUrl, username, applicationPassword) {
   let response;
+  const url = wpApiUrl(siteUrl, '/wp-json/wp/v2/users/me');
   try {
-    response = await axios.get(wpApiUrl(siteUrl, '/wp-json/wp/v2/users/me'), {
+    response = await axios.get(url, {
       timeout: WP_AUTH_TIMEOUT_MS,
       maxRedirects: 0,
       validateStatus: () => true,
       headers: { Authorization: buildAuthHeader(username, applicationPassword) },
     });
   } catch (error) {
+    logWordPressDiagnostic('verify-credentials', url, { error, authAttached: true });
     throw classifyError(error);
   }
 
+  logWordPressDiagnostic('verify-credentials', url, { response, authAttached: true });
   if (response.status !== 200) {
-    throw classifyError({ response });
+    throw classifyError({ response }, { authAttached: true });
   }
 
   return { wpUserId: response.data?.id ?? null };

@@ -140,11 +140,22 @@ export function sumRows(rows) {
 export const pct = (n, d) => (d > 0 ? Math.round((n / d) * 10000) / 100 : 0);
 const avg = (sum, n) => (n > 0 ? Math.round((sum / n) * 100) / 100 : null);
 
+/**
+ * Reviews that carry a 1-5 star rating. Every rating metric (average, bucket
+ * percentages) uses THIS as its denominator, never `total`: a stored review
+ * without a usable rating still counts in `total` but has no bucket and no
+ * star value, so dividing by `total` would understate the average and make the
+ * bucket percentages sum to less than 100. With complete data rated === total
+ * and nothing changes. `total - rated` is reported as `unrated`.
+ */
+export const ratedCount = (row) => (row.r1 || 0) + (row.r2 || 0) + (row.r3 || 0) + (row.r4 || 0) + (row.r5 || 0);
+
 function ratingBreakdown(row) {
+  const rated = ratedCount(row);
   return [5, 4, 3, 2, 1].map((stars) => ({
     stars,
     count: row[`r${stars}`],
-    percent: pct(row[`r${stars}`], row.total),
+    percent: pct(row[`r${stars}`], rated),
   }));
 }
 
@@ -183,7 +194,7 @@ export function summarizeRow(row) {
   const r = { ...EMPTY_ROW, ...(row || {}) };
   return {
     totalReviews: r.total,
-    averageRating: avg(r.ratingSum, r.total),
+    averageRating: avg(r.ratingSum, ratedCount(r)),
     ratingDistribution: { one: r.r1, two: r.r2, three: r.r3, four: r.r4, five: r.r5 },
     withText: r.withText,
     withoutText: r.total - r.withText,
@@ -237,13 +248,13 @@ export function buildAnalytics({ range, lifetime, daily, recent, google, now = n
     overview: {
       lifetime: {
         totalReviews: life.total,
-        averageRating: avg(life.ratingSum, life.total),
+        averageRating: avg(life.ratingSum, ratedCount(life)),
         withText: life.withText,
         withoutText: life.total - life.withText,
       },
       period: {
         totalReviews: period.total,
-        averageRating: avg(period.ratingSum, period.total),
+        averageRating: avg(period.ratingSum, ratedCount(period)),
         withText: period.withText,
         withoutText: period.total - period.withText,
       },
@@ -258,6 +269,9 @@ export function buildAnalytics({ range, lifetime, daily, recent, google, now = n
     ratings: {
       period: ratingBreakdown(period),
       lifetime: ratingBreakdown(life),
+      // Reviews counted in the totals but without a 1-5 rating (excluded from
+      // the buckets, the percentages and the averages). 0 for complete data.
+      unrated: { period: period.total - ratedCount(period), lifetime: life.total - ratedCount(life) },
       // Per-bucket star counts (stacked rating chart). Same daily rows as everything
       // else, so bucket sums always equal `period`.
       series: bucketRows.map(([bucket, r]) => ({ bucket, one: r.r1, two: r.r2, three: r.r3, four: r.r4, five: r.r5 })),
@@ -266,7 +280,7 @@ export function buildAnalytics({ range, lifetime, daily, recent, google, now = n
     trends: bucketRows.map(([bucket, r]) => ({
       bucket,
       reviewCount: r.total,
-      averageRating: avg(r.ratingSum, r.total), // null for empty buckets - no invented values
+      averageRating: avg(r.ratingSum, ratedCount(r)), // null for empty buckets - no invented values
     })),
 
     glance: {

@@ -30,6 +30,10 @@ function handleError(res, error, fallbackMessage) {
       success: false,
       message: error.message,
       code: error.code,
+      // WordPress's own sanitized REST error code, when it sent one
+      // (e.g. "incorrect_password") — lets support tell a wrong credential
+      // from a stripped Authorization header. Never credential material.
+      ...(error.wpCode ? { wpCode: error.wpCode } : {}),
     });
   }
 

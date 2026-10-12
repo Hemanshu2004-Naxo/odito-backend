@@ -165,24 +165,35 @@ export async function fetchBusinessMetadata(googleConnection, locationId) {
  * plus Google's own averageRating/totalReviewCount from the response root
  * (the only place this data exists - see module docstring).
  *
- * Throws on the FIRST page's failure (caller should have already checked
- * checkReviewsCapability() and can classify the error the same way); a
- * failure on a LATER page during pagination stops the fetch but still
- * returns everything gathered so far, since a partial sync is more useful
- * than discarding already-fetched reviews.
+ * Any page failure (after withRetry) THROWS and nothing is returned - the
+ * caller then stores nothing and deletes nothing, so a failed or partial
+ * fetch can never be mistaken for "these reviews were removed".
+ *
+ * Completeness (this is what keeps the stored count honest against Google's
+ * `totalReviewCount`):
+ *  - Reviews are de-duplicated by id. The list is ordered by updateTime, so a
+ *    review edited or added WHILE we page can shift into a page we already read
+ *    (a duplicate) or out of the page we are about to read (a miss).
+ *  - If fewer distinct reviews than Google's own total came back, ONE more
+ *    full pass is made and the two passes are merged by id, which recovers
+ *    reviews that slipped between pages.
+ *  - `complete` is false when a shortfall remains or the page ceiling was hit.
+ *    The caller must not treat unseen reviews as deleted in that case.
  */
-export async function fetchAllReviews(googleConnection, accountId, locationId) {
-  const client = await getAuthenticatedHttpClient(googleConnection, GBP_LEGACY_API);
+const MAX_REVIEW_PAGES = 200; // hard ceiling (10,000 reviews) - protects against a pageToken loop bug on Google's side
 
-  let allReviews = [];
+async function fetchReviewPass(client, accountId, locationId) {
+  const byId = new Map();
   let pageToken = undefined;
   let averageRating = null;
   let totalReviewCount = null;
-  let page = 0;
-  const MAX_PAGES = 200; // hard ceiling (10,000 reviews) - protects against a pageToken loop bug on Google's side
+  let pages = 0;
+  let skipped = 0;
+  let raw = 0;
+  let duplicates = 0;
 
   do {
-    page++;
+    pages++;
     const response = await withRetry(() =>
       client.get(`accounts/${accountId}/locations/${locationId}/reviews`, {
         params: {
@@ -197,13 +208,67 @@ export async function fetchAllReviews(googleConnection, accountId, locationId) {
     if (typeof data.averageRating === 'number') averageRating = data.averageRating;
     if (typeof data.totalReviewCount === 'number') totalReviewCount = data.totalReviewCount;
 
-    const normalized = (data.reviews || []).map(r => normalizeReview(r));
-    allReviews = allReviews.concat(normalized);
+    for (const item of data.reviews || []) {
+      raw++;
+      const review = normalizeReview(item);
+      if (!review.google_review_id) { skipped++; continue; } // cannot be keyed -> cannot be stored
+      if (byId.has(review.google_review_id)) duplicates++;
+      byId.set(review.google_review_id, review);
+    }
 
     pageToken = data.nextPageToken || undefined;
-  } while (pageToken && page < MAX_PAGES);
+  } while (pageToken && pages < MAX_REVIEW_PAGES);
 
-  return { reviews: allReviews, averageRating, totalReviewCount, pagesFetched: page };
+  return { byId, averageRating, totalReviewCount, pages, skipped, raw, duplicates, truncated: !!pageToken };
+}
+
+export async function fetchAllReviews(googleConnection, accountId, locationId, { client: providedClient } = {}) {
+  // `client` exists only for read-only diagnostics that must not go through the
+  // shared token manager (a failed refresh there can flip a connection to `expired`).
+  const client = providedClient || await getAuthenticatedHttpClient(googleConnection, GBP_LEGACY_API);
+
+  const first = await fetchReviewPass(client, accountId, locationId);
+  let merged = first.byId;
+  let { averageRating, totalReviewCount } = first;
+  let pagesFetched = first.pages;
+  let truncated = first.truncated;
+  let retried = false;
+  let rawFetched = first.raw;
+  let duplicatesWithinPass = first.duplicates;
+  let skippedWithoutId = first.skipped;
+
+  const short = () => typeof totalReviewCount === 'number' && merged.size < totalReviewCount;
+  if (short() && !truncated) {
+    retried = true;
+    const second = await fetchReviewPass(client, accountId, locationId);
+    merged = new Map([...merged, ...second.byId]); // later pass wins: it is the fresher copy
+    pagesFetched += second.pages;
+    rawFetched += second.raw;
+    // Same records are seen again on a second pass, so report the worse single pass, not a sum.
+    duplicatesWithinPass = Math.max(duplicatesWithinPass, second.duplicates);
+    skippedWithoutId = Math.max(skippedWithoutId, second.skipped);
+    truncated = second.truncated;
+    if (typeof second.averageRating === 'number') averageRating = second.averageRating;
+    if (typeof second.totalReviewCount === 'number') totalReviewCount = second.totalReviewCount;
+  }
+
+  const missingCount = typeof totalReviewCount === 'number' ? Math.max(0, totalReviewCount - merged.size) : 0;
+  return {
+    reviews: [...merged.values()],
+    averageRating,
+    totalReviewCount,
+    pagesFetched,
+    // Authoritative for "did we see everything Google says exists".
+    complete: !truncated && missingCount === 0,
+    missingCount,
+    truncated,
+    retried,
+    // Counts for the sync reconciliation log (see the sync in businessProfileController):
+    rawFetched,                  // review records Google returned across every page and pass
+    uniqueFetched: merged.size,  // distinct review ids among them
+    duplicatesWithinPass,        // the same id returned twice inside ONE pass (page shift); worst single pass
+    skippedWithoutId             // records with no usable id (cannot be stored)
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -336,7 +401,13 @@ function normalizeReview(googleReview) {
     reviewer_is_anonymous: !!googleReview.reviewer?.isAnonymous,
     star_rating: STAR_RATING_MAP[googleReview.starRating] || null,
     comment: googleReview.comment || '',
-    review_create_time: googleReview.createTime ? new Date(googleReview.createTime) : new Date(),
+    // A review's age decides which period it falls in. Google always sends
+    // createTime; if it is ever missing, the review's own updateTime is a
+    // truthful bound - "now" (the sync time) would invent a brand-new review
+    // and inflate the 7D / 30D counts on every sync.
+    review_create_time: googleReview.createTime
+      ? new Date(googleReview.createTime)
+      : (googleReview.updateTime ? new Date(googleReview.updateTime) : new Date()),
     review_update_time: googleReview.updateTime ? new Date(googleReview.updateTime) : new Date(),
     reply: googleReview.reviewReply ? {
       comment: googleReview.reviewReply.comment || null,
