@@ -3,6 +3,7 @@ import {
   getInstanceId, reconcileUnknownPublication, applyNotPublished, quarantineUnknown,
 } from './publicationLifecycle.js';
 import { getPublishConfig } from './socialPublishConfig.js';
+import { activeProjectScope } from './projectLifecycleGuard.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 
 /**
@@ -37,11 +38,16 @@ const MAX_PER_SWEEP = 50;
  * ops/"run now" call — and tests sharing one database across parallel
  * processes — can act on a single project without touching anyone else's rows.
  */
-const scopeFor = (projectId) => (projectId ? { project_id: projectId } : {});
+/**
+ * The project part of every sweep's filter: the requested project, or every project EXCEPT those in the trash - a trashed
+ * project's posts are neither recovered, reconciled against Meta nor marked missed (a restore finds them as they were).
+ * See projectLifecycleGuard.js.
+ */
+const scopeFor = (projectId) => activeProjectScope(projectId);
 
-function staleFilter(staleBefore, projectId) {
+function staleFilter(staleBefore, scope) {
   return {
-    ...scopeFor(projectId),
+    ...scope,
     status: 'publishing',
     $or: [
       { publishingStartedAt: { $lt: staleBefore } },
@@ -54,7 +60,7 @@ function staleFilter(staleBefore, projectId) {
 
 export async function recoverStalePublications({ now = new Date(), config = getPublishConfig(), projectId = null } = {}) {
   const staleBefore = new Date(now.getTime() - config.staleMs);
-  const filter = staleFilter(staleBefore, projectId);
+  const filter = staleFilter(staleBefore, await scopeFor(projectId));
   const candidates = await SocialPublication.find(filter).sort({ publishingStartedAt: 1 }).limit(MAX_PER_SWEEP);
 
   const summary = { found: candidates.length, recovered: 0, published: 0, requeued: 0, quarantined: 0, skipped: 0 };
@@ -103,7 +109,7 @@ export async function reconcileUnknownOutcomes({ now = new Date(), config = getP
   const settledBefore = new Date(now.getTime() - config.reconcileSettleMs);
   const giveUpBefore = new Date(now.getTime() - config.reconcileGiveUpMs);
   const filter = {
-    ...scopeFor(projectId),
+    ...(await scopeFor(projectId)),
     status: 'failed',
     outcomeUnknown: true,
     lastAttemptAt: { $lte: settledBefore, $gte: giveUpBefore },
@@ -155,7 +161,7 @@ export async function markMissedPublications({ now = new Date(), config = getPub
   const minutes = Math.round(config.maxLatenessMs / 60000);
   const res = await SocialPublication.updateMany(
     {
-      ...scopeFor(projectId),
+      ...(await scopeFor(projectId)),
       status: 'scheduled',
       $or: [
         { nextRetryAt: null, scheduledAt: { $lt: cutoff } },

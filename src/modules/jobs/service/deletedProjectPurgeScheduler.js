@@ -1,6 +1,7 @@
 import { schedule } from 'node-cron';
 import SeoProject from '../../app_user/model/SeoProject.js';
 import { deleteProjectCascade } from '../../app_user/service/projectCascadeDeleteService.js';
+import { purgeOrphanedSocialData } from '../../social_meta/service/socialProjectCleanupService.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 
 const SERVICE = 'DeletedProjectPurgeScheduler';
@@ -73,6 +74,14 @@ export async function runOnce() {
       summary.failedProjects.push({ projectId, error: error.message });
       LoggerUtil.error(`${SERVICE}: purge failed`, error, { projectId });
     }
+  }
+
+  // Social rows (stored credentials, scheduled posts) whose project is already gone - left behind by purges that predate
+  // purgeProjectSocialData. Never aborts the run.
+  try {
+    summary.orphanedSocial = await purgeOrphanedSocialData();
+  } catch (error) {
+    LoggerUtil.error(`${SERVICE}: orphaned social data sweep failed`, error);
   }
 
   LoggerUtil.service(SERVICE, 'run', 'completed', {

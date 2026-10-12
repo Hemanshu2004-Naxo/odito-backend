@@ -1,4 +1,6 @@
-import { searchBusinesses } from '../../../services/googlePlacesService.js';
+import { randomUUID } from 'node:crypto';
+import { searchBusinesses, PlacesError, PLACES_ERROR } from '../../../services/googlePlacesService.js';
+import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 import { rankBusinessResults, hasGoodResults } from '../../../services/businessRankingService.js';
 import { extractBusinessData } from '../../../services/websiteExtractionService.js';
 
@@ -9,33 +11,71 @@ import { extractBusinessData } from '../../../services/websiteExtractionService.
  * Integrates Google Places API with ranking algorithm
  */
 
+// PlacesError code -> [HTTP status, legacy `error` key, end-user message].
+// `code` (the PlacesError code) is what the onboarding UI branches on; the
+// legacy `error` key is kept so existing consumers keep working. Messages never
+// contain keys, project ids or upstream text - that stays in the server log
+// line googlePlacesService writes.
+const SEARCH_ERROR_RESPONSES = {
+  [PLACES_ERROR.NOT_CONFIGURED]:   [503, 'API_CONFIGURATION_ERROR', 'Business search is not available right now.'],
+  [PLACES_ERROR.KEY_INVALID]:      [503, 'API_CONFIGURATION_ERROR', 'Business search is not available right now.'],
+  [PLACES_ERROR.ACCESS_DENIED]:    [503, 'API_CONFIGURATION_ERROR', 'Business search is not available right now.'],
+  [PLACES_ERROR.BILLING_REQUIRED]: [503, 'API_CONFIGURATION_ERROR', 'Business search is not available right now.'],
+  [PLACES_ERROR.RATE_LIMITED]:     [429, 'RATE_LIMIT_EXCEEDED', 'Too many searches. Please wait a moment and try again.'],
+  [PLACES_ERROR.TIMEOUT]:          [504, 'SEARCH_TIMEOUT', 'The business search timed out. Please try again.'],
+  [PLACES_ERROR.UNAVAILABLE]:      [502, 'SEARCH_UNAVAILABLE', 'Business search is temporarily unavailable.'],
+  [PLACES_ERROR.BAD_RESPONSE]:     [502, 'SEARCH_UNAVAILABLE', 'Business search is temporarily unavailable.'],
+  [PLACES_ERROR.INVALID_REQUEST]:  [400, 'INVALID_REQUEST', 'Invalid search. Please check your business name and location.']
+};
+
+const MAX_SEARCH_FIELD_LENGTH = 120;
+
 /**
  * Search for businesses using name and location
+ *
+ * A failure is NEVER returned as an empty result list: `200 { results: [] }`
+ * means Google really found nothing; anything else is a non-2xx with a `code`.
+ *
  * @param {Object} req - Express request object
  * @param {Object} res - Express response object
  */
 export async function searchBusiness(req, res) {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  res.set?.('X-Request-Id', requestId);
+
   try {
-    const { businessName, businessLocation } = req.body;
-    
+    const { businessName, businessLocation } = req.body || {};
+
     // Validate required fields
-    if (!businessName || !businessName.trim()) {
+    if (typeof businessName !== 'string' || !businessName.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Business name is required'
       });
     }
-    
-    if (!businessLocation || !businessLocation.trim()) {
+
+    if (typeof businessLocation !== 'string' || !businessLocation.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Business location is required'
       });
     }
-    
+
+    const name = businessName.trim().replace(/s+/g, ' ');
+    const location = businessLocation.trim().replace(/s+/g, ' ');
+    if (name.length > MAX_SEARCH_FIELD_LENGTH || location.length > MAX_SEARCH_FIELD_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        message: 'Business name and location must be at most 120 characters',
+        code: PLACES_ERROR.INVALID_REQUEST,
+        error: 'INVALID_REQUEST'
+      });
+    }
+
     // Search for businesses using Google Places API
-    const rawResults = await searchBusinesses(businessName.trim(), businessLocation.trim());
-    
+    const rawResults = await searchBusinesses(name, location, { requestId });
+
     if (rawResults.length === 0) {
       return res.json({
         success: true,
@@ -46,13 +86,13 @@ export async function searchBusiness(req, res) {
         }
       });
     }
-    
+
     // Rank results by relevance
-    const rankedResults = rankBusinessResults(rawResults, businessName.trim(), businessLocation.trim());
-    
+    const rankedResults = rankBusinessResults(rawResults, name, location);
+
     // Check if results are good enough
     const hasGoodMatches = hasGoodResults(rankedResults);
-    
+
     // Return response
     res.json({
       success: true,
@@ -63,48 +103,26 @@ export async function searchBusiness(req, res) {
           : 'Found some businesses, but none seem to match well. Try different search terms.',
         hasResults: rankedResults.length > 0,
         hasGoodMatches,
-        searchQuery: `${businessName.trim()} in ${businessLocation.trim()}`
+        searchQuery: `${name} in ${location}`
       }
     });
-    
+
   } catch (error) {
-    console.error('[BUSINESS_CONTROLLER] Search failed', {
-      error: error.message,
-      stack: error.stack,
-      body: req.body
+    const code = error instanceof PlacesError ? error.code : null;
+    const [status, errorKey, message] = SEARCH_ERROR_RESPONSES[code] || [500, 'INTERNAL_ERROR', 'Something went wrong while searching for businesses. Please try again.'];
+
+    // Never log the request body (it contains what the user typed) - just
+    // correlation + classification. googlePlacesService already logged the
+    // upstream status/reason for Places failures.
+    LoggerUtil.warn('[BUSINESS_CONTROLLER] Search failed', {
+      requestId,
+      errorCode: code || 'UNEXPECTED',
+      status,
+      durationMs: Date.now() - startedAt,
+      ...(code ? {} : { error: error?.message })
     });
-    
-    // Handle specific error types
-    if (error.message.includes('API key')) {
-      return res.status(500).json({
-        success: false,
-        message: 'Service temporarily unavailable. Please try again later.',
-        error: 'API_CONFIGURATION_ERROR'
-      });
-    }
-    
-    if (error.message.includes('quota exceeded')) {
-      return res.status(429).json({
-        success: false,
-        message: 'Too many searches. Please wait a moment and try again.',
-        error: 'RATE_LIMIT_EXCEEDED'
-      });
-    }
-    
-    if (error.message.includes('Invalid search request')) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid search. Please check your business name and location.',
-        error: 'INVALID_REQUEST'
-      });
-    }
-    
-    // Generic error
-    res.status(500).json({
-      success: false,
-      message: 'Something went wrong while searching for businesses. Please try again.',
-      error: 'INTERNAL_ERROR'
-    });
+
+    return res.status(status).json({ success: false, message, code: code || 'INTERNAL_ERROR', error: errorKey });
   }
 }
 

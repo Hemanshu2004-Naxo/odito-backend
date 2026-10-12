@@ -18,6 +18,9 @@ import { PLATFORM_TEXT_LIMITS, MAX_HASHTAGS } from '../aiContent/contentConfig.j
 
 export const CALENDAR_PROMPT_VERSION = 'social-ai-calendar-v3';
 
+/** The most recent topics listed as "do not repeat" - a long calendar must not grow every later call without bound (the validator still checks every earlier topic). */
+const MAX_TOPICS_IN_PROMPT = 80;
+
 const SYSTEM_PROMPT = `You are the content planner inside Odito. You turn ONE business's social media strategy into a complete content calendar: for each requested slot you decide what the post is about AND write it - the caption, the hashtags and, when a slot targets both platforms, one adapted version per platform. You do not create designs, schedule or publish anything, and a human reviews every post before it goes anywhere.
 
 NON-NEGOTIABLE RULES
@@ -90,6 +93,7 @@ export function buildUserPrompt({ snapshotData, strategy, config, slots, progres
       line('distribution', fixed ? 'each slot lists its fixed platforms' : 'you choose, per slot, one platform or both of the selected platforms - use both only when the same post genuinely suits each; do not default to both'),
       line('posts_per_week_chosen_by_the_user', config.postsPerWeek),
       line('period', `${config.startDate} to ${config.endDate}`),
+      line('calendar_length', config.months ? `${config.months} calendar month${config.months === 1 ? '' : 's'} - spread the topics over the whole period; do not front-load them` : null),
       line('business_model', d.businessModel === 'product' ? 'product-based' : d.businessModel === 'service' ? 'service-based' : null),
     ]),
     block('business', [
@@ -137,7 +141,7 @@ export function buildUserPrompt({ snapshotData, strategy, config, slots, progres
 
   if (planned && (planned.topics.length || Object.keys(planned.services).length || Object.keys(planned.products).length)) {
     parts.push(block('already_planned_in_earlier_batches', [
-      line('topics_do_not_repeat', planned.topics),
+      line('topics_do_not_repeat', planned.topics.slice(-MAX_TOPICS_IN_PROMPT)),
       line('services_used_counts', Object.entries(planned.services).map(([id, n]) => `${id} x${n}`)),
       line('products_used_counts', Object.entries(planned.products).map(([id, n]) => `${id} x${n}`)),
     ]));

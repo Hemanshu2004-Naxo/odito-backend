@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { checkPublicWebsiteUrl } from '../utils/publicWebsiteUrl.js';
 
 /**
  * Website Extraction Service
@@ -65,45 +66,17 @@ function getPythonWorkerUrl() {
  * @returns {{ valid: boolean, error?: string }}
  */
 export function validateUrl(url) {
-  if (!url || typeof url !== 'string' || !url.trim()) {
-    return { valid: false, error: 'URL is required' };
+  // Syntactic gate: scheme, credentials, ports, IP literals, internal hostnames.
+  // The authoritative DNS + redirect-hop checks live in the Python worker, which
+  // is the process that actually performs the fetch.
+  const check = checkPublicWebsiteUrl(url);
+  if (!check.ok) return { valid: false, error: check.reason };
+
+  // Legacy blocklist kept as defence in depth (cheap, and covers metadata names).
+  if (isBlockedUrl(url.trim())) {
+    return { valid: false, error: 'This URL is not allowed for security reasons' };
   }
-
-  const trimmed = url.trim();
-
-  // Must start with http:// or https://
-  if (!/^https?:\/\//i.test(trimmed)) {
-    return { valid: false, error: 'URL must start with http:// or https://' };
-  }
-
-  try {
-    const urlObj = new URL(trimmed);
-
-    // Must be http or https protocol
-    if (!['http:', 'https:'].includes(urlObj.protocol)) {
-      return { valid: false, error: 'Only HTTP and HTTPS URLs are allowed' };
-    }
-
-    // Must have a valid hostname with a TLD
-    const hostname = urlObj.hostname;
-    if (!hostname || !hostname.includes('.')) {
-      return { valid: false, error: 'Invalid hostname — must include a domain extension (e.g., .com)' };
-    }
-
-    // Hostname must not be an IP address for public-facing use
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
-      return { valid: false, error: 'IP addresses are not allowed — use a domain name' };
-    }
-
-    // Check SSRF blocklist
-    if (isBlockedUrl(trimmed)) {
-      return { valid: false, error: 'This URL is not allowed for security reasons' };
-    }
-
-    return { valid: true };
-  } catch {
-    return { valid: false, error: 'Invalid URL format' };
-  }
+  return { valid: true };
 }
 
 /**
@@ -339,7 +312,9 @@ async function callPythonExtractor(url) {
       }
 
       if (!response.data.success) {
-        throw new Error(response.data.message || response.data.error || 'Extraction failed');
+        const workerError = new Error(response.data.message || response.data.error || 'Extraction failed');
+        workerError.workerCode = response.data.error || null;
+        throw workerError;
       }
 
       return response.data.data || {};
@@ -350,6 +325,11 @@ async function callPythonExtractor(url) {
         error: error.message,
         status: error.response?.status
       });
+
+      // A deterministic refusal (blocked destination) will not change on retry.
+      if (error.workerCode === 'blocked_url') {
+        throw error;
+      }
 
       // Don't retry on 4xx errors (client errors like bad URL)
       if (error.response?.status >= 400 && error.response?.status < 500) {
@@ -518,6 +498,22 @@ function calculateConfidence(data) {
  * Handle extraction errors with user-friendly messages
  */
 function handleExtractionError(error) {
+  if (error.workerCode === 'blocked_url') {
+    return {
+      success: false,
+      error: 'INVALID_URL',
+      message: 'This URL is not allowed for security reasons'
+    };
+  }
+
+  if (error.workerCode === 'timeout') {
+    return {
+      success: false,
+      error: 'TIMEOUT',
+      message: 'This website is taking too long to analyze. Please try again or enter your business details manually.'
+    };
+  }
+
   if (error.code === 'ECONNABORTED') {
     return {
       success: false,

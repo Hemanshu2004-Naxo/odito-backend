@@ -50,6 +50,17 @@ const seoProjectSchema = new mongoose.Schema({
     default: null
   },
 
+  // Business name exactly as the customer typed it during onboarding (the
+  // Website Manual Fallback path). Additive and optional: absent/null on every
+  // existing project, so no migration is needed. Deliberately NOT stored in
+  // verified_business.name, which means "confirmed against Google Places".
+  business_name: {
+    type: String,
+    trim: true,
+    maxlength: [200, 'Business name cannot exceed 200 characters'],
+    default: null
+  },
+
   // 🎯 SEO Scope — persisted from onboarding targetLevel selection
   seo_scope: {
     type: String,

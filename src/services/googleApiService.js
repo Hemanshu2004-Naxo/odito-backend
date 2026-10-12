@@ -194,7 +194,9 @@ export async function getValidAccessToken(googleConnection) {
   }
   
   if (!googleConnection.refresh_token) {
-    throw new Error('GoogleConnection missing refresh_token');
+    const err = new Error('GoogleConnection missing refresh_token');
+    err.code = 'GOOGLE_TOKEN_REFRESH_FAILED';
+    throw err;
   }
   
   const connectionId = googleConnection._id?.toString();
@@ -238,8 +240,11 @@ export async function getValidAccessToken(googleConnection) {
     // Mark connection as expired for user visibility
     await markConnectionExpired(connectionId, error.message);
     
-    // Re-throw for caller to handle
-    throw new Error(`Failed to obtain valid access token: ${error.message}`);
+    // Re-throw for caller to handle. The code lets controllers answer
+    // "reconnect your Google account" instead of a generic 500.
+    const err = new Error(`Failed to obtain valid access token: ${error.message}`);
+    err.code = 'GOOGLE_TOKEN_REFRESH_FAILED';
+    throw err;
   }
 }
 

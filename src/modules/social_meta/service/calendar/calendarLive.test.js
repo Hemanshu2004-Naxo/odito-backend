@@ -20,8 +20,8 @@ import {
   startCalendarGeneration, runCalendarGeneration, getCalendarState, getCalendarGenerationStatus, recoverStaleCalendarGenerations, planSlots, seedForCalendar,
   setCalendarProviderOverride, resetCalendarProviderOverride, CALENDAR_FAILURE_MESSAGES,
 } from './socialContentCalendarService.js';
-import { validateSlotPlan, splitWeeks, parseDate } from './calendarPlanner.js';
-import { CALENDAR_STALE_MS, CALENDAR_BATCH_SIZE } from './calendarConfig.js';
+import { validateSlotPlan, splitWeeks, parseDate, periodEndDate, previewCalendarPlan } from './calendarPlanner.js';
+import { CALENDAR_BATCH_SIZE, CALENDAR_LEASE_MS } from './calendarConfig.js';
 import { validRawStrategy, mockProvider, mockCalendarProvider, validRawCalendarItem } from '../../testSupport/aiStrategyFixtures.js';
 
 /**
@@ -127,7 +127,9 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
       [{ postsPerWeek: 0 }, 'INVALID_POSTS_PER_WEEK'], [{ postsPerWeek: 9 }, 'INVALID_POSTS_PER_WEEK'], [{ postsPerWeek: '3' }, 'INVALID_POSTS_PER_WEEK'],
       [{ platforms: [] }, 'INVALID_PLATFORMS'], [{ platforms: ['tiktok'] }, 'INVALID_PLATFORMS'],
       [{ startDate: '2020-01-01', endDate: '2020-01-31' }, 'DATE_IN_PAST'], [{ startDate: addDays(5), endDate: addDays(2) }, 'INVALID_DATE_RANGE'], [{ startDate: 'soon' }, 'INVALID_DATE'],
-      [{ startDate: addDays(1), endDate: addDays(90) }, 'INVALID_DATE_RANGE'], [{ distributionMode: 'chaos' }, 'INVALID_DISTRIBUTION'],
+      [{ startDate: addDays(1), endDate: addDays(200) }, 'INVALID_DATE_RANGE'], [{ distributionMode: 'chaos' }, 'INVALID_DISTRIBUTION'],
+      [{ months: 0 }, 'INVALID_DURATION'], [{ months: 7 }, 'INVALID_DURATION'], [{ months: '3' }, 'INVALID_DURATION'], [{ months: 2.5 }, 'INVALID_DURATION'],
+      [{ startDate: addDays(1), months: 2, endDate: addDays(20) }, 'INVALID_DATE_RANGE'],
       [{ strategy: { contentPillars: [] } }, 'UNKNOWN_FIELD'], [{ strategyId: String(new mongoose.Types.ObjectId()) }, 'UNKNOWN_FIELD'],
     ]) {
       setCalendarProviderOverride(provider);
@@ -294,24 +296,46 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     assert.equal(JSON.stringify(state).includes('not json at all'), false);
   });
 
-  test('14: a failure in a LATER batch discards the whole run — nothing from the earlier batches is kept', async (t) => {
+  test("14: a failure in a LATER batch keeps the earlier, validated batches: the calendar is PARTIAL (not ready, not discarded) and says how far it got", async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await seedStrategy();
     const provider = mockCalendarProvider({ behavior: ({ slots, callNumber }) => (callNumber >= 2 ? { items: [] } : { items: slots.map((s) => validRawCalendarItem(s)) }) });
     const r = await generate(provider, { startDate: addDays(1), endDate: addDays(30), postsPerWeek: 5 });
     assert.ok(provider.calls.length >= 3, 'the second batch (and its repair) ran');
-    assert.equal(r.generation.status, 'failed');
-    assert.equal(await SocialContentCalendarItem.countDocuments({ project_id: project._id }), 0);
+    assert.equal(r.generation.status, 'partial');
+    assert.equal(r.generation.canResume, true);
+    assert.equal(r.generation.failure.code, 'AI_BAD_OUTPUT', 'a permanent (validation) failure is not retried automatically');
+    assert.equal(provider.calls.length, 3, 'batch 1, batch 2 and its single repair - nothing more');
+    const saved = await SocialContentCalendarItem.countDocuments({ project_id: project._id });
+    assert.equal(saved, CALENDAR_BATCH_SIZE, 'the first batch is kept');
+    assert.equal(r.generation.progress.plannedPosts, CALENDAR_BATCH_SIZE);
+    assert.ok(r.generation.progress.totalPosts > saved);
+    // honest: it is not presented as a finished calendar
+    const state = await current();
+    assert.equal(state.status, 'partial');
+    assert.equal(state.calendar, null, 'no READY calendar exists');
+    assert.equal(state.partial.items.length, CALENDAR_BATCH_SIZE);
+    assert.equal(state.partial.calendar.status, 'partial');
   });
 
-  test('15: provider errors are mapped to a safe message — never the provider\'s own text', async (t) => {
+  test("15: a transient provider error (busy) is retried automatically later and never leaks the provider's own text; a permanent one stops", async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await seedStrategy();
     const boom = mockCalendarProvider({ behavior: () => { const e = new Error('upstream said: sk-secret-key leaked'); e.code = 'CLAUDE_RATE_LIMITED'; throw e; } });
     const r = await generate(boom, { postsPerWeek: 2 });
-    assert.equal(r.generation.failure.code, 'AI_BUSY');
+    assert.equal(r.generation.status, 'generating', 'waiting to retry, not failed');
+    assert.equal(r.generation.retry.code, 'AI_BUSY');
+    assert.ok(new Date(r.generation.retry.at) > new Date(), 'it says when it will try again');
     assert.equal(JSON.stringify(r).includes('sk-secret'), false);
     assert.equal(JSON.stringify(await SocialContentCalendar.find({ project_id: project._id }).lean()).includes('sk-secret'), false);
+
+    await SocialContentCalendar.deleteMany({ project_id: project._id });
+    const down = mockCalendarProvider({ behavior: () => { const e = new Error('invalid x-api-key sk-secret-key'); e.code = 'CLAUDE_AUTH'; throw e; } });
+    const r2 = await generate(down, { postsPerWeek: 2 });
+    assert.equal(r2.generation.status, 'failed');
+    assert.equal(r2.generation.failure.code, 'AI_UNAVAILABLE');
+    assert.equal(down.calls.length, 1, 'a permanent failure is not retried');
+    assert.equal(JSON.stringify(r2).includes('sk-secret'), false);
   });
 
   test('16: honesty rules are enforced inside the run: a "trending" claim, an invented price and a banned phrase each trigger the repair', async (t) => {
@@ -422,13 +446,13 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     assert.equal(provider.calls.length, 1, 'one planning call, not five');
   });
 
-  test('23: an interrupted generation is failed after the stale window, and the project can generate again', async (t) => {
+  test('23: a generation from before leases whose process is gone is finished as interrupted (nothing was saved), and the project can generate again', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const strategy = await seedStrategy();
-    const old = new Date(Date.now() - CALENDAR_STALE_MS - 60_000);
+    const old = new Date(Date.now() - CALENDAR_LEASE_MS - 60_000);
     await SocialContentCalendar.create({
       project_id: project._id, version: 1, status: 'generating', config: request(), strategy: { id: strategy._id, version: strategy.version, profileSnapshotHash: 'h' },
-      generation: { startedAt: old, lockedBy: 'dead-process' },
+      generation: { startedAt: old, lockedBy: 'dead-process' }, // no lease: written by the code that predates it
     });
     const status = await getCalendarGenerationStatus(pid);
     assert.equal(status.status, 'failed');
@@ -438,12 +462,13 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     assert.equal(r.generation.version, 2);
   });
 
-  test('24: a recent in-flight generation is NOT recovered (only the stale one is)', async (t) => {
+  test('24: a generation whose lease is still alive is NOT taken over (only an expired one is)', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const strategy = await seedStrategy();
-    await SocialContentCalendar.create({ project_id: project._id, version: 1, status: 'generating', config: request(), strategy: { id: strategy._id, version: strategy.version }, generation: { startedAt: new Date(), lockedBy: 'alive' } });
+    await SocialContentCalendar.create({ project_id: project._id, version: 1, status: 'generating', config: request(), strategy: { id: strategy._id, version: strategy.version }, generation: { startedAt: new Date(), lockedBy: 'alive', lease: { expiresAt: new Date(Date.now() + 60_000) }, runAttempts: 1 } });
     assert.equal(await recoverStaleCalendarGenerations(pid), 0);
     assert.equal((await getCalendarGenerationStatus(pid)).status, 'generating');
+    assert.equal((await SocialContentCalendar.findOne({ project_id: project._id }).lean()).generation.lockedBy, 'alive');
   });
 
   test('25: a run that lost its lock (recovered as interrupted while still working) publishes NOTHING', async (t) => {
@@ -584,7 +609,64 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     const state = await current();
     assert.deepEqual(state.connectedPlatforms, { facebook: true, instagram: false });
     assert.deepEqual(state.strategy, { available: true, id: String(s._id), version: s.version, platforms: ['facebook', 'instagram'], hasHooks: true, recommended: { postsPerWeek: 4, range: { min: 3, max: 5 }, days: ['tuesday', 'thursday', 'saturday'] } });
-    assert.deepEqual(state.limits, { minDays: 7, maxDays: 31, maxPostsPerWeek: 7 });
+    assert.deepEqual(state.limits, { minDays: 7, maxDays: 184, minMonths: 1, maxMonths: 6, maxPostsPerWeek: 7, maxPosts: 200 });
+  });
+
+  // ── months: 1-6 month calendars ────────────────────────────────────────────
+  const monthly = (months, postsPerWeek, over = {}) => ({ startDate: addDays(1), months, endDate: undefined, postsPerWeek, ...over });
+
+  test("M1: a 3-month calendar at 3 a week: the end date is derived, the count is the server's exact quota, dates are the planner's (never the model's), and it persists", async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const strategy = await seedStrategy();
+    const provider = mockCalendarProvider();
+    const input = monthly(3, 3);
+    const r = await generate(provider, input);
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r));
+
+    const state = await current();
+    const { calendar } = state;
+    assert.equal(calendar.config.months, 3);
+    assert.equal(calendar.config.endDate, periodEndDate(input.startDate, 3), 'derived from the start date and the months');
+    const expected = previewCalendarPlan({ ...request(input), platforms: ['facebook', 'instagram'] }, { today: input.startDate });
+    assert.equal(expected.error, undefined);
+    assert.equal(calendar.plan.totalItems, expected.value.totalPosts, 'exactly the previewed count');
+    assert.equal(state.items.length, expected.value.totalPosts);
+    assert.ok(state.items.length >= 36 && state.items.length <= 40, `about 3 x 13 weeks (${state.items.length})`);
+
+    // the dates are the deterministic plan of the stored calendar, not whatever the model said
+    const doc = await SocialContentCalendar.findById(calendar.id).lean();
+    const planned = planSlots(doc.config, strategy.strategy, seedForCalendar(doc)).slots.map((slot) => slot.date);
+    assert.deepEqual(state.items.map((i) => i.date), planned);
+    assert.equal(new Set(planned).size, planned.length, 'no date twice');
+    assert.ok(planned.every((d) => d >= doc.config.startDate && d <= doc.config.endDate));
+    assert.deepEqual(validateSlotPlan(planned.map((date, index) => ({ index, date })), { startDate: doc.config.startDate, endDate: doc.config.endDate, postsPerWeek: 3 }), []);
+
+    // one AI call per batch, every item pinned to the strategy it came from
+    assert.equal(provider.calls.length, Math.ceil(expected.value.totalPosts / CALENDAR_BATCH_SIZE));
+    assert.ok(state.items.every((i) => i.strategyVersion === strategy.version));
+    assert.equal(await SocialContentCalendarItem.countDocuments({ calendar_id: calendar.id }), expected.value.totalPosts, 'persisted');
+    assert.equal(fetchCalls.length, 0, 'no real network');
+  });
+
+  test('M2: 7 a week for 6 months is a long but valid calendar: one post a day, inside the safety limit', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy();
+    const provider = mockCalendarProvider();
+    const r = await generate(provider, monthly(6, 7, { platforms: ['facebook'] }));
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r));
+    const { calendar, items: list } = await current();
+    const days = Math.round((parseDate(calendar.config.endDate) - parseDate(calendar.config.startDate)) / 86400000) + 1;
+    assert.equal(list.length, days, 'every day of the period');
+    assert.ok(list.length >= 181 && list.length <= 184);
+    assert.equal(new Set(list.map((i) => i.date)).size, list.length);
+  });
+
+  test('M3: a legacy {startDate, endDate} request still produces a calendar (months stays null)', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy();
+    const r = await generate(mockCalendarProvider(), { endDate: addDays(14) });
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r));
+    assert.equal((await current()).calendar.config.months, null);
   });
 
   test('34: weekdays vary from week to week (not a recurring scheduler), every week has the requested count, nothing is outside the range, and a regeneration gets a different valid plan', async (t) => {

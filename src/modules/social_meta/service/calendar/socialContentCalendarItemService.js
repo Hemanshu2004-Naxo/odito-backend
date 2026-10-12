@@ -10,11 +10,14 @@ import { PLATFORM_TEXT_LIMITS, MAX_HASHTAGS } from '../aiContent/contentConfig.j
 import {
   toApiItem, buildPlanningContext, connectedPlatforms, latestReadyStrategy, getCalendarProvider, calendarFailureFor,
 } from './socialContentCalendarService.js';
+import { planSummaryOf } from './calendarPlanningContext.js';
 import { validateItemInput, defaultContentType, isItemLocked, FORMAT_SUPPORT, REGEN_FIELDS, USER_LIMITS } from './calendarItemRules.js';
-import { loadPublicationSummaries } from './calendarItemLinks.js';
+import { loadPublicationSummaries, linkPublicationToItem } from './calendarItemLinks.js';
+import { createPublication, submitContentForApproval } from '../socialPublishingService.js';
+import { getActiveFacebookAccount, getActiveInstagramAccount } from '../facebookAccountService.js';
 import { buildCalendarToolSchema, validateCalendarBatch, PURCHASE_CTA_RE } from './calendarOutputSchema.js';
 import { buildSystemPrompt, buildUserPrompt } from './calendarPromptBuilder.js';
-import { CALENDAR_MAX_REPAIR_ATTEMPTS } from './calendarConfig.js';
+import { CALENDAR_MAX_REPAIR_ATTEMPTS, CALENDAR_MAX_ITEMS } from './calendarConfig.js';
 import { formatDate } from './calendarPlanner.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
@@ -43,7 +46,7 @@ import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
 const toId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
 const fail = (code, message, extra = {}) => ({ success: false, error: { code, message, ...extra } });
-const MAX_ITEMS_PER_CALENDAR = 200;
+const MAX_ITEMS_PER_CALENDAR = CALENDAR_MAX_ITEMS;
 const REGEN_LABELS = { topic: 'topic', angle: 'angle', hook: 'hook', caption: 'caption', hashtags: 'hashtags', captionDirection: 'caption direction', primaryCta: 'call to action', creativeDirection: 'creative direction', contentBrief: 'content brief', engagementPrompt: 'engagement prompt', onCreativeText: 'text on the creative' };
 
 // ── context ──────────────────────────────────────────────────────────────────
@@ -118,13 +121,8 @@ export async function recomputePlanSummary(projectId, calendarId) {
     const cal = await SocialContentCalendar.findOne({ _id: calendarId, project_id: toId(projectId) }).lean();
     if (!cal) return;
     const items = await SocialContentCalendarItem.find({ calendar_id: calendarId, project_id: toId(projectId), status: { $ne: 'cancelled' } }).select('contentPillar platforms').lean();
-    const total = items.length || 1;
-    const counts = new Map();
-    items.forEach((i) => counts.set(i.contentPillar, (counts.get(i.contentPillar) || 0) + 1));
-    const platformCounts = {};
-    items.forEach((i) => i.platforms.forEach((p) => { platformCounts[p] = (platformCounts[p] || 0) + 1; }));
-    const pillarDistribution = (cal.plan?.pillarDistribution || []).map((d) => ({ pillar: d.pillar, targetPercent: d.targetPercent, plannedCount: counts.get(d.pillar) || 0, plannedPercent: Math.round(((counts.get(d.pillar) || 0) / total) * 1000) / 10 }));
-    await SocialContentCalendar.updateOne({ _id: calendarId, project_id: toId(projectId) }, { $set: { 'plan.totalItems': items.length, 'plan.pillarDistribution': pillarDistribution, 'plan.platformCounts': platformCounts } });
+    const summary = planSummaryOf(items, cal.plan?.pillarDistribution);
+    await SocialContentCalendar.updateOne({ _id: calendarId, project_id: toId(projectId) }, { $set: { 'plan.totalItems': summary.totalItems, 'plan.pillarDistribution': summary.pillarDistribution, 'plan.platformCounts': summary.platformCounts } });
   } catch (error) {
     LoggerUtil.warn('[SOCIAL_CALENDAR] Could not refresh the plan summary', { message: error.message });
   }
@@ -435,17 +433,37 @@ export async function regenerateItem(projectId, userId, itemId, body = {}) {
   return respond(projectId, doc, { regenerated: fields.filter((f) => $set[f] !== undefined), warnings, approvalRevoked: !hasContent && item.status === 'plan_approved' });
 }
 
-// ── content generation hand-off ──────────────────────────────────────────────
+// ── content hand-off ─────────────────────────────────────────────────────────
 
 /**
- * Starts the EXISTING single-post generator for ONE platform of an approved plan. It creates a real SocialPublication draft
- * and submits it to the existing content approval workflow; the draft is linked back to this item when it is saved.
- * The item must be plan-approved, and the strategy must be the one the calendar was planned from (an old plan is never mixed
- * with a newer strategy).
+ * The caption a person reviewed in the plan, as it will be posted on ONE platform: that platform's own copy when it has one, else the
+ * shared caption (a blank platform field falls back to the shared one - the same rule the editor shows). Hashtags likewise.
+ */
+export function plannedCopyFor(item, platform) {
+  const entry = (item.platformContent || []).find((p) => p.platform === platform);
+  const caption = String(entry?.caption || item.caption || '').trim();
+  const hashtags = [...((entry?.hashtags?.length ? entry.hashtags : item.hashtags) || [])];
+  return { caption, hashtags };
+}
+
+/**
+ * Turns an APPROVED plan item into a post draft for ONE platform.
+ *
+ * Two explicit modes, so a person always knows whether a caption will be kept or rewritten:
+ *   'plan' (default when the plan has a caption for that platform)
+ *        the draft's text IS the caption (and hashtags) the person reviewed, verbatim - no AI call, nothing rewritten, nothing charged.
+ *        It is checked against the platform's length / hashtag limits and the business's prohibited phrases and REFUSED (with the
+ *        reason) rather than silently shortened. The draft records which plan revision it came from.
+ *   'ai'   (default when the plan has no caption for that platform, or when asked for)
+ *        the existing single-post generator writes a NEW caption from the plan. The plan's own caption is left untouched; the AI text
+ *        becomes a draft in Content Approvals, where it is reviewed before anything is used.
+ * Either way the draft enters the existing content approval workflow (which decides review vs. auto-approval) and is linked back to the
+ * item. Nothing is designed, scheduled or published here, and the item must be plan-approved with the strategy it was planned from still current.
  */
 export async function generateItemContent(projectId, userId, itemId, body = {}) {
   const platform = body?.platform;
   if (typeof platform !== 'string' || !['facebook', 'instagram'].includes(platform)) return fail('INVALID_FIELD', 'platform must be facebook or instagram.', { field: 'platform' });
+  if (body?.mode !== undefined && !['plan', 'ai'].includes(body.mode)) return fail('INVALID_FIELD', "mode must be 'plan' (use the caption in this plan) or 'ai' (write a new caption with AI).", { field: 'mode' });
   const c = await loadContext(projectId, itemId, { catalog: false });
   if (!c.ok) return { success: false, error: c.error };
   const blocked = checkEditable(c);
@@ -457,7 +475,59 @@ export async function generateItemContent(projectId, userId, itemId, body = {}) 
   const latest = await latestReadyStrategy(projectId);
   if (!latest || String(latest._id) !== String(item.strategyId)) return fail('STRATEGY_CHANGED', 'Your strategy has changed since this calendar was generated. Regenerate the calendar before creating content from it.');
 
-  return startContentGeneration(projectId, userId, { platform, contentPillar: item.contentPillar, objective: item.contentType }, { calendarItemId: item._id });
+  const copy = plannedCopyFor(item, platform);
+  const mode = body?.mode || (copy.caption ? 'plan' : 'ai');
+  if (mode === 'ai') return startContentGeneration(projectId, userId, { platform, contentPillar: item.contentPillar, objective: item.contentType }, { calendarItemId: item._id });
+
+  // ── 'plan': the reviewed caption, verbatim ──
+  if (!validRevision(body.expectedRevision)) return needRevision();
+  const label = platform === 'facebook' ? 'Facebook' : 'Instagram';
+  if (!copy.caption) return fail('NO_PLAN_CAPTION', `This plan has no ${label} caption to use. Write one in the plan, or choose to have AI write the post.`);
+  const text = copy.hashtags.length ? `${copy.caption}\n\n${copy.hashtags.join(' ')}` : copy.caption;
+  if (text.length > PLATFORM_TEXT_LIMITS[platform]) return fail('CAPTION_TOO_LONG', `The ${label} caption (with its hashtags) is ${text.length} characters; ${label} posts here can be at most ${PLATFORM_TEXT_LIMITS[platform]}. Shorten it in the plan first - Odito will not cut your words.`);
+  if (copy.hashtags.length > MAX_HASHTAGS[platform]) return fail('TOO_MANY_HASHTAGS', `${label} posts here can have at most ${MAX_HASHTAGS[platform]} hashtags; this plan has ${copy.hashtags.length}.`);
+  const ctx = await buildPlanningContext(c.strategyDoc, projectId);
+  const lowered = text.toLowerCase();
+  const banned = ctx.prohibitedPhrases.find((p) => lowered.includes(String(p).toLowerCase()));
+  if (banned) return fail('PROHIBITED_PHRASE', `The ${label} caption uses "${banned}", which your business profile says never to use. Edit the caption in the plan first.`);
+  const account = platform === 'facebook' ? await getActiveFacebookAccount(projectId) : await getActiveInstagramAccount(projectId);
+  if (!account) return fail('PLATFORM_NOT_CONNECTED', `Connect your ${platform === 'facebook' ? 'Facebook Page' : 'Instagram account'} before creating a post for it.`);
+
+  // Claim the item at the revision the person saw (one atomic update): a double click, a second tab or an edit made meanwhile gets a
+  // conflict instead of a second draft or a draft of text that has since changed.
+  const claimed = await SocialContentCalendarItem.findOneAndUpdate(
+    { _id: item._id, project_id: toId(projectId), calendar_id: c.calendar._id, revision: body.expectedRevision, status: { $in: ['plan_approved', 'content_generated'] } },
+    { $inc: { revision: 1 }, $set: { updatedBy: toId(userId) } },
+    { new: true },
+  ).lean();
+  if (!claimed) return conflict(projectId, itemId);
+
+  const created = await createPublication(projectId, userId, {
+    platform,
+    socialAccountId: String(account._id),
+    content: text,
+    generation: {
+      source: 'calendar_plan',
+      type: 'calendar_item',
+      strategyId: item.strategyId,
+      strategyVersion: item.strategyVersion,
+      profileSnapshotHash: item.profileSnapshotHash || null,
+      contentPillar: item.contentPillar,
+      objective: item.contentType,
+      calendarItemId: item._id,
+      planRevision: body.expectedRevision,
+      planApprovedAt: item.planApprovedAt || null,
+    },
+  });
+  if (!created.success) return fail(created.error?.code?.startsWith('ACCOUNT_') ? 'PLATFORM_NOT_CONNECTED' : (created.error?.code || 'DRAFT_CREATE_FAILED'), created.error?.message || 'The post draft could not be created.');
+
+  const submitted = await submitContentForApproval(projectId, created.publication.id, userId);
+  if (!submitted.success) LoggerUtil.warn('[SOCIAL_CALENDAR] Draft created from a plan but could not be submitted for review', { itemId: String(itemId), code: submitted.error?.code });
+  await linkPublicationToItem({ projectId, itemId: item._id, publicationId: created.publication.id });
+  LoggerUtil.info('[SOCIAL_CALENDAR] Post draft created from the plan caption', { projectId: String(projectId), itemId: String(itemId), publicationId: String(created.publication.id), platform, planRevision: body.expectedRevision });
+
+  const fresh = await SocialContentCalendarItem.findOne({ _id: item._id, project_id: toId(projectId) }).lean();
+  return { ...(await respond(projectId, fresh)), mode: 'plan', publication: submitted.success ? submitted.publication : created.publication };
 }
 
 export default { getItemOptions, getItem, updateItem, createItem, approveItem, revokeItemApproval, regenerateItem, generateItemContent, recomputePlanSummary };

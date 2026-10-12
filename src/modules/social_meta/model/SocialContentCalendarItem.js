@@ -33,6 +33,9 @@ const socialContentCalendarItemSchema = new mongoose.Schema({
   profileSnapshotHash: { type: String, default: null },
 
   order: { type: Number, required: true, min: 0 },
+  // The planner's slot number of a GENERATED item (absent on a hand-added one). Together with calendar_id it is unique, which is
+  // what makes saving a batch idempotent: a retried batch can never create a second item for a slot.
+  slot: { type: Number, min: 0 },
   contentDate: { type: String, required: true }, // YYYY-MM-DD
   dayOfWeek: { type: String, required: true },
   platforms: { type: [String], required: true },
@@ -100,6 +103,8 @@ const socialContentCalendarItemSchema = new mongoose.Schema({
   collection: 'social_content_calendar_items',
 });
 
+// one generated item per slot of a calendar (partial: hand-added items have no slot)
+socialContentCalendarItemSchema.index({ calendar_id: 1, slot: 1 }, { unique: true, partialFilterExpression: { slot: { $type: 'number' } }, name: 'unique_calendar_item_slot' });
 // the calendar view: one calendar's items in date order
 socialContentCalendarItemSchema.index({ project_id: 1, calendar_id: 1, order: 1 }, { name: 'calendar_item_by_calendar' });
 // "what is planned on / around a date" across versions

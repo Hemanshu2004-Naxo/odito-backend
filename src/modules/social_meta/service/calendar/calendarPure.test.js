@@ -58,8 +58,11 @@ describe('validateCalendarInput', () => {
     assert.equal(errorOf({ startDate: '2026-10-04', endDate: '2026-10-31' }), undefined, 'a day earlier than the server date is tolerated (a viewer west of UTC)');
     assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2026-10-11' }), 'INVALID_DATE_RANGE', `shorter than ${CALENDAR_MIN_DAYS} days`);
     assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2026-10-12' }), undefined);
-    assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2026-11-06' }), 'INVALID_DATE_RANGE', `longer than ${CALENDAR_MAX_DAYS} days`);
-    assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2026-11-05' }), undefined, `${CALENDAR_MAX_DAYS} days is allowed`);
+    // the 31-day ceiling is gone: a legacy explicit range may run up to 6 calendar months (and no further)
+    assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2026-11-06' }), undefined, 'a range longer than 31 days is allowed');
+    assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2027-04-05' }), undefined, 'exactly 6 months is allowed');
+    assert.equal(errorOf({ startDate: '2026-10-06', endDate: '2027-04-06' }), 'INVALID_DATE_RANGE', 'one day beyond 6 months is refused');
+    assert.ok(CALENDAR_MAX_DAYS >= 184, 'the reported day ceiling covers the longest 6-month period');
   });
 
   test('5: distribution mode is one of the three; anything else is refused', () => {

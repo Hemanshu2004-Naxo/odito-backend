@@ -10,6 +10,7 @@ import SocialPublication from '../model/SocialPublication.js';
 import metaApiService from './metaApiService.js';
 import { recoverStalePublications, reconcileUnknownOutcomes, markMissedPublications } from './socialPublishRecoveryService.js';
 import { executeDuePublications } from './socialPublishingService.js';
+import { ensureProject, removeProject } from '../testSupport/projectFixture.js';
 
 /**
  * Stale-lock recovery + unknown-outcome reconciliation (P0 #3, #5, #8):
@@ -51,6 +52,7 @@ describe('recovery sweeps', () => {
     if (!mongoAvailable) return;
     userId = new mongoose.Types.ObjectId();
     projectId = new mongoose.Types.ObjectId();
+    await ensureProject(projectId, { userId });
     project = projectId.toString();
     fb = await SocialAccount.create({
       user_id: userId, project_id: projectId, platform: 'facebook', platformAccountId: 'pg_rec', pageId: 'pg_rec', accountType: 'page',
@@ -61,6 +63,7 @@ describe('recovery sweeps', () => {
     if (!mongoAvailable) return;
     await SocialPublication.deleteMany({ project_id: projectId });
     await SocialAccount.deleteMany({ project_id: projectId });
+    await removeProject(projectId);
   });
 
   /** A row exactly as a crashed worker leaves it: claimed, lock stamped, never finalized. */

@@ -373,23 +373,29 @@ export function validateCalendarBatch(raw, ctx) {
 }
 
 /**
- * Variety, applied AFTER validation across the whole calendar. The same service / product on consecutive items (when
- * there are at least two to choose from) or used more than its fair share is cleared (the item becomes brand-level
- * content) and a warning recorded; a format repeated three times running is only warned about. Returns
- * { items, warnings } and never throws.
+ * Variety, applied AFTER validation, in calendar order. The same service / product on consecutive items (when there are at
+ * least two to choose from) or used more than its fair share is cleared (the item becomes brand-level content) and a warning
+ * recorded; a format repeated three times running is only warned about. Returns { items, warnings, carry } and never throws.
+ *
+ * It is INCREMENTAL, so a long calendar can be saved batch by batch (and resumed after a crash) with exactly the result one pass
+ * over the whole calendar would give: the rules only ever look at the previous item, at how often an id was already kept, and at the
+ * last two formats. `carry` is that state after this batch ({ used, prev, formats }); pass it back with the next batch, together with
+ * `total` (the number of posts of the WHOLE calendar - the fair share is computed from it). `varietyCarryFromItems` rebuilds it from
+ * the items already saved.
  */
-export function applyVariety(items, { serviceCount = 0, productCount = 0 } = {}) {
+export function applyVariety(items, { serviceCount = 0, productCount = 0, total = null, carry = null } = {}) {
   const warnings = [];
   const out = items.map((it) => ({ ...it }));
+  const prior = carry || { used: {}, prev: { serviceId: null, productId: null }, formats: [] };
+  const used = new Map(Object.entries(prior.used || {}));
   const refCount = Math.max(serviceCount, productCount);
   if (refCount >= 2) {
-    const cap = Math.ceil(out.length / refCount) + 1;
-    const used = new Map();
+    const cap = Math.ceil((total ?? out.length) / refCount) + 1;
     out.forEach((it, i) => {
       for (const key of ['serviceId', 'productId']) {
         const id = it[key];
         if (!id) continue;
-        const prev = out[i - 1]?.[key];
+        const prev = i === 0 ? prior.prev?.[key] : out[i - 1]?.[key];
         const overUsed = (used.get(id) || 0) >= cap;
         if (prev === id || overUsed) {
           warnings.push(`${it.contentDate}: the ${key === 'serviceId' ? 'service' : 'product'} was ${prev === id ? 'repeated on consecutive posts' : 'used more than its share'}, so this post is brand-level content instead.`);
@@ -400,10 +406,33 @@ export function applyVariety(items, { serviceCount = 0, productCount = 0 } = {})
       }
     });
   }
-  for (let i = 2; i < out.length; i += 1) {
-    if (out[i].format === out[i - 1].format && out[i].format === out[i - 2].format) warnings.push(`${out[i].contentDate}: the same format (${out[i].format}) is used three posts in a row.`);
+  const formats = [...(prior.formats || []), ...out.map((it) => it.format)];
+  const offset = (prior.formats || []).length;
+  for (let j = Math.max(offset, 2); j < formats.length; j += 1) {
+    if (formats[j] === formats[j - 1] && formats[j] === formats[j - 2]) warnings.push(`${out[j - offset].contentDate}: the same format (${formats[j]}) is used three posts in a row.`);
   }
-  return { items: out, warnings };
+  const last = out[out.length - 1];
+  return {
+    items: out,
+    warnings,
+    carry: {
+      used: Object.fromEntries(used),
+      prev: { serviceId: last ? last.serviceId || null : prior.prev?.serviceId || null, productId: last ? last.productId || null : prior.prev?.productId || null },
+      formats: formats.slice(-2),
+    },
+  };
 }
 
-export default { CALENDAR_TOOL_NAME, CALENDAR_LIMITS, buildCalendarToolSchema, validateCalendarBatch, applyVariety, PURCHASE_CTA_RE, REGULATED_RE, ALL_KPIS };
+/** The `carry` of applyVariety rebuilt from items that are already saved (in slot order): what a resumed run continues from. */
+export function varietyCarryFromItems(savedItems) {
+  const used = {};
+  for (const it of savedItems) for (const key of ['serviceId', 'productId']) if (it[key]) used[String(it[key])] = (used[String(it[key])] || 0) + 1;
+  const last = savedItems[savedItems.length - 1];
+  return {
+    used,
+    prev: { serviceId: last?.serviceId ? String(last.serviceId) : null, productId: last?.productId ? String(last.productId) : null },
+    formats: savedItems.slice(-2).map((it) => it.format),
+  };
+}
+
+export default { CALENDAR_TOOL_NAME, CALENDAR_LIMITS, buildCalendarToolSchema, validateCalendarBatch, applyVariety, varietyCarryFromItems, PURCHASE_CTA_RE, REGULATED_RE, ALL_KPIS };

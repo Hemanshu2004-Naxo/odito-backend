@@ -160,6 +160,28 @@ export async function deleteByKey(storageKey, { projectId = null } = {}) {
   }
 }
 
+const PROJECT_SEGMENT_RE = /^[a-f0-9]{24}$/i;
+
+/**
+ * Removes EVERY stored file of one project (storage/social_media/<projectId>/): post media, AI designs, catalog images, logo.
+ * Used only when a project is permanently purged. The id must be a 24-hex project id and the resolved path must sit directly
+ * under ROOT_DIR, so nothing else can ever be removed through it. Idempotent (a missing folder is success); never throws.
+ * @returns {Promise<boolean>} false only when a folder existed and could not be removed
+ */
+export async function deleteProjectDirectory(projectId) {
+  const segment = String(projectId || '');
+  if (!PROJECT_SEGMENT_RE.test(segment)) return false;
+  const dir = path.resolve(ROOT_DIR, segment);
+  if (path.dirname(dir) !== ROOT_DIR) return false;
+  try {
+    await fs.rm(dir, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    console.error('[MEDIA_STORAGE] Failed to remove a project media folder:', error.message);
+    return false;
+  }
+}
+
 /** Largest stored file read back for processing (a logo or a product photo): bigger files are refused, never loaded. */
 const MAX_READ_BYTES = 12 * 1024 * 1024;
 
@@ -183,4 +205,4 @@ export async function readByKey(storageKey, { projectId }) {
   }
 }
 
-export default { upload, deleteByUrl, deleteByKey, readByKey, isOwnedUrl, isPubliclyReachableUrl, publicMediaOrigin, publishableMediaProblem, storedMediaExists };
+export default { upload, deleteByUrl, deleteByKey, deleteProjectDirectory, readByKey, isOwnedUrl, isPubliclyReachableUrl, publicMediaOrigin, publishableMediaProblem, storedMediaExists };

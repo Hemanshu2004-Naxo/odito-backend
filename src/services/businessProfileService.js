@@ -315,6 +315,33 @@ export async function getAuthenticatedHttpClient(googleConnection, baseUrl = GBP
   });
 }
 
+const ACCOUNTS_PAGE_SIZE = 20;    // accounts.list maximum
+const LOCATIONS_PAGE_SIZE = 100;  // accounts.locations.list maximum
+const MAX_LIST_PAGES = 50;        // ceiling against a nextPageToken loop on Google's side
+
+/**
+ * Follow nextPageToken until exhausted. `fetchPage(pageToken)` must resolve to
+ * an axios response; the items are read from the first array-valued field of
+ * `response.data` named by `itemsKey` ('accounts' | 'locations').
+ */
+async function fetchAllPages(fetchPage, itemsKey) {
+  const items = [];
+  let pageToken;
+  let pages = 0;
+  do {
+    const response = await fetchPage(pageToken);
+    const batch = response.data?.[itemsKey];
+    if (Array.isArray(batch)) items.push(...batch);
+    pageToken = response.data?.nextPageToken || undefined;
+    pages++;
+  } while (pageToken && pages < MAX_LIST_PAGES);
+
+  if (pageToken) {
+    console.warn(`[BUSINESS_PROFILE] ${itemsKey} list truncated at ${MAX_LIST_PAGES} pages`);
+  }
+  return items;
+}
+
 /**
  * Get list of accessible Business Profile accounts
  * @param {Object} googleConnection - GoogleConnection document
@@ -332,23 +359,23 @@ export async function getBusinessProfileAccounts(googleConnection) {
     }
     
     const client = await getAuthenticatedHttpClient(googleConnection, GBP_ACCOUNT_MANAGEMENT_API);
-    
-    const response = await withRetry(() => client.get('/accounts'));
-    
-    console.log('[BUSINESS_PROFILE] Accounts response:', {
-      status: response.status,
-      hasAccounts: !!response.data.accounts,
-      accountCount: response.data.accounts?.length || 0
-    });
-    
-    if (!response.data?.accounts || !Array.isArray(response.data.accounts)) {
+
+    // accounts.list is paginated (pageSize max 20) - follow nextPageToken.
+    const rawAccounts = await fetchAllPages(
+      (pageToken) => withRetry(() => client.get('/accounts', { params: { pageSize: ACCOUNTS_PAGE_SIZE, pageToken } })),
+      'accounts'
+    );
+
+    console.log('[BUSINESS_PROFILE] Accounts response:', { accountCount: rawAccounts.length });
+
+    if (rawAccounts.length === 0) {
       console.log('[BUSINESS_PROFILE] No accounts found');
       const emptyResult = [];
       setCachedData(cacheKey, emptyResult);
       return emptyResult;
     }
-    
-    const accounts = response.data.accounts.map(account => ({
+
+    const accounts = rawAccounts.map(account => ({
       accountId: account.name.replace('accounts/', ''),
       accountName: account.displayName || account.name
     }));
@@ -389,13 +416,19 @@ export async function getBusinessProfileLocations(googleConnection, accountId) {
     
     const client = await getAuthenticatedHttpClient(googleConnection, GBP_BUSINESS_INFO_API);
 
-    const response = await withRetry(() =>
-      client.get(`/accounts/${accountId}/locations`, {
-        params: { readMask: LOCATION_READ_MASK }
-      })
+    // accounts.locations.list is paginated (default pageSize is only 10, max
+    // 100) - without following nextPageToken, accounts with more than 10
+    // locations silently lose the rest.
+    const rawLocations = await fetchAllPages(
+      (pageToken) => withRetry(() =>
+        client.get(`/accounts/${accountId}/locations`, {
+          params: { readMask: LOCATION_READ_MASK, pageSize: LOCATIONS_PAGE_SIZE, pageToken }
+        })
+      ),
+      'locations'
     );
 
-    const locations = (response.data?.locations || []).map(location => ({
+    const locations = rawLocations.map(location => ({
       locationId: location.name.replace('locations/', ''),
       locationName: location.title || location.name,
       address: location.storefrontAddress?.addressLines?.join(', ') || '',

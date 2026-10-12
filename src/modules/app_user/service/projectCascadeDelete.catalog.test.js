@@ -90,7 +90,8 @@ describe('deleteProjectCascade — Product Catalog, services and brand logo', ()
     assert.equal(await SocialProduct.countDocuments({ project_id: doomed._id }), 0, 'no orphaned product');
     assert.equal(await SocialBusinessProfile.countDocuments({ project_id: doomed._id }), 0);
     for (const f of doomedFiles) assert.equal(await exists(f), false, 'file removed');
-    assert.equal((await fs.readdir(path.join(STORAGE_ROOT, String(doomed._id)))).length, 0, 'nothing left in the project\'s media folder');
+    // the whole media folder of a purged project is removed: it is fine for it to be gone entirely, not merely empty
+    assert.equal((await fs.readdir(path.join(STORAGE_ROOT, String(doomed._id))).catch(() => [])).length, 0, 'nothing left in the project\'s media folder');
 
     // the other project is untouched: documents and files
     assert.equal(await SocialProduct.countDocuments({ project_id: kept._id }), 2);

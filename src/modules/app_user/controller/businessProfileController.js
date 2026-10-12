@@ -487,8 +487,41 @@ export const getBusinessProfileData = async (req, res) => {
 };
 
 /**
+ * Map a failure from the GBP account/location discovery calls to a response
+ * with a stable `code`. Authenticated GBP discovery is separate from public
+ * Places discovery: these codes tell the UI whether the user must (re)connect
+ * Google, lacks permission, or the project's API access is the problem.
+ */
+export function gbpDiscoveryErrorResponse(error, fallbackMessage) {
+  const status = error?.response?.status;
+  const g = error?.response?.data?.error;
+  const reason = g?.details?.find?.(d => d?.reason)?.reason || null;
+  const build = (httpStatus, code, message) => ({
+    httpStatus,
+    body: { ...ResponseUtil.error(message, httpStatus), code }
+  });
+
+  if (error?.code === 'GOOGLE_TOKEN_REFRESH_FAILED' || status === 401) {
+    return build(401, 'GBP_RECONNECT_REQUIRED', 'Authentication failed: Invalid or expired credentials');
+  }
+  if (status === 403) {
+    if (reason === 'SERVICE_DISABLED') {
+      return build(503, 'GBP_API_NOT_ENABLED', 'Google Business Profile API is not enabled for this application.');
+    }
+    if (reason === 'ACCESS_TOKEN_SCOPE_INSUFFICIENT') {
+      return build(403, 'GBP_SCOPE_MISSING', 'Access denied: Missing Business Profile permissions');
+    }
+    return build(403, 'GBP_PERMISSION_DENIED', 'Access denied: Missing Business Profile permissions');
+  }
+  if (status === 429) {
+    return build(429, 'GBP_RATE_LIMITED', 'Google Business Profile rate limit exceeded. Please wait and retry.');
+  }
+  return build(500, 'GBP_ERROR', fallbackMessage);
+}
+
+/**
  * Get list of accessible Business Profile accounts
- * 
+ *
  * @param {Object} req - Express request object
  * @param {Object} res - Express response object
  */
@@ -514,7 +547,7 @@ export const getBusinessProfileAccountsController = async (req, res) => {
     const googleConnection = await GoogleConnection.findActiveConnection(userId, projectId, 'business_profile');
     
     if (!googleConnection) {
-      return res.status(400).json(ResponseUtil.error('Google account not connected', 400));
+      return res.status(400).json({ ...ResponseUtil.error('Google account not connected', 400), code: 'GBP_CONNECTION_REQUIRED' });
     }
 
     // Get Business Profile accounts
@@ -526,21 +559,10 @@ export const getBusinessProfileAccountsController = async (req, res) => {
 
   } catch (error) {
     LoggerUtil.error('Error fetching Business Profile accounts', error, { projectId });
-    
+
     // Preserve Google error codes - don't hide behind 500
-    if (error.response?.status === 429) {
-      return res.status(429).json(ResponseUtil.error('Google Business Profile rate limit exceeded. Please wait and retry.', 429, { retryAfter: 60 }));
-    }
-    
-    if (error.response?.status === 403) {
-      return res.status(403).json(ResponseUtil.accessDenied('Access denied: Missing Business Profile permissions'));
-    }
-    
-    if (error.response?.status === 401) {
-      return res.status(401).json(ResponseUtil.error('Authentication failed: Invalid or expired credentials', 401));
-    }
-    
-    return res.status(500).json(ResponseUtil.error('Unexpected Business Profile error', 500));
+    const { httpStatus, body } = gbpDiscoveryErrorResponse(error, 'Unexpected Business Profile error');
+    return res.status(httpStatus).json(body);
   }
 };
 
@@ -583,7 +605,7 @@ export const getBusinessProfileLocationsController = async (req, res) => {
     const googleConnection = await GoogleConnection.findActiveConnection(userId, projectId, 'business_profile');
     
     if (!googleConnection) {
-      return res.status(400).json(ResponseUtil.error('Google account not connected', 400));
+      return res.status(400).json({ ...ResponseUtil.error('Google account not connected', 400), code: 'GBP_CONNECTION_REQUIRED' });
     }
 
     // Get locations for the account
@@ -595,8 +617,9 @@ export const getBusinessProfileLocationsController = async (req, res) => {
 
   } catch (error) {
     LoggerUtil.error('Error fetching Business Profile locations', error, { projectId });
-    
-    return res.status(500).json(ResponseUtil.error('Failed to fetch Business Profile locations', 500));
+
+    const { httpStatus, body } = gbpDiscoveryErrorResponse(error, 'Failed to fetch Business Profile locations');
+    return res.status(httpStatus).json(body);
   }
 };
 

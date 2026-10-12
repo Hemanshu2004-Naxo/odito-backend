@@ -8,10 +8,16 @@ import { ProjectPerformanceService } from '../service/projectPerformance.service
 import { IssueCountsService } from '../service/issueCounts.service.js';
 import { TechnicalChecksService } from '../service/technicalChecks.service.js';
 import mongoose from 'mongoose';
+import { checkPublicWebsiteUrl } from '../../../utils/publicWebsiteUrl.js';
 import { isAuditInProgress } from '../service/projectAuditService.js';
 import { deleteProjectCascade } from '../service/projectCascadeDeleteService.js';
 import { hasCredits, deductCredits, refundCredits } from '../../../utils/creditService.js';
 import { canConsumeQuota } from '../../subscription/service/subscriptionLifecycle.js';
+
+// A retried create (double-click, or a client retry after a timed-out response)
+// for the SAME user + name + URL within this window returns the project that was
+// already created instead of failing - and never charges a second credit.
+const CREATE_IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 
 // Create a new SEO project
 const createSeoProject = async (req, res) => {
@@ -33,7 +39,8 @@ const createSeoProject = async (req, res) => {
     extracted_metadata,
     verified_business,
     source,
-    seo_scope
+    seo_scope,
+    business_name
   } = req.body;
 
   LoggerUtil.info('Create project request received', { userId: req.user?._id });
@@ -60,6 +67,38 @@ const createSeoProject = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'At least one keyword is required'
+      });
+    }
+
+    // Server-side URL validation. Syntax only (no fetch): http(s), no credentials,
+    // and nothing loopback/private/link-local/internal - main_url is fetched
+    // server-side later (crawler, brand assets), so it must not name our own network.
+    const urlCheck = checkPublicWebsiteUrl(main_url, { allowPublicIp: true, allowCustomPorts: true });
+    if (!urlCheck.ok) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_MAIN_URL',
+        message: urlCheck.reason
+      });
+    }
+
+    // Idempotent retry: see CREATE_IDEMPOTENCY_WINDOW_MS. Checked before the
+    // subscription/credit gates on purpose - replaying an already-created project
+    // must not fail just because that creation consumed the user's last credit.
+    const existingRecent = await SeoProject.findOne({
+      user_id: req.user._id,
+      project_name: project_name.trim(),
+      main_url: main_url.trim().toLowerCase(),
+      is_deleted: { $ne: true },
+      created_at: { $gte: new Date(Date.now() - CREATE_IDEMPOTENCY_WINDOW_MS) }
+    });
+    if (existingRecent) {
+      LoggerUtil.info('Duplicate project create replayed as no-op', { userId: req.user._id, projectId: existingRecent._id });
+      return res.status(200).json({
+        success: true,
+        idempotent: true,
+        message: 'SEO Project already created',
+        data: { project: existingRecent, projectId: existingRecent._id }
       });
     }
 
@@ -145,7 +184,9 @@ const createSeoProject = async (req, res) => {
       ...(extracted_metadata && { extracted_metadata }),
       ...(verified_business && { verified_business }),
       ...(source && { source }),
-      ...(seo_scope && { seo_scope })
+      ...(seo_scope && { seo_scope }),
+      // Name the customer entered/confirmed (unverified); separate from verified_business.
+      ...(typeof business_name === 'string' && business_name.trim() && { business_name: business_name.trim() })
     });
 
     // The credit is already spent at this point. If saving the project

@@ -10,6 +10,7 @@ import SocialPublication from '../model/SocialPublication.js';
 import metaApiService from './metaApiService.js';
 import { listPublications, getPublication, publishNow, executeDuePublications } from './socialPublishingService.js';
 import { recoverStalePublications } from './socialPublishRecoveryService.js';
+import { ensureProject, removeProject } from '../testSupport/projectFixture.js';
 
 /**
  * The derived `canRetry` flag: the backend — not each UI — decides whether a
@@ -44,6 +45,7 @@ describe('publication.canRetry', () => {
     if (!mongoAvailable) return;
     userId = new mongoose.Types.ObjectId();
     projectId = new mongoose.Types.ObjectId();
+    await ensureProject(projectId, { userId });
     project = projectId.toString();
     fb = await SocialAccount.create({ user_id: userId, project_id: projectId, platform: 'facebook', platformAccountId: 'pg_cr', pageId: 'pg_cr', accountType: 'page', accessToken: 'tok', status: 'active', isActive: true, scopes: ['pages_manage_posts'] });
   });
@@ -51,6 +53,7 @@ describe('publication.canRetry', () => {
     if (!mongoAvailable) return;
     await SocialPublication.deleteMany({ project_id: projectId });
     await SocialAccount.deleteMany({ project_id: projectId });
+    await removeProject(projectId);
   });
 
   const row = (over = {}) => SocialPublication.create({

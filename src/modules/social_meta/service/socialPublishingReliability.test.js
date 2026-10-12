@@ -15,6 +15,7 @@ import {
 import { recordPublished, settleFailure, getInstanceId } from './publicationLifecycle.js';
 import { createPublicationHandler } from '../controller/socialPublishingController.js';
 import '../testSupport/stubPermalinkLookup.js';
+import { ensureProject, removeProject } from '../testSupport/projectFixture.js';
 
 /**
  * Publishing reliability — real MongoDB, REAL platform adapters + REAL error
@@ -79,6 +80,7 @@ describe('socialPublishing reliability', () => {
     if (!mongoAvailable) return;
     userId = new mongoose.Types.ObjectId();
     projectId = new mongoose.Types.ObjectId();
+    await ensureProject(projectId, { userId });
     project = projectId.toString();
     const base = { user_id: userId, project_id: projectId, accessToken: PAGE_TOKEN, status: 'active', scopes: ['pages_show_list', 'pages_manage_posts', 'instagram_content_publish'] };
     fb = await SocialAccount.create({ ...base, platform: 'facebook', platformAccountId: 'pg_r1', pageId: 'pg_r1', accountType: 'page', isActive: true });
@@ -88,6 +90,7 @@ describe('socialPublishing reliability', () => {
     if (!mongoAvailable) return;
     await SocialPublication.deleteMany({ project_id: projectId });
     await SocialAccount.deleteMany({ project_id: projectId });
+    await removeProject(projectId);
   });
 
   /** A scheduled post that is due `minutesAgo` minutes ago (created via the real API for the future, then moved back in time). */

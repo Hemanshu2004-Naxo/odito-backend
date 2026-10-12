@@ -3,6 +3,7 @@ import { unlink } from 'fs/promises';
 import path from 'path';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 import mediaStorageService from '../../social_meta/service/media/mediaStorageService.js';
+import { purgeProjectSocialData } from '../../social_meta/service/socialProjectCleanupService.js';
 
 const SERVICE = 'ProjectCascadeDelete';
 
@@ -87,9 +88,12 @@ const CASCADE_REGISTRY = [
   { category: 'integrations', collection: 'google_ads_budget_alerts', field: 'project_id' },
 
   // 8c. Social Media AI — user-entered business profile and generated AI strategies.
-  // Only the collections added by those two features are registered here; the other
-  // social_meta collections (accounts, publications, ...) are deliberately NOT
-  // changed by this entry.
+  // The collections of the AI features are registered here. The connection / publishing
+  // collections (social accounts, publications, approval settings, import batches, pending
+  // Meta connections, synced posts) are NOT in this list on purpose: they hold live
+  // credentials and scheduled posts, so purgeProjectSocialData (socialProjectCleanupService.js)
+  // removes them in a fixed order BEFORE this loop, and a failure there keeps the project
+  // in the trash so the daily purge retries it.
   { category: 'social', collection: 'socialbusinessprofiles', field: 'project_id' },
   { category: 'social', collection: 'social_ai_strategies', field: 'project_id' },
   { category: 'social', collection: 'social_content_generations', field: 'project_id' },
@@ -285,7 +289,7 @@ async function purgeProjectCatalogMedia(projectId, projectIdObj) {
  * is a caller bug, not a partial-failure case.
  *
  * @param {string} projectId
- * @returns {Promise<{projectId:string, durationMs:number, collectionCounts:object, screenshotCounts:object, videoCounts:object, catalogMediaCounts:object, failures:object[], projectDeleted:boolean}>}
+ * @returns {Promise<{projectId:string, durationMs:number, collectionCounts:object, screenshotCounts:object, videoCounts:object, catalogMediaCounts:object, socialCounts:object, retryable:boolean, failures:object[], projectDeleted:boolean}>}
  */
 export async function deleteProjectCascade(projectId) {
   const projectIdObj = new mongoose.Types.ObjectId(projectId);
@@ -299,6 +303,11 @@ export async function deleteProjectCascade(projectId) {
 
   // 0. Catalog media files first: they are found through the product / profile documents the registry deletes below.
   const catalogMediaCounts = await purgeProjectCatalogMedia(projectId, projectIdObj);
+
+  // 0b. Social credentials + publications, first of all the database work: from here on nothing can be dispatched for this
+  // project. Never throws; critical failures are reported so the project document is kept and the purge can be retried.
+  const social = await purgeProjectSocialData(projectId);
+  for (const failure of social.failures) failures.push({ collection: `social:${failure.step}`, error: failure.error });
 
   // 1–7, 9: registry-driven collections (screenshot metadata, category 8,
   // is handled by purgeProjectScreenshots below since it needs file I/O
@@ -319,14 +328,20 @@ export async function deleteProjectCascade(projectId) {
   // 8b. AI-generated video metadata + file
   const videoCounts = await purgeProjectVideos(projectId, projectIdObj);
 
-  // 10. SeoProject — always last, always attempted regardless of failures above.
+  // 10. SeoProject — always last. Attempted regardless of failures above EXCEPT when live credentials or scheduled posts
+  // could not be removed: the project then stays in the trash (retryable) instead of orphaning them for good.
   let projectDeleted = false;
-  try {
-    const result = await db.collection('seoprojects').deleteOne({ _id: projectIdObj });
-    projectDeleted = result.deletedCount > 0;
-  } catch (error) {
-    failures.push({ collection: 'seoprojects', error: error.message });
-    LoggerUtil.error(`${SERVICE}: failed to delete SeoProject document`, error, { projectId });
+  const retryable = social.retryable;
+  if (retryable) {
+    LoggerUtil.error(`${SERVICE}: social credentials/publications were not fully removed; keeping the project for a retry`, null, { projectId });
+  } else {
+    try {
+      const result = await db.collection('seoprojects').deleteOne({ _id: projectIdObj });
+      projectDeleted = result.deletedCount > 0;
+    } catch (error) {
+      failures.push({ collection: 'seoprojects', error: error.message });
+      LoggerUtil.error(`${SERVICE}: failed to delete SeoProject document`, error, { projectId });
+    }
   }
 
   const summary = {
@@ -336,6 +351,8 @@ export async function deleteProjectCascade(projectId) {
     screenshotCounts,
     videoCounts,
     catalogMediaCounts,
+    socialCounts: social.counts,
+    retryable,
     failures,
     projectDeleted,
   };

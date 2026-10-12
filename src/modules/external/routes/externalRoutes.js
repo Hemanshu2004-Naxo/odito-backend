@@ -41,6 +41,29 @@ const auditRateLimiter = rateLimit({
 });
 
 /**
+ * Rate limiter for public business discovery (each call can hit billable
+ * Places API). The UI debounces, so a normal user stays far below this.
+ * 30 requests per minute per IP; skipped for localhost outside production.
+ */
+const businessSearchRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      code: 'RATE_LIMIT_EXCEEDED',
+      message: 'Too many searches. Please wait a moment and try again.'
+    });
+  },
+  skip: (req) => {
+    const isLocalhost = req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
+    return isLocalhost && process.env.NODE_ENV !== 'production';
+  }
+});
+
+/**
  * POST /external/local-seo
  * Fetch local SEO data using Google Places API
  * No authentication required
@@ -74,11 +97,12 @@ router.post('/discover-business',
 /**
  * POST /external/search-businesses
  * Returns up to 4 Google Places candidates for business name autocomplete.
- * No authentication required.
- * Body: { query: string, location: string }
+ * No authentication required (public Places discovery; no Google account needed).
+ * Body: { query: string (2-120 chars), location?: string }
+ * Validation + error mapping live in the controller.
  */
 router.post('/search-businesses',
-  [body('query').trim().notEmpty().withMessage('query is required')],
+  businessSearchRateLimiter,
   searchBusinessCandidatesController
 );
 

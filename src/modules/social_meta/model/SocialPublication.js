@@ -287,8 +287,10 @@ const socialPublicationSchema = new mongoose.Schema({
   // version / profile snapshot / pillar / objective the text was written for.
   // A post created any other way has `source: null`.
   generation: {
-    source: { type: String, enum: ['ai', null], default: null },
-    type: { type: String, enum: ['social_content', null], default: null },
+    // 'ai'            the text was written by the single-post AI generator (from a plan, or from a pillar + objective)
+    // 'calendar_plan' the text IS the caption a person reviewed in the content calendar, copied verbatim into this draft (no AI call)
+    source: { type: String, enum: ['ai', 'calendar_plan', null], default: null },
+    type: { type: String, enum: ['social_content', 'calendar_item', null], default: null },
     generationId: { type: mongoose.Schema.Types.ObjectId, default: null },
     strategyId: { type: mongoose.Schema.Types.ObjectId, default: null },
     strategyVersion: { type: Number, default: null },
@@ -298,6 +300,10 @@ const socialPublicationSchema = new mongoose.Schema({
     objective: { type: String, default: null, maxlength: 40 },
     // The content-calendar item this draft was written from (null for a post written without a plan).
     calendarItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    // For source 'calendar_plan': which state of the plan item the text was taken from (its revision) and when that plan was approved -
+    // so the text of a draft can always be traced to the exact approved plan it came from.
+    planRevision: { type: Number, default: null },
+    planApprovedAt: { type: Date, default: null },
   },
   // Provenance of the CURRENT design (media) when an AI design generation produced it: which generation,
   // for which content version, as which design version. No prompt, no provider output, no key. It describes

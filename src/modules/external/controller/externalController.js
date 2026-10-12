@@ -3,7 +3,9 @@ import mongoose from 'mongoose';
 import ExternalService from '../service/externalService.js';
 import HomepageAuditVideoService from '../service/homepageAuditVideo.service.js';
 import { discoverBusinessFromUrl } from '../service/businessDiscoveryService.js';
-import { searchBusinesses } from '../../../services/googlePlacesService.js';
+import { randomUUID } from 'node:crypto';
+import { searchBusinesses, PlacesError, PLACES_ERROR } from '../../../services/googlePlacesService.js';
+import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 
 const externalService = new ExternalService();
 
@@ -349,33 +351,104 @@ export const discoverBusinessController = async (req, res) => {
   }
 };
 
+export const BUSINESS_SEARCH_MIN_QUERY = 2;
+export const BUSINESS_SEARCH_MAX_QUERY = 120;
+export const BUSINESS_SEARCH_MAX_LOCATION = 120;
+const BUSINESS_SEARCH_MAX_RESULTS = 4;
+
+// PlacesError code -> what the browser gets. Messages are safe for end users
+// (no keys, project ids or upstream bodies); the technical detail is only in
+// the server log line written by googlePlacesService.
+const PLACES_HTTP = {
+  [PLACES_ERROR.NOT_CONFIGURED]:   [503, 'Business search is not available right now. You can add your business manually or skip this step.'],
+  [PLACES_ERROR.KEY_INVALID]:      [503, 'Business search is not available right now. You can add your business manually or skip this step.'],
+  [PLACES_ERROR.ACCESS_DENIED]:    [503, 'Business search is not available right now. You can add your business manually or skip this step.'],
+  [PLACES_ERROR.BILLING_REQUIRED]: [503, 'Business search is not available right now. You can add your business manually or skip this step.'],
+  [PLACES_ERROR.RATE_LIMITED]:     [429, 'Too many searches. Please wait a moment and try again.'],
+  [PLACES_ERROR.TIMEOUT]:          [504, 'The business search timed out. Please try again.'],
+  [PLACES_ERROR.UNAVAILABLE]:      [502, 'Google business search is temporarily unavailable. Please try again.'],
+  [PLACES_ERROR.BAD_RESPONSE]:     [502, 'Google business search returned an unexpected response. Please try again.'],
+  [PLACES_ERROR.INVALID_REQUEST]:  [400, 'That search could not be processed. Please check the business name.']
+};
+
+/**
+ * Map a Places search failure to a response. Never forwards upstream bodies,
+ * messages from Google, or stack traces.
+ */
+export function placesErrorResponse(error) {
+  const code = error instanceof PlacesError ? error.code : 'PLACES_UNAVAILABLE';
+  const [status, message] = PLACES_HTTP[code] || PLACES_HTTP[PLACES_ERROR.UNAVAILABLE];
+  return { status, body: { success: false, code, message } };
+}
+
+/**
+ * Stable application schema for a Places candidate - no raw Google payload.
+ * `requiresGoogleConnection` is intentionally absent: public Places discovery
+ * never needs a connected Google account.
+ */
+export function toBusinessCandidate(place) {
+  return {
+    placeId: place.placeId,
+    name: place.name,
+    formattedAddress: place.address || '',
+    // Alias kept for existing consumers of this endpoint (address-based UIs).
+    address: place.address || '',
+    location: place.lat != null && place.lng != null
+      ? { latitude: place.lat, longitude: place.lng }
+      : null,
+    businessStatus: place.businessStatus || null,
+    website: place.website || '',
+    phone: place.phone || '',
+    source: 'google_places'
+  };
+}
+
 /**
  * POST /external/search-businesses
- * Returns up to 4 Google Places candidates for autocomplete.
- * Requires both query (business name fragment) and location.
+ * Public Places discovery (no auth, no Google account needed) for the Quick
+ * Audit business step. Returns up to 4 normalized candidates.
+ *
+ * Failures are returned as non-2xx with a stable `code` so the UI can tell
+ * "Google found nothing" (200, data: []) from "the search itself failed".
  */
 export const searchBusinessCandidatesController = async (req, res) => {
-  try {
-    const { query, location = '' } = req.body;
-    if (!query || !query.trim()) {
-      return res.status(400).json({ success: false, message: 'query is required' });
-    }
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  res.set?.('X-Request-Id', requestId);
 
-    console.log('[EXTERNAL] Business candidates search:', query, location || '(no location)');
-    const results = await searchBusinesses(query.trim(), location.trim());
-    return res.status(200).json({
-      success: true,
-      data: results.slice(0, 4).map(r => ({
-        name: r.name,
-        address: r.address,
-        website: r.website,
-        phone: r.phone
-      }))
+  const rawQuery = req.body?.query;
+  const rawLocation = req.body?.location ?? '';
+
+  if (typeof rawQuery !== 'string' || typeof rawLocation !== 'string') {
+    return res.status(400).json({ success: false, code: 'INVALID_QUERY', message: 'query must be a string' });
+  }
+  const query = rawQuery.trim().replace(/\s+/g, ' ');
+  const location = rawLocation.trim().replace(/\s+/g, ' ');
+
+  if (query.length < BUSINESS_SEARCH_MIN_QUERY) {
+    return res.status(400).json({ success: false, code: 'INVALID_QUERY', message: `query must be at least ${BUSINESS_SEARCH_MIN_QUERY} characters` });
+  }
+  if (query.length > BUSINESS_SEARCH_MAX_QUERY || location.length > BUSINESS_SEARCH_MAX_LOCATION) {
+    return res.status(400).json({ success: false, code: 'INVALID_QUERY', message: `query must be at most ${BUSINESS_SEARCH_MAX_QUERY} characters` });
+  }
+
+  try {
+    const results = await searchBusinesses(query, location, { requestId });
+    const data = results.slice(0, BUSINESS_SEARCH_MAX_RESULTS).map(toBusinessCandidate);
+
+    LoggerUtil.info('[EXTERNAL] Business candidates search', {
+      requestId, provider: 'google_places', queryLength: query.length,
+      candidates: data.length, durationMs: Date.now() - startedAt, status: 200
     });
+    return res.status(200).json({ success: true, data, meta: { source: 'google_places', count: data.length } });
 
   } catch (error) {
-    console.error('[EXTERNAL] searchBusinessCandidatesController error:', error.message);
-    return res.status(200).json({ success: true, data: [] });
+    const { status, body } = placesErrorResponse(error);
+    LoggerUtil.warn('[EXTERNAL] Business candidates search failed', {
+      requestId, provider: 'google_places', queryLength: query.length,
+      errorCode: body.code, durationMs: Date.now() - startedAt, status
+    });
+    return res.status(status).json(body);
   }
 };
 

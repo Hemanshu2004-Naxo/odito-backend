@@ -18,14 +18,14 @@ import { LoggerUtil } from '../../../utils/LoggerUtil.js';
  * POST   /items/:itemId/approve     approve the PLAN (never content, design or publishing)
  * POST   /items/:itemId/revoke-approval
  * POST   /items/:itemId/regenerate  re-plan some fields with AI (edited fields are protected unless overwriteEdited)
- * POST   /items/:itemId/generate-content  202: start the existing post generator from this plan, for one platform
+ * POST   /items/:itemId/generate-content  create the post draft for one platform: mode 'plan' (201) uses the plan's caption verbatim; mode 'ai' (202) writes a new one
  */
 
 const STATUS = {
   NOT_FOUND: 404,
   // state conflicts
   ITEM_CONFLICT: 409, ITEM_LOCKED: 409, CALENDAR_ARCHIVED: 409, PLATFORM_HAS_PUBLICATION: 409, EDITED_FIELDS: 409, NO_CALENDAR: 409,
-  NOT_APPROVABLE: 409, NOT_APPROVED: 409, PLAN_NOT_APPROVED: 409, ALREADY_GENERATED: 409, STRATEGY_CHANGED: 409, LIMIT_REACHED: 409, CONFLICT: 409,
+  NOT_APPROVABLE: 409, NOT_APPROVED: 409, NO_PLAN_CAPTION: 422, CAPTION_TOO_LONG: 422, TOO_MANY_HASHTAGS: 422, PROHIBITED_PHRASE: 422, PLAN_NOT_APPROVED: 409, ALREADY_GENERATED: 409, STRATEGY_CHANGED: 409, LIMIT_REACHED: 409, CONFLICT: 409,
   // the request is well-formed but not allowed
   PLATFORM_NOT_CONNECTED: 422, PLATFORM_NOT_IN_STRATEGY: 422, FORMAT_NOT_SUPPORTED: 422, KPI_MISMATCH: 422, CTA_MISMATCH: 422,
   DATE_OUT_OF_RANGE: 422, DATE_IN_PAST: 422, NO_STRATEGY: 422, OBJECTIVE_NOT_IN_STRATEGY: 422, INSUFFICIENT_PROFILE: 422, AI_BAD_OUTPUT: 422,
@@ -63,12 +63,22 @@ export const createItemHandler = run('add the calendar item', (req) => createIte
 export const approveItemHandler = run('approve the plan', (req) => approveItem(req.projectId, req.userId, req.params.itemId, bodyWithoutRouting(req)));
 export const revokeApprovalHandler = run('withdraw the approval', (req) => revokeItemApproval(req.projectId, req.userId, req.params.itemId, bodyWithoutRouting(req)));
 export const regenerateItemHandler = run('regenerate the plan', (req) => regenerateItem(req.projectId, req.userId, req.params.itemId, bodyWithoutRouting(req)));
-export const generateItemContentHandler = run(
-  'start the post generation',
-  (req) => generateItemContent(req.projectId, req.userId, req.params.itemId, bodyWithoutRouting(req)),
-  (r) => ({ status: 'generating', generationId: r.generation?.id || null, alreadyRunning: !!r.alreadyRunning, generation: r.generation }),
-  202,
-);
+/**
+ * POST /items/:itemId/generate-content
+ *   mode 'plan'  201 { mode: 'plan', item, publication }   the draft's text is the caption of the plan, verbatim (no AI call)
+ *   mode 'ai'    202 { status: 'generating', generation }  the single-post generator writes a NEW caption; poll /social/ai-content/status
+ */
+export async function generateItemContentHandler(req, res) {
+  try {
+    const result = await generateItemContent(req.projectId, req.userId, req.params.itemId, bodyWithoutRouting(req));
+    if (!result.success) return sendFailure(res, result.error);
+    if (result.mode === 'plan') return res.status(201).json(ResponseUtil.success({ mode: 'plan', status: 'draft_created', item: result.item, publication: result.publication }));
+    return res.status(202).json(ResponseUtil.success({ mode: 'ai', status: 'generating', generationId: result.generation?.id || null, alreadyRunning: !!result.alreadyRunning, generation: result.generation }));
+  } catch (error) {
+    LoggerUtil.error('[SOCIAL_CALENDAR_ITEM] start the post generation failed', { message: error.message }, { projectId: req.projectId });
+    return serverError(res, 'Failed to create the post');
+  }
+}
 
 export default {
   getOptionsHandler, getItemHandler, updateItemHandler, createItemHandler, approveItemHandler, revokeApprovalHandler, regenerateItemHandler, generateItemContentHandler,

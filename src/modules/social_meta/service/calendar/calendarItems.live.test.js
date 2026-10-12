@@ -631,11 +631,11 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     const doc = await first();
     const provider = contentProvider();
     setContentProviderOverride(provider);
-    const r = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' });
+    const r = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' });
     assert.equal(r.error.code, 'PLAN_NOT_APPROVED');
     assert.equal(provider.calls.length, 0);
     assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'tiktok' })).error.code, 'INVALID_FIELD');
-    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'instagram' })).error.code, 'INVALID_FIELD', 'the item is not planned for Instagram');
+    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'instagram', mode: 'ai' })).error.code, 'INVALID_FIELD', 'the item is not planned for Instagram');
   });
 
   test('31: generating content uses the EXISTING generator with the plan as input, creates a real draft publication and links it back to the item', async (t) => {
@@ -646,7 +646,7 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: 1 }));
     const provider = contentProvider();
     setContentProviderOverride(provider);
-    const started = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' });
+    const started = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' });
     assert.equal(started.success, true, JSON.stringify(started.error));
     assert.equal(started.started, true);
     assert.equal(started.generation.calendarItemId, String(doc._id));
@@ -681,17 +681,176 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     ok(await edit(doc, { platforms: ['facebook', 'instagram'] }));
     ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: 1 }));
     setContentProviderOverride(contentProvider());
-    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' })).success, true);
+    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' })).success, true);
     await waitFor(async () => (await reload(doc)).publicationIds.length === 1);
     await waitFor(async () => !(await SocialContentGeneration.exists({ project_id: project._id, status: 'generating' })));
-    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' })).error.code, 'ALREADY_GENERATED');
-    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'instagram' })).success, true);
+    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' })).error.code, 'ALREADY_GENERATED');
+    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'instagram', mode: 'ai' })).success, true);
     await waitFor(async () => (await reload(doc)).publicationIds.length === 2);
     const pubs = await SocialPublication.find({ _id: { $in: (await reload(doc)).publicationIds } }).lean();
     assert.deepEqual(pubs.map((p) => p.platform).sort(), ['facebook', 'instagram']);
     const latest = await reload(doc);
     assert.equal((await revokeItemApproval(pid, userId, String(doc._id), { expectedRevision: latest.revision })).error.code, 'NOT_APPROVED');
     assert.equal((await edit(latest, { platforms: ['instagram'] })).error.code, 'PLATFORM_HAS_PUBLICATION');
+  });
+
+  // ── the caption source of truth: the reviewed plan caption becomes the draft, verbatim ──
+  const approvedItem = async (fields = {}) => {
+    const doc = await first();
+    ok(await edit(doc, { caption: 'Brushing twice a day keeps your smile strong.\n\nBook a check-up with us this month.', hashtags: ['#DentalCare', '#HealthySmile'], ...fields }));
+    const edited = await reload(doc);
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: edited.revision }));
+    return reload(doc);
+  };
+  const create = (doc, over = {}) => generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', expectedRevision: doc.revision, ...over });
+
+  test('P1: the draft IS the reviewed caption, word for word, with its hashtags - no AI call, nothing rewritten - and it records which plan revision it came from', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const provider = contentProvider();
+    setContentProviderOverride(provider);
+    const doc = await approvedItem();
+    const r = await create(doc);
+    assert.equal(r.success, true, JSON.stringify(r.error));
+    assert.equal(r.mode, 'plan');
+
+    assert.equal(provider.calls.length, 0, 'no AI call: the person\'s words are not rewritten');
+    const pub = await SocialPublication.findById(r.publication.id).lean();
+    assert.equal(pub.content, 'Brushing twice a day keeps your smile strong.\n\nBook a check-up with us this month.\n\n#DentalCare #HealthySmile', 'verbatim, hashtags appended once');
+    assert.equal(pub.status, 'draft', 'nothing is scheduled or published');
+    assert.equal(pub.scheduledAt, null);
+    assert.equal(pub.generation.source, 'calendar_plan');
+    assert.equal(pub.generation.type, 'calendar_item');
+    assert.equal(pub.generation.planRevision, doc.revision, 'traceable to the approved plan revision');
+    assert.ok(pub.generation.planApprovedAt);
+    assert.equal(String(pub.generation.calendarItemId), String(doc._id));
+    assert.ok(pub.approvalState, 'it entered the existing content approval workflow');
+
+    const linked = await reload(doc);
+    assert.deepEqual(linked.publicationIds.map(String), [String(pub._id)]);
+    assert.equal(linked.status, 'content_generated');
+    assert.equal(linked.caption, doc.caption, 'the plan itself is untouched');
+    assert.equal(r.publication.generation.source, 'calendar_plan', 'the API tells the UI where the text came from');
+    assert.deepEqual(fetchCalls, [], 'nothing was sent anywhere');
+  });
+
+  test('P2: with a caption in the plan the default is to USE it; with none the default is AI writing; each choice can be asked for explicitly', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const provider = contentProvider();
+    setContentProviderOverride(provider);
+    // no caption in the plan -> the only thing that can write it is AI
+    const bare = await approvedItem({ caption: '', hashtags: [] });
+    const refused = await create(bare, { mode: 'plan' });
+    assert.equal(refused.error.code, 'NO_PLAN_CAPTION');
+    assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
+    assert.equal((await reload(bare)).revision, bare.revision, 'a refusal changes nothing');
+    const byDefault = await create(bare);
+    assert.equal(byDefault.success, true, JSON.stringify(byDefault.error));
+    assert.equal(byDefault.started, true, 'no caption to use: the AI path started');
+    await waitFor(async () => (await reload(bare)).publicationIds.length === 1);
+    assert.equal(provider.calls.length, 1);
+    assert.equal((await reload(bare)).caption, '', 'the plan\'s own caption is not filled in behind the person\'s back');
+    assert.equal((await SocialPublication.findOne({ project_id: project._id }).lean()).generation.source, 'ai');
+    assert.equal((await generateItemContent(pid, userId, String(bare._id), { platform: 'facebook', mode: 'sideways', expectedRevision: 0 })).error.code, 'INVALID_FIELD');
+  });
+
+  test('P3: asking for AI explicitly leaves the reviewed caption in the plan exactly as it was; the AI text is a separate draft that goes through approval', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    setContentProviderOverride(contentProvider());
+    const doc = await approvedItem();
+    const r = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' });
+    assert.equal(r.success, true, JSON.stringify(r.error));
+    await waitFor(async () => (await reload(doc)).publicationIds.length === 1);
+    const after = await reload(doc);
+    assert.equal(after.caption, doc.caption, 'the plan caption is unchanged');
+    assert.deepEqual(after.hashtags, doc.hashtags);
+    const pub = await SocialPublication.findOne({ project_id: project._id }).lean();
+    assert.equal(pub.generation.source, 'ai');
+    assert.notEqual(pub.content, doc.caption);
+  });
+
+  test('P4: each platform gets ITS OWN reviewed copy (platform-specific caption and hashtags), falling back to the shared one', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await edit(doc, { platforms: ['facebook', 'instagram'], caption: 'Shared caption for everyone.', hashtags: ['#Shared'], platformContent: [{ platform: 'instagram', caption: 'Short Instagram caption.', primaryCta: 'Save this', hashtags: ['#Insta', '#Only'] }] }));
+    const edited = await reload(doc);
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: edited.revision }));
+    const fb = await create(await reload(doc), { platform: 'facebook' });
+    assert.equal(fb.success, true, JSON.stringify(fb.error));
+    const ig = await create(await reload(doc), { platform: 'instagram' });
+    assert.equal(ig.success, true, JSON.stringify(ig.error));
+    const pubs = await SocialPublication.find({ project_id: project._id }).lean();
+    assert.equal(pubs.find((p) => p.platform === 'facebook').content, 'Shared caption for everyone.\n\n#Shared');
+    assert.equal(pubs.find((p) => p.platform === 'instagram').content, 'Short Instagram caption.\n\n#Insta #Only');
+  });
+
+  test('P5: a caption that does not fit the platform, has too many hashtags or uses a prohibited phrase is REFUSED with the reason - never cut, never published (a backstop for text that changed after approval)', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await updateProfile(pid, userId, { prohibitedPhrases: ['cheapest'] });
+    await seedStrategy(); await seedCalendar();
+    setContentProviderOverride(contentProvider());
+    const cases = [
+      [{ caption: 'x'.repeat(2300), platforms: ['facebook', 'instagram'] }, 'CAPTION_TOO_LONG', { platform: 'instagram' }],
+      [{ caption: 'Fine caption', hashtags: Array.from({ length: 11 }, (_, i) => `#tag${i}`) }, 'TOO_MANY_HASHTAGS', { platform: 'facebook' }],
+      [{ caption: 'We are the Cheapest dentist in town.' }, 'PROHIBITED_PHRASE', { platform: 'facebook' }],
+    ];
+    for (const [fields, code, over] of cases) {
+      await SocialContentCalendarItem.updateMany({ calendar_id: calendar._id }, { $set: { status: 'planned', editedFields: [], publicationIds: [] } });
+      const doc = await approvedItem();
+      // the stored plan changes underneath the approval (legacy data, a direct edit): the draft step re-checks the text itself
+      await SocialContentCalendarItem.updateOne({ _id: doc._id }, { $set: fields });
+      const approved = await reload(doc);
+      const r = await create(approved, over);
+      assert.equal(r.error?.code, code, JSON.stringify(r));
+      assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0, `${code}: no draft`);
+      assert.equal((await reload(doc)).revision, approved.revision, `${code}: the item is untouched`);
+    }
+  });
+
+  test('P6: it needs the revision the person saw: missing -> refused; stale -> a conflict that creates nothing; two clicks at once -> exactly ONE draft', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    setContentProviderOverride(contentProvider());
+    const doc = await approvedItem();
+    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' })).error.field, 'expectedRevision');
+    assert.equal((await create(doc, { expectedRevision: doc.revision - 1 })).error.code, 'ITEM_CONFLICT');
+    assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
+
+    const results = await Promise.all([create(doc), create(doc), create(doc)]);
+    assert.equal(results.filter((r) => r.success).length, 1, JSON.stringify(results.map((r) => r.error?.code)));
+    assert.ok(results.filter((r) => !r.success).every((r) => ['ITEM_CONFLICT', 'ALREADY_GENERATED'].includes(r.error.code)));
+    assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 1, 'one draft, not three');
+  });
+
+  test('P7: once the draft exists it is the source of truth: editing the plan caption afterwards does not touch the draft (and the draft carries the revision it came from)', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await approvedItem();
+    const r = await create(doc);
+    assert.equal(r.success, true, JSON.stringify(r.error));
+    const linked = await reload(doc);
+    ok(await edit(linked, { caption: 'A later edit of the plan caption.' }));
+    const pub = await SocialPublication.findById(r.publication.id).lean();
+    assert.match(pub.content, /^Brushing twice a day/);
+    assert.equal(pub.generation.planRevision, doc.revision);
+    assert.notEqual((await reload(doc)).caption, pub.content);
+  });
+
+  test('P8: an unapproved plan, a changed strategy and a disconnected platform each refuse before anything is created', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc0 = await first();
+    assert.equal((await create(doc0)).error.code, 'PLAN_NOT_APPROVED');
+    const doc = await approvedItem();
+    await SocialAccount.updateMany({ project_id: project._id, platform: 'facebook' }, { $set: { status: 'revoked' } });
+    assert.equal((await create(doc)).error.code, 'PLATFORM_NOT_CONNECTED');
+    await SocialAccount.updateMany({ project_id: project._id, platform: 'facebook' }, { $set: { status: 'active' } });
+    await seedStrategy();
+    assert.equal((await create(doc)).error.code, 'STRATEGY_CHANGED');
+    assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
   });
 
   test('33: if the strategy changed since the calendar was made, content is NOT generated from the old plan', async (t) => {
@@ -702,7 +861,7 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     await seedStrategy();
     const provider = contentProvider();
     setContentProviderOverride(provider);
-    const r = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' });
+    const r = await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' });
     assert.equal(r.error.code, 'STRATEGY_CHANGED');
     assert.equal(provider.calls.length, 0);
     assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
@@ -717,7 +876,7 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     const doc = await first();
     ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: 0 }));
     setContentProviderOverride(mockContentProvider({ behavior: () => ({ nonsense: true }) }));
-    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' })).success, true);
+    assert.equal((await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' })).success, true);
     await waitFor(async () => SocialContentGeneration.exists({ project_id: project._id, status: 'failed' }));
     const same = await reload(doc);
     assert.deepEqual(same.publicationIds, []);
@@ -733,7 +892,7 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     const doc = await first();
     ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: 0 }));
     setContentProviderOverride(contentProvider());
-    await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook' });
+    await generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', mode: 'ai' });
     const linked = await waitFor(async () => { const d = await reload(doc); return d.publicationIds.length ? d : null; });
     await SocialPublication.updateOne({ _id: linked.publicationIds[0] }, { $set: { status: 'published', publishedAt: new Date() } });
     const state = await getCalendarState(pid);

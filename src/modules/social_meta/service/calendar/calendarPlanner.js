@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { PLATFORMS, WEEKDAYS } from '../aiStrategy/strategyOutputSchema.js';
-import { CALENDAR_MIN_DAYS, CALENDAR_MAX_DAYS } from './calendarConfig.js';
+import { CALENDAR_MIN_DAYS, CALENDAR_MIN_MONTHS, CALENDAR_MAX_MONTHS, CALENDAR_MAX_START_AHEAD_DAYS, CALENDAR_MAX_POSTS, CALENDAR_BATCH_SIZE } from './calendarConfig.js';
 import { DISTRIBUTION_MODES } from '../../model/SocialContentCalendar.js';
 
 /**
@@ -19,13 +19,26 @@ import { DISTRIBUTION_MODES } from '../../model/SocialContentCalendar.js';
  * balanced and platform_specific every item targets exactly one platform.
  *
  * Dates are plain "YYYY-MM-DD" calendar dates (no timezone), handled in UTC so a server's local zone never shifts one.
+ *
+ * DATE SEMANTICS (one rule, used by validation, generation, storage, display and the tests):
+ *   - A calendar is a start date plus a number of CALENDAR MONTHS (1-6).
+ *   - The start date is INCLUSIVE. The period runs up to, and not including, start + N months; the END DATE stored and shown
+ *     everywhere is the LAST day of the period, i.e. INCLUSIVE (start + N months - 1 day).
+ *       Oct 13 + 1 month -> ends Nov 12      Jan 1 + 3 months -> ends Mar 31      Jul 1 + 6 months -> ends Dec 31
+ *   - When the start's day does not exist in the target month it is CLAMPED to that month's last day, so the period never
+ *     skips a month and never spills into the next one:  Jan 31 + 1 month = Feb 28 (29 in a leap year), so the period ends
+ *     Feb 27 (28).  Aug 31 + 6 months = Feb 28 (29), so it ends Feb 27 (28).
+ *   - Everything is computed on calendar dates in UTC. There is no time of day, so a daylight-saving change can never move a
+ *     date, and a date is never converted between time zones.
+ *   - Posts per week is a weekly TARGET enforced as an exact quota per Monday-first week (weeklyQuota); a week only partly
+ *     inside the period gets a proportional share. The total is therefore known exactly before any AI call (previewCalendarPlan).
  */
 
 export { DISTRIBUTION_MODES };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const INPUT_KEYS = ['startDate', 'endDate', 'postsPerWeek', 'platforms', 'distributionMode'];
+const INPUT_KEYS = ['startDate', 'months', 'endDate', 'postsPerWeek', 'platforms', 'distributionMode'];
 
 const SLOT_ATTEMPTS = 24; // seeded weekday plans tried before the best one is kept (a plan that fails validation is never preferred)
 
@@ -43,6 +56,24 @@ export function parseDate(value) {
 export const formatDate = (ms) => new Date(ms).toISOString().slice(0, 10);
 const weekdayOf = (ms) => WEEKDAYS[(new Date(ms).getUTCDay() + 6) % 7]; // Monday-first
 
+const daysInMonth = (year, month0) => new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+
+/** epoch ms of (the date at `ms`) + `months` calendar months, with the day clamped to the target month's last day. */
+export function addMonthsClamped(ms, months) {
+  const d = new Date(ms);
+  const total = d.getUTCFullYear() * 12 + d.getUTCMonth() + months;
+  const year = Math.floor(total / 12);
+  const month0 = total - year * 12;
+  return Date.UTC(year, month0, Math.min(d.getUTCDate(), daysInMonth(year, month0)));
+}
+
+/** The LAST day (inclusive, "YYYY-MM-DD") of a calendar starting on `startDate` and covering `months` months; null for a bad input. */
+export function periodEndDate(startDate, months) {
+  const start = parseDate(startDate);
+  if (start === null || !Number.isInteger(months) || months < 1) return null;
+  return formatDate(addMonthsClamped(start, months) - DAY_MS);
+}
+
 /**
  * Validates the user's calendar request. Returns { value } or { error: { code, message } } — never throws.
  * `today` is the server's current UTC date; a start date up to one day earlier is accepted, because a user west of UTC
@@ -54,14 +85,35 @@ export function validateCalendarInput(body, { today = formatDate(Date.now()) } =
   for (const key of Object.keys(fields)) if (!INPUT_KEYS.includes(key)) return bad('UNKNOWN_FIELD', `"${key}" is not a calendar setting.`);
 
   const start = parseDate(fields.startDate);
-  const end = parseDate(fields.endDate);
   if (start === null) return bad('INVALID_DATE', 'startDate must be a real date like 2026-10-01.');
-  if (end === null) return bad('INVALID_DATE', 'endDate must be a real date like 2026-10-31.');
-  if (end < start) return bad('INVALID_DATE_RANGE', 'The end date must be on or after the start date.');
   if (start < parseDate(today) - DAY_MS) return bad('DATE_IN_PAST', 'The calendar cannot start in the past.');
+  if (start > parseDate(today) + CALENDAR_MAX_START_AHEAD_DAYS * DAY_MS) return bad('DATE_TOO_FAR', `The calendar cannot start more than ${CALENDAR_MAX_START_AHEAD_DAYS} days from now.`);
+
+  // The length: `months` (1-6, the product's model) - the end date is derived from it. A legacy client may instead send an explicit
+  // endDate (no months): still accepted, but never beyond what 6 months would allow.
+  let months = null;
+  let endDate;
+  if (fields.months !== undefined) {
+    months = fields.months;
+    if (typeof months !== 'number' || !Number.isInteger(months) || months < CALENDAR_MIN_MONTHS || months > CALENDAR_MAX_MONTHS) {
+      return bad('INVALID_DURATION', `months must be a whole number from ${CALENDAR_MIN_MONTHS} to ${CALENDAR_MAX_MONTHS}.`);
+    }
+    endDate = periodEndDate(fields.startDate, months);
+    if (fields.endDate !== undefined && fields.endDate !== endDate) {
+      return bad('INVALID_DATE_RANGE', `endDate does not match ${months} month${months === 1 ? '' : 's'} from ${fields.startDate} (that period ends ${endDate}). Leave endDate out: it is worked out for you.`);
+    }
+  } else {
+    const end = parseDate(fields.endDate);
+    if (end === null) return bad('INVALID_DATE', 'Send months (1-6), or an endDate like 2026-10-31.');
+    if (end < start) return bad('INVALID_DATE_RANGE', 'The end date must be on or after the start date.');
+    const legacyDays = Math.round((end - start) / DAY_MS) + 1;
+    if (legacyDays < CALENDAR_MIN_DAYS) return bad('INVALID_DATE_RANGE', `A calendar must cover at least ${CALENDAR_MIN_DAYS} days.`);
+    if (end > parseDate(periodEndDate(fields.startDate, CALENDAR_MAX_MONTHS))) return bad('INVALID_DATE_RANGE', `A calendar can cover at most ${CALENDAR_MAX_MONTHS} months.`);
+    endDate = fields.endDate;
+  }
+  const end = parseDate(endDate);
   const days = Math.round((end - start) / DAY_MS) + 1;
   if (days < CALENDAR_MIN_DAYS) return bad('INVALID_DATE_RANGE', `A calendar must cover at least ${CALENDAR_MIN_DAYS} days.`);
-  if (days > CALENDAR_MAX_DAYS) return bad('INVALID_DATE_RANGE', `A calendar can cover at most ${CALENDAR_MAX_DAYS} days.`);
 
   const ppw = fields.postsPerWeek;
   if (typeof ppw !== 'number' || !Number.isInteger(ppw) || ppw < 1 || ppw > 7) return bad('INVALID_POSTS_PER_WEEK', 'postsPerWeek must be a whole number from 1 to 7.');
@@ -77,7 +129,8 @@ export function validateCalendarInput(body, { today = formatDate(Date.now()) } =
   return {
     value: {
       startDate: fields.startDate,
-      endDate: fields.endDate,
+      endDate,
+      months,
       postsPerWeek: ppw,
       platforms: PLATFORMS.filter((p) => platforms.includes(p)), // canonical order, whatever order the client sent
       distributionMode: mode,
@@ -359,4 +412,23 @@ export function assignPlatforms(slots, platforms, mode, strategyPlatforms = [], 
   return sequence.map((p) => [p]);
 }
 
-export default { validateCalendarInput, buildSlots, validateSlotPlan, calendarSeed, weeklyQuota, splitWeeks, weightedSequence, allocatePillars, assignPlatforms, parseDate, formatDate };
+/**
+ * What a calendar request means, WITHOUT any AI call or database access: the validated period, the exact number of posts the
+ * planner will schedule, and the weeks that are only partly inside the period (their share is pro-rated). The count is exact
+ * because the server's quota per week does not depend on the seed or on the AI. Refuses a calendar larger than
+ * CALENDAR_MAX_POSTS before anything expensive starts. Returns { value } or { error: { code, message } }.
+ */
+export function previewCalendarPlan(body, options) {
+  const checked = validateCalendarInput(body, options);
+  if (checked.error) return checked;
+  const { startDate, endDate, months, postsPerWeek, days } = checked.value;
+  const slots = buildSlots({ startDate, endDate, postsPerWeek });
+  if (!slots.length) return bad('INVALID_DATE_RANGE', 'That date range has no posting days. Choose a longer range.');
+  if (slots.length > CALENDAR_MAX_POSTS) return bad('CALENDAR_TOO_LARGE', `That would be ${slots.length} posts; a calendar can hold at most ${CALENDAR_MAX_POSTS}. Choose fewer posts per week or a shorter calendar.`);
+  const partialWeeks = splitWeeks(parseDate(startDate), parseDate(endDate))
+    .filter((w) => w.valid.length < 7)
+    .map((w) => ({ weekStart: formatDate(w.start), days: w.valid.length, posts: weeklyQuota(w.valid.length, postsPerWeek) }));
+  return { value: { ...checked.value, months, days, totalPosts: slots.length, partialWeeks, steps: Math.ceil(slots.length / CALENDAR_BATCH_SIZE) } };
+}
+
+export default { validateCalendarInput, previewCalendarPlan, periodEndDate, addMonthsClamped, buildSlots, validateSlotPlan, calendarSeed, weeklyQuota, splitWeeks, weightedSequence, allocatePillars, assignPlatforms, parseDate, formatDate };

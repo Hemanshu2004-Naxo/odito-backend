@@ -87,6 +87,7 @@ import { startStaleLockScheduler } from './src/modules/jobs/service/staleLockSch
 import { startVerificationBatchRecoveryScheduler } from './src/modules/verification/service/verificationBatchRecoveryScheduler.js';
 import { startSocialScheduler } from './src/modules/social_meta/service/socialSchedulerService.js';
 import { startBulkImportRecoveryScheduler } from './src/modules/social_meta/service/bulkImport/bulkImportRecoveryScheduler.js';
+import { startCalendarRecoveryScheduler } from './src/modules/social_meta/service/calendar/calendarRecoveryScheduler.js';
 import { startAutomationScheduler } from './src/modules/aiCampaign/service/automation/automationScheduler.js';
 import { startReviewSnapshotScheduler } from './src/services/businessProfileReviewSnapshotScheduler.js';
 import { handleStripeWebhook } from './src/modules/subscription/controller/subscriptionController.js';
@@ -290,6 +291,11 @@ const startServer = async () => {
   // mid-import never blocks a project's next upload. Never touches
   // publications. Opt-out via BULK_IMPORT_RECOVERY_ENABLED=false.
   startBulkImportRecoveryScheduler();
+
+  // Social Content Calendar: every minute, take over a calendar generation whose worker died or restarted (its lease expired) and
+  // continue it from the posts already saved, so a restart never costs a calendar or locks the project out. Safe on many instances
+  // (every take-over is one conditional update). Opt-out via SOCIAL_AI_CALENDAR_RECOVERY_ENABLED=false.
+  startCalendarRecoveryScheduler();
 
   // AI Campaign Builder — Phase 8 automation: every 15 minutes, scans for
   // enabled automation policies whose scheduled window has arrived and runs

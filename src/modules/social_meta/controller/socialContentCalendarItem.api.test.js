@@ -106,7 +106,7 @@ describe('Content Calendar item API — wiring', () => {
   test('1: the item routes exist with the right layers; the two AI routes also have the rate limiter (and the generic calendar routes are unchanged)', () => {
     const routes = calendarRouter.stack.filter((l) => l.route).map((l) => ({ id: `${Object.keys(l.route.methods)[0]} ${l.route.path}`, layers: l.route.stack.length }));
     assert.deepEqual(routes.map((r) => r.id).sort(), [
-      'get /', 'get /options', 'get /items/:itemId', 'get /status', 'patch /items/:itemId', 'post /generate', 'post /items', 'post /items/:itemId/approve',
+      'get /', 'get /options', 'get /items/:itemId', 'get /status', 'patch /items/:itemId', 'get /history', 'get /history/:calendarId', 'post /cancel', 'post /generate', 'post /preview', 'post /restore', 'post /resume', 'post /items', 'post /items/:itemId/approve',
       'post /items/:itemId/generate-content', 'post /items/:itemId/regenerate', 'post /items/:itemId/revoke-approval',
     ].sort());
     const layers = (id) => routes.find((r) => r.id === id).layers;
@@ -230,7 +230,7 @@ describe('Content Calendar item API — editing flow', () => {
     assert.equal(await SocialPublication.countDocuments({ project_id: projectA._id }), 0, 'approving the plan creates no publication');
 
     setContentProviderOverride(mockContentProvider({ behavior: ({ user }) => validRawPost({ platform: 'facebook', contentPillar: /content_pillar: (.*)/.exec(user)[1].trim() }) }));
-    const started = await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook' } });
+    const started = await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook', mode: 'ai' } });
     assert.equal(started.status, 202, JSON.stringify(started.body));
     assert.equal(started.body.data.status, 'generating');
     assert.equal(started.body.data.generation.calendarItemId, id);
@@ -244,7 +244,40 @@ describe('Content Calendar item API — editing flow', () => {
     assert.equal(api.publications[0].platform, 'facebook');
     assert.equal(api.status, 'content_generated');
 
-    const again = await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook' } });
+    const again = await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook', mode: 'ai' } });
+    assert.equal(again.status, 409);
+    assert.equal(again.body.details.code, 'ALREADY_GENERATED');
+  });
+
+  test('8b: generate-content in plan mode answers 201 with the draft built from the reviewed caption (no AI), needs the revision, and a stranger gets nothing', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const provider = mockContentProvider({ behavior: () => { throw new Error('the AI must not be called in plan mode'); } });
+    setContentProviderOverride(provider);
+    const item = await SocialContentCalendarItem.findOne({ project_id: projectA._id, status: { $in: ['planned', 'edited'] } }).sort({ contentDate: 1 }).lean();
+    const id = String(item._id);
+    const edit = await call('PATCH', `${CAL}/items/${id}`, { body: { projectId: pidA(), expectedRevision: item.revision, caption: 'The exact words the owner reviewed.', hashtags: ['#Reviewed'] } });
+    assert.equal(edit.status, 200, JSON.stringify(edit.body));
+    const approve = await call('POST', `${CAL}/items/${id}/approve`, { body: { projectId: pidA(), expectedRevision: edit.body.data.item.revision } });
+    assert.equal(approve.status, 200, JSON.stringify(approve.body));
+    const rev = approve.body.data.item.revision;
+
+    assert.equal((await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook', mode: 'plan' } })).status, 400, 'the revision is required');
+    const stranger = await call('POST', `${CAL}/items/${id}/generate-content`, { token: tokenB, body: { projectId: pidA(), platform: 'facebook', mode: 'plan', expectedRevision: rev } });
+    assert.ok([403, 404].includes(stranger.status), String(stranger.status));
+    assert.equal(await SocialPublication.countDocuments({ project_id: projectA._id }), 1, 'only the draft of test 8 exists so far');
+
+    const res = await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook', mode: 'plan', expectedRevision: rev } });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    assert.equal(res.body.data.mode, 'plan');
+    assert.equal(res.body.data.publication.content, 'The exact words the owner reviewed.\n\n#Reviewed');
+    assert.equal(res.body.data.publication.generation.source, 'calendar_plan');
+    assert.equal(res.body.data.publication.status, 'draft');
+    assert.equal(res.body.data.item.status, 'content_generated');
+    assert.equal(provider.calls.length, 0);
+    const json = JSON.stringify(res.body);
+    for (const leak of ['FB-SECRET-TOKEN', 'accessToken', 'profileSnapshotHash']) assert.equal(json.includes(leak), false, leak);
+
+    const again = await call('POST', `${CAL}/items/${id}/generate-content`, { body: { projectId: pidA(), platform: 'facebook', mode: 'plan', expectedRevision: res.body.data.item.revision } });
     assert.equal(again.status, 409);
     assert.equal(again.body.details.code, 'ALREADY_GENERATED');
   });

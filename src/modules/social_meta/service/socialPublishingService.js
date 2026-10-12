@@ -10,6 +10,7 @@ import {
 import { markAccountExpired } from './metaTokenService.js';
 import { markMissedPublications } from './socialPublishRecoveryService.js';
 import { getPublishConfig } from './socialPublishConfig.js';
+import { getProjectState, activeProjectScope, PROJECT_STATES } from './projectLifecycleGuard.js';
 import workflow, {
   PUBLISHABLE_APPROVAL_STATES, APPROVAL_STATES, isApprovalSatisfied, approvalGateError, approvalStageOf, needsChanges, planEditEffects,
 } from './approvalWorkflow.js';
@@ -274,8 +275,9 @@ async function decorateActors(apiPublications) {
 /** Safe provenance for the UI: where the text came from and what it was written for. No hash, prompt or provider data. */
 function toApiGeneration(doc) {
   const g = doc.generation;
-  if (!g || g.source !== 'ai') return null;
-  return { source: 'ai', type: g.type || 'social_content', strategyVersion: g.strategyVersion ?? null, contentPillar: g.contentPillar || null, objective: g.objective || null };
+  if (!g || (g.source !== 'ai' && g.source !== 'calendar_plan')) return null;
+  const base = { source: g.source, type: g.type || (g.source === 'ai' ? 'social_content' : 'calendar_item'), strategyVersion: g.strategyVersion ?? null, contentPillar: g.contentPillar || null, objective: g.objective || null };
+  return g.source === 'calendar_plan' ? { ...base, planRevision: g.planRevision ?? null, planApprovedAt: g.planApprovedAt || null } : base;
 }
 
 /** Safe provenance of the current design (only while it still describes the media): no prompt, no provider data. */
@@ -874,6 +876,25 @@ async function resolveApprovalBlock(projectObjectId, publicationId, dueFilter, n
 }
 
 /**
+ * A publication may only be dispatched for a project that exists and is not in the trash. A trashed project is simply not
+ * dispatched (everything stays as it is, so a restore finds it intact); a project that no longer exists can never come
+ * back, so its publication is cancelled - which also stops the scheduler from re-selecting it every minute.
+ * Returns null when the project is active, otherwise the final result for the caller.
+ */
+const PROJECT_UNAVAILABLE = { code: 'PROJECT_UNAVAILABLE', message: 'This project has been deleted, so nothing can be published for it.' };
+async function refuseIfProjectInactive(projectObjectId, publicationId, state, now) {
+  if (state === PROJECT_STATES.ACTIVE) return null;
+  if (state === PROJECT_STATES.MISSING) {
+    await SocialPublication.updateOne(
+      { _id: publicationId, project_id: projectObjectId, status: { $in: ['draft', 'scheduled'] } },
+      { $set: { status: 'cancelled', nextRetryAt: null, failureCode: 'PROJECT_DELETED', lastError: PROJECT_UNAVAILABLE.message, lastErrorCode: 'PROJECT_DELETED' } },
+    );
+  }
+  LoggerUtil.warn('[SOCIAL_PUBLISH_BLOCKED]', { publicationId: String(publicationId), reason: 'PROJECT_' + state.toUpperCase() });
+  return { success: false, error: { ...PROJECT_UNAVAILABLE } };
+}
+
+/**
  * The real publish path — the only function that ever calls a platform
  * adapter.
  *
@@ -906,6 +927,9 @@ export async function publishNow(projectId, publicationId, userId, { trigger = '
   const projectObjectId = toObjectId(projectId);
   const config = getPublishConfig();
   const owner = getInstanceId();
+
+  const inactive = await refuseIfProjectInactive(projectObjectId, publicationId, await getProjectState(projectId), now);
+  if (inactive) return inactive;
 
   if (trigger !== 'scheduler') {
     // Approval gate, before anything else (and before any Meta reconciliation
@@ -1003,6 +1027,20 @@ export async function publishNow(projectId, publicationId, userId, { trigger = '
     return { success: false, error: safe, publication: toApiPublication(publication) };
   }
 
+  // The project may have been deleted between the check above and the claim. Re-check now, before any credential is read:
+  // a claimed-but-undispatched post is handed back untouched (scheduled again, attempt not counted) or cancelled.
+  const stateAfterClaim = await getProjectState(projectId);
+  if (stateAfterClaim !== PROJECT_STATES.ACTIVE) {
+    await SocialPublication.updateOne(
+      { _id: claimed._id, status: 'publishing', lockedBy: owner },
+      stateAfterClaim === PROJECT_STATES.MISSING
+        ? { $set: { status: 'cancelled', nextRetryAt: null, publishingStartedAt: null, lockedBy: null, failureCode: 'PROJECT_DELETED', lastErrorCode: 'PROJECT_DELETED' } }
+        : { $set: { status: 'scheduled', publishingStartedAt: null, lockedBy: null }, $inc: { attempts: -1 } },
+    );
+    LoggerUtil.warn('[SOCIAL_PUBLISH_BLOCKED]', { publicationId: String(publicationId), reason: 'PROJECT_' + stateAfterClaim.toUpperCase(), stage: 'after_claim' });
+    return { success: false, error: { ...PROJECT_UNAVAILABLE } };
+  }
+
   const resolved = await resolveAccount(projectId, claimed.platform, claimed.social_account_id.toString());
   if (resolved.error) {
     return conclude({ ...resolved.error, category: 'PERMANENT', retryable: false, outcome: 'not_published' });
@@ -1098,8 +1136,9 @@ export async function executeDuePublications({ now = new Date(), projectId = nul
 
   const { missed } = await markMissedPublications({ now, config, projectId });
 
+  // Trashed projects are skipped (their schedules wait for a restore); see projectLifecycleGuard.js
   const due = await SocialPublication.find({
-    ...(projectId ? { project_id: toObjectId(projectId) } : {}),
+    ...(await activeProjectScope(projectId)),
     status: 'scheduled',
     outcomeUnknown: { $ne: true },
     $or: [

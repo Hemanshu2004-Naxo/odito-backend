@@ -9,6 +9,7 @@ import SocialAccount from '../model/SocialAccount.js';
 import SocialPublication from '../model/SocialPublication.js';
 import metaApiService from './metaApiService.js';
 import { runOnce, getSchedulerStatus } from './socialSchedulerService.js';
+import { ensureProject, removeProject } from '../testSupport/projectFixture.js';
 
 /**
  * The scheduler tick (P0 #12): recovery + reconciliation + due execution in
@@ -43,12 +44,14 @@ describe('runOnce — one scheduler tick', () => {
     if (!mongoAvailable) return;
     userId = new mongoose.Types.ObjectId();
     projectId = new mongoose.Types.ObjectId();
+    await ensureProject(projectId, { userId });
     fb = await SocialAccount.create({ user_id: userId, project_id: projectId, platform: 'facebook', platformAccountId: 'pg_tick', pageId: 'pg_tick', accountType: 'page', accessToken: 'tok', status: 'active', isActive: true, scopes: ['pages_manage_posts'] });
   });
   afterEach(async () => {
     if (!mongoAvailable) return;
     await SocialPublication.deleteMany({ project_id: projectId });
     await SocialAccount.deleteMany({ project_id: projectId });
+    await removeProject(projectId);
   });
 
   const base = (over) => ({ project_id: projectId, social_account_id: fb._id, platform: 'facebook', createdBy: userId, ...over });
