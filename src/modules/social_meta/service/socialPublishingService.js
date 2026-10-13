@@ -8,6 +8,7 @@ import {
   resolveAccount, recordPublished, attachPermalink, settleFailure, reconcileUnknownPublication, getInstanceId, RECONNECT_REQUIRED_CODES, NOT_RETRYABLE_FAILURE_CODES,
 } from './publicationLifecycle.js';
 import { markAccountExpired } from './metaTokenService.js';
+import { recordPublish } from '../../../monitoring/socialAiMetrics.js';
 import { markMissedPublications } from './socialPublishRecoveryService.js';
 import { getPublishConfig } from './socialPublishConfig.js';
 import { getProjectState, activeProjectScope, PROJECT_STATES } from './projectLifecycleGuard.js';
@@ -1016,6 +1017,7 @@ export async function publishNow(projectId, publicationId, userId, { trigger = '
     }
 
     const settled = await settleFailure(claimed, error);
+    recordPublish(error?.requiresReconnect || error?.accountAction === 'expire' ? 'reconnect_required' : 'failed');
     const publication = settled.publication || claimed;
     LoggerUtil.info('[SOCIAL_PUBLISH_FAILED]', {
       publicationId,
@@ -1099,6 +1101,7 @@ export async function publishNow(projectId, publicationId, userId, { trigger = '
     return { success: true, publication: toApiPublication({ ...claimed.toObject(), status: 'published', externalPostId: result.externalPostId, publishedAt: new Date() }) };
   }
 
+  recordPublish('published');
   LoggerUtil.service('SocialPublishing', 'publish', 'completed', { projectId: String(projectId), publicationId, platform: claimed.platform });
   LoggerUtil.info('[SOCIAL_PUBLISH_SUCCESS]', {
     publicationId,

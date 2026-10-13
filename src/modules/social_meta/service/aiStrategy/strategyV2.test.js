@@ -35,7 +35,7 @@ describe('strategy schema v2 — structure', () => {
     const r = validateStrategyOutput(validRawStrategy());
     assert.equal(r.ok, true, JSON.stringify(r.errors));
     assert.equal(r.strategy.schemaVersion, STRATEGY_SCHEMA_VERSION);
-    assert.equal(STRATEGY_SCHEMA_VERSION, 2);
+    assert.equal(STRATEGY_SCHEMA_VERSION, 3);
   });
 
   test('2: every section the product needs is required: overview, brand analysis, trending topics, hooks, competitors', () => {
@@ -211,7 +211,7 @@ describe('strategy prompt v2', () => {
   });
 
   test('19: the version moved on, and the fixed system prompt states the new honesty rules', () => {
-    assert.equal(PROMPT_VERSION, 'social-ai-strategy-v3');
+    assert.equal(PROMPT_VERSION, 'social-ai-strategy-v4');
     const system = buildSystemPrompt();
     for (const rule of [/NO live trend/, /NEVER say or imply a topic is trending/, /ONLY the competitors listed/, /never describe what a competitor posts/, /not a schedule/, /CONCISE/, /byObjective/, /Do not state any statistic/, /workingHooks: 6-12/]) assert.match(system, rule);
     assert.equal(system, buildSystemPrompt(), 'fixed text, no arguments');
@@ -315,7 +315,7 @@ describe('strategy v2 — server-owned parts (real MongoDB, scripted provider)',
     assert.match(provider.calls[1].user, /trending or viral/);
     const s = await current();
     assert.equal(s.trendDataSource, 'none');
-    assert.equal(s.schemaVersion, 2);
+    assert.equal(s.schemaVersion, 3);
     assert.equal(JSON.stringify(s.trendingTopics).includes('trending everywhere'), false);
   });
 
@@ -365,7 +365,7 @@ describe('strategy v2 — server-owned parts (real MongoDB, scripted provider)',
     await updateProfile(pid, userId, { audience: { primary: 'Families' }, goals: ['Bookings'] });
     await generate(mockProvider());
     const doc = await SocialAIStrategy.findOne({ project_id: project._id, status: 'ready' }).lean();
-    assert.equal(doc.generation.promptVersion, 'social-ai-strategy-v3');
+    assert.equal(doc.generation.promptVersion, 'social-ai-strategy-v4');
     assert.equal(doc.profileSnapshot.hash.length, 64);
     assert.equal((await getStrategyState(pid)).profile.changed, false);
   });

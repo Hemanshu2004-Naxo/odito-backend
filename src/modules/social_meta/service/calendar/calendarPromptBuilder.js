@@ -1,3 +1,4 @@
+import { cleanPromptValue } from '../promptSafety.js';
 import { CALENDAR_TOOL_NAME, CALENDAR_LIMITS } from './calendarOutputSchema.js';
 import { MARKETING_OBJECTIVES, KPIS_BY_OBJECTIVE, CONTENT_MIX_TYPES } from '../aiStrategy/strategyOutputSchema.js';
 import { PLATFORM_TEXT_LIMITS, MAX_HASHTAGS } from '../aiContent/contentConfig.js';
@@ -48,7 +49,7 @@ export function buildSystemPrompt() {
 
 const MAX_VALUE = 400;
 // angle brackets are dropped so a value can never imitate a delimiter tag
-const clean = (v) => String(v).replace(/[<>]/g, '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_VALUE);
+const clean = (v) => cleanPromptValue(v, { max: MAX_VALUE }); // one line, bounded, and nothing in it can imitate a `</block>` delimiter (promptSafety.js)
 const line = (label, value) => (value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length) ? null : `${label}: ${Array.isArray(value) ? value.map(clean).join(' | ') : clean(value)}`);
 const block = (tag, lines) => `<${tag}>\n${lines.filter(Boolean).join('\n') || '(nothing supplied)'}\n</${tag}>`;
 

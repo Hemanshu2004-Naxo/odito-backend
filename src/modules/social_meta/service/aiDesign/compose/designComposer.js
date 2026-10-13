@@ -5,6 +5,7 @@ import { orientationOf } from './layoutKit.js';
 import { PHOTO_LAYOUTS } from './layoutsPhoto.js';
 import { STRUCTURED_LAYOUTS } from './layoutsStructured.js';
 import { LAYOUT_NEEDS, PHOTO_LAYOUT_IDS, missingForLayout } from './layoutNeeds.js';
+import { checkComposition, emptySlot } from '../designQuality.js';
 
 /**
  * The deterministic half of the hybrid design pipeline. Given a design brief (the single source of truth for every word, number,
@@ -37,6 +38,9 @@ export async function composeDesign({ brief, size, visual = null, logo = null, p
   const missing = missingForLayout(brief.layoutId, brief, { productImages: productImages.length });
   if (missing) throw composeError('COMPOSE_INVALID', `layout_needs_${missing}`);
 
+  const empty = emptySlot(brief); // a card with nothing to say is refused before it is drawn
+  if (empty) throw composeError('COMPOSE_INCOMPLETE', empty);
+
   const pal = buildPalette(brief.brandColors || {});
   const typography = resolveTypography(brief.typography || {});
   const ctx = {
@@ -48,6 +52,9 @@ export async function composeDesign({ brief, size, visual = null, logo = null, p
 
   const scene = new Scene(W, H, pal.paper);
   await layout(scene, ctx);
+  // what the layout was meant to show must have been drawn: an empty card is a failure, never a finished design
+  const incomplete = checkComposition(brief, scene.report);
+  if (incomplete) throw composeError('COMPOSE_INCOMPLETE', incomplete);
   const buffer = await scene.render();
   return {
     buffer,

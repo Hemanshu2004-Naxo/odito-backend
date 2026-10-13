@@ -19,6 +19,8 @@ import { purgeProjectSocialData, purgeOrphanedSocialData } from '../../social_me
 import { setProjectTrashed } from '../../social_meta/testSupport/projectFixture.js';
 import { deleteProjectCascade } from './projectCascadeDeleteService.js';
 import '../../social_meta/testSupport/stubPermalinkLookup.js';
+import { renderMetrics } from '../../../monitoring/metrics.js';
+import '../../../monitoring/socialAiMetrics.js';
 
 /**
  * Permanently deleting (or trashing) a project must stop everything social for it: no stored credential, no scheduled post
@@ -47,6 +49,7 @@ async function withGraph(fn) {
   try { return await fn(calls); } finally { metaApiService.request = original; }
 }
 const posts = (calls) => calls.filter((c) => c.method === 'POST');
+const cleanupFailures = async (step) => Number((await renderMetrics()).split('\n').find((l) => l.startsWith(`odito_social_cleanup_failures_total{step="${step}"} `)).split(' ')[1]);
 
 describe('project deletion — social data and publishing safety', () => {
   let userId;
@@ -250,10 +253,12 @@ describe('project deletion — social data and publishing safety', () => {
     await seed(p);
     await setProjectTrashed(p._id, true); // a permanent purge only ever runs on a trashed project
 
+    const failuresBefore = await cleanupFailures('publications');
     const restore = failOnce('socialpublications', 'deleteMany');
     let first;
     try { first = await deleteProjectCascade(String(p._id)); } finally { restore(); }
 
+    assert.equal(await cleanupFailures('publications') - failuresBefore, 1, 'a failed cleanup step is counted (and alertable) by step name');
     assert.equal(first.retryable, true);
     assert.equal(first.projectDeleted, false, 'the project stays in place so the daily purge retries it');
     assert.ok(first.failures.some((f) => f.collection === 'social:publications'));

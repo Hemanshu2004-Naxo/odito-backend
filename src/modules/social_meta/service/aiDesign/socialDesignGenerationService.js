@@ -65,7 +65,7 @@ export const getDesignProvider = () => getProvider();
 // ── failures (user-safe; never a provider message, prompt, key or file path) ─
 
 export const DESIGN_FAILURE_MESSAGES = Object.freeze({
-  AI_UNAVAILABLE: 'AI design generation is not available right now. Please try again later.',
+  AI_UNAVAILABLE: 'This design needs an AI-generated photograph, and AI image generation is not available right now. Designs without a photograph (lists, statistics, quotes) can still be created. Please try again later.',
   AI_BUSY: 'The AI service is busy right now. Please try again in a few minutes.',
   AI_TIMEOUT: 'The AI took too long to draw the design. Please try again.',
   AI_UNREACHABLE: 'Odito could not reach the AI service. Please try again.',
@@ -78,8 +78,15 @@ export const DESIGN_FAILURE_MESSAGES = Object.freeze({
   PLATFORM_NOT_CONNECTED: 'That account is no longer connected. Reconnect it and try again.',
   GENERATION_INTERRUPTED: 'Design generation was interrupted. Please try again.',
   DESIGN_BRIEF_INVALID: 'Odito could not build a safe design brief for this post. Try again, or upload your own design.',
+  // the caption has nothing to build a headline from (too short, only emoji or a link, or one long run of filler)
+  DESIGN_NEEDS_TEXT: 'This post has no clear sentence Odito can use as the design\'s headline. Add a short opening sentence of a few real words (the post will need approving again), or upload your own design.',
+  // the layout could not show everything the post needs (a text missing, empty or not fitting), or the finished picture was blank: nothing was saved
+  DESIGN_COMPOSE_FAILED: 'Odito could not lay this post out as a complete design, so nothing was saved and your current design is unchanged. Try again, or upload your own design.',
   GENERATION_FAILED: 'Design generation failed. Please try again.',
 });
+
+/** Why a brief was refused, as a failure code: a missing headline has its own plain message; every other problem is the general one. */
+export const briefFailureCode = (problems) => ((problems || []).some((p) => p === 'no headline') ? 'DESIGN_NEEDS_TEXT' : 'DESIGN_BRIEF_INVALID');
 
 export function designFailureFor(error) {
   const code = error?.code;
@@ -217,8 +224,9 @@ export async function startDesignGeneration(projectId, userId, input = {}, { now
   const account = await activeAccountFor(projectId, pub.platform);
   if (!account || String(account._id) !== String(pub.social_account_id)) return fail('PLATFORM_NOT_CONNECTED', `Reconnect the ${pub.platform === 'facebook' ? 'Facebook Page' : 'Instagram account'} before generating a design for this post.`);
 
+  // The image provider is required only by a design that carries an AI photograph. A design made entirely by Odito's own composition does not call it.
   const provider = getProvider();
-  if (!provider.isAvailable()) {
+  if (!provider.isAvailable() && (await designNeedsProvider(pub))) {
     LoggerUtil.warn(`${EVENT} design_generation_rejected`, { event: 'design_generation_rejected', projectId: String(projectId), publicationId, reason: 'provider_unavailable' });
     return fail('AI_UNAVAILABLE', DESIGN_FAILURE_MESSAGES.AI_UNAVAILABLE);
   }
@@ -265,6 +273,26 @@ export async function startDesignGeneration(projectId, userId, input = {}, { now
 }
 
 // ── the run ──────────────────────────────────────────────────────────────────
+
+/** The brief for the post's ONE design, from the approved caption + stored business/brand context + the real assets. Shared by the run and by the provider pre-flight, so the design type is decided in one place. */
+async function prepareDesignRequest(pub) {
+  const { snapshotData, strategy, liveProfile, prohibitedPhrases, services, contact } = await loadBriefContext(pub);
+  const assets = await loadDesignAssets(pub, liveProfile);
+  const request = buildDesignRequest({
+    caption: pub.content, platform: pub.platform, pillar: pub.generation?.contentPillar || null, objective: pub.generation?.objective || null, snapshotData, strategy,
+    planItem: assets.planItem, product: productFacts(assets.product), productAssetCount: assets.references.length, hasLogo: !!assets.logo,
+    services, contact, prohibitedPhrases, recentTypes: assets.recentTypes, seed: String(pub._id),
+  });
+  return { request, assets };
+}
+
+/** Does the design this post would get carry an AI photograph? Only then is the image provider needed. If that cannot be worked out here, the run itself reports the real problem (and never calls an unavailable provider). */
+async function designNeedsProvider(pub) {
+  try {
+    const { request } = await prepareDesignRequest(pub);
+    return request.brief.photography.required === true;
+  } catch { return false; }
+}
 
 /** Business + brand context for the brief: the STORED strategy snapshot when there is one, else the existing live resolver. */
 export async function loadBriefContext(pub) {
@@ -373,18 +401,12 @@ export async function runDesignGeneration(generationId, lockedBy, userId = null)
     if (!account || String(account._id) !== String(pub.social_account_id)) throw Object.assign(new Error('account gone'), { code: 'PLATFORM_NOT_CONNECTED' });
 
     // 2. The brief: built on the server from the approved caption + stored business/brand context.
-    const { snapshotData, strategy, liveProfile, prohibitedPhrases, services, contact } = await loadBriefContext(pub);
-    const assets = await loadDesignAssets(pub, liveProfile);
-    const request = buildDesignRequest({
-      caption: pub.content, platform: pub.platform, pillar: pub.generation?.contentPillar || null, objective: pub.generation?.objective || null, snapshotData, strategy,
-      planItem: assets.planItem, product: productFacts(assets.product), productAssetCount: assets.references.length, hasLogo: !!assets.logo,
-      services, contact, prohibitedPhrases, recentTypes: assets.recentTypes, seed: String(pub._id),
-    });
+    const { request, assets } = await prepareDesignRequest(pub);
     const { brief, problems } = request;
     // the deterministic quality check of the brief: nothing unsupported (a figure, a prohibited phrase, a list without points...) may reach the design
     if (problems.length) {
       LoggerUtil.warn(`${EVENT} design_brief_rejected`, { event: 'design_brief_rejected', ...ids, problemCount: problems.length });
-      throw Object.assign(new Error('brief invalid'), { code: 'DESIGN_BRIEF_INVALID' });
+      throw Object.assign(new Error('brief invalid'), { code: briefFailureCode(problems) });
     }
 
     // 3. The design: the photograph (only when the layout carries one) from the image provider, then Odito's own composition of every

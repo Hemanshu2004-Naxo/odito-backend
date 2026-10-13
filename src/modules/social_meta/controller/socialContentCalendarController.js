@@ -21,12 +21,17 @@ const ERROR_STATUS = {
   NO_STRATEGY: 422,
   INSUFFICIENT_PROFILE: 422,
   PLATFORM_NOT_CONNECTED: 422,
+  PLATFORM_RECONNECT_REQUIRED: 422,
   PLATFORM_NOT_IN_STRATEGY: 422,
   AI_UNAVAILABLE: 503,
   CONFLICT: 409,
   NOTHING_TO_RESUME: 409,
   NOTHING_TO_CANCEL: 409,
   ALREADY_CURRENT: 409,
+  QUOTA_EXCEEDED: 429,
+  TOO_MANY_GENERATIONS: 409,
+  QUOTA_NOT_CONFIGURED: 503,
+  PLAN_REQUIRED: 403,
   GENERATION_IN_PROGRESS: 409,
   // every input-validation code (INVALID_BODY, UNKNOWN_FIELD, INVALID_DATE, INVALID_DATE_RANGE, DATE_IN_PAST, INVALID_POSTS_PER_WEEK, INVALID_PLATFORMS, INVALID_DISTRIBUTION) is a 400
 };
@@ -36,7 +41,7 @@ const serverError = (res, message, code) => res.status(500).json(ResponseUtil.er
 export async function getContentCalendarHandler(req, res) {
   const projectId = req.projectId;
   try {
-    const state = await getCalendarState(projectId);
+    const state = await getCalendarState(projectId, { userId: req.userId });
     if (!state) return res.status(404).json(ResponseUtil.error('Project not found.', 404, { code: 'NOT_FOUND' }));
     return res.json(ResponseUtil.success(state));
   } catch (error) {
@@ -78,10 +83,11 @@ export async function generateContentCalendarHandler(req, res) {
  */
 export async function previewContentCalendarHandler(req, res) {
   try {
-    const result = await previewCalendar(req.body);
+    const result = await previewCalendar(req.body, { userId: req.userId, projectId: req.projectId });
     if (!result.success) {
       const status = ERROR_STATUS[result.error.code] || 400;
-      return res.status(status).json(ResponseUtil.error(result.error.message, status, { code: result.error.code }));
+      const { code, message, ...extra } = result.error;
+      return res.status(status).json(ResponseUtil.error(message, status, { code, ...extra }));
     }
     return res.json(ResponseUtil.success(result.preview));
   } catch (error) {
@@ -97,7 +103,7 @@ export async function previewContentCalendarHandler(req, res) {
 export async function resumeContentCalendarHandler(req, res) {
   const projectId = req.projectId;
   try {
-    const result = await resumeCalendar(projectId);
+    const result = await resumeCalendar(projectId, { userId: req.userId });
     if (!result.success) {
       const status = ERROR_STATUS[result.error.code] || 400;
       return res.status(status).json(ResponseUtil.error(result.error.message, status, { code: result.error.code }));

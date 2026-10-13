@@ -608,7 +608,7 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     const s = await seedStrategy();
     const state = await current();
     assert.deepEqual(state.connectedPlatforms, { facebook: true, instagram: false });
-    assert.deepEqual(state.strategy, { available: true, id: String(s._id), version: s.version, platforms: ['facebook', 'instagram'], hasHooks: true, recommended: { postsPerWeek: 4, range: { min: 3, max: 5 }, days: ['tuesday', 'thursday', 'saturday'] } });
+    assert.deepEqual(state.strategy, { available: true, id: String(s._id), version: s.version, platforms: ['facebook', 'instagram'], hasHooks: true, planning: null, recommended: { postsPerWeek: 4, range: { min: 3, max: 5 }, days: ['tuesday', 'thursday', 'saturday'] } });
     assert.deepEqual(state.limits, { minDays: 7, maxDays: 184, minMonths: 1, maxMonths: 6, maxPostsPerWeek: 7, maxPosts: 200 });
   });
 
@@ -667,6 +667,39 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     const r = await generate(mockCalendarProvider(), { endDate: addDays(14) });
     assert.equal(r.generation.status, 'ready', JSON.stringify(r));
     assert.equal((await current()).calendar.config.months, null);
+  });
+
+  test('R1: an EXPIRED connection is reported as expired (fix: Reconnect), never as "not connected"; generation names it and nothing runs', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy();
+    const provider = mockCalendarProvider();
+    assert.deepEqual((await current()).platformStates, { facebook: 'connected', instagram: 'connected' });
+    // the Page token dies: Odito marks the Page and its Instagram account expired together (metaTokenService.markAccountExpired)
+    await SocialAccount.updateMany({ project_id: project._id }, { $set: { status: 'expired', statusReason: 'META_TOKEN_INVALID' } });
+    const state = await current();
+    assert.deepEqual(state.platformStates, { facebook: 'expired', instagram: 'expired' });
+    assert.deepEqual(state.connectedPlatforms, { facebook: false, instagram: false });
+    const r = await generate(provider, { platforms: ['facebook', 'instagram'] });
+    assert.equal(r.error.code, 'PLATFORM_RECONNECT_REQUIRED');
+    assert.deepEqual(r.error.platforms, ['facebook', 'instagram']);
+    assert.match(r.error.message, /expired or was revoked in Meta\. Reconnect them/);
+    assert.equal(provider.calls.length, 0);
+    assert.equal(await SocialContentCalendar.countDocuments({ project_id: project._id }), 0);
+    // a project that never connected anything still says "connect"
+    await SocialAccount.deleteMany({ project_id: project._id });
+    assert.deepEqual((await current()).platformStates, { facebook: 'none', instagram: 'none' });
+    assert.equal((await generate(provider, { platforms: ['facebook'] })).error.code, 'PLATFORM_NOT_CONNECTED');
+  });
+
+  test('R2: only the Instagram connection expired: Facebook stays usable and only Instagram asks for a reconnect', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy();
+    await SocialAccount.updateMany({ project_id: project._id, platform: 'instagram' }, { $set: { status: 'expired' } });
+    assert.deepEqual((await current()).platformStates, { facebook: 'connected', instagram: 'expired' });
+    const r = await generate(mockCalendarProvider(), { platforms: ['facebook', 'instagram'] });
+    assert.equal(r.error.code, 'PLATFORM_RECONNECT_REQUIRED');
+    assert.deepEqual(r.error.platforms, ['instagram']);
+    assert.equal((await generate(mockCalendarProvider(), { platforms: ['facebook'], postsPerWeek: 2 })).generation.status, 'ready');
   });
 
   test('34: weekdays vary from week to week (not a recurring scheduler), every week has the requested count, nothing is outside the range, and a regeneration gets a different valid plan', async (t) => {

@@ -315,6 +315,30 @@ describe('Content Calendar item API — editing flow', () => {
     assert.equal(JSON.stringify(down.body).includes('SECRET'), false);
   });
 
+  test('10b: regenerating an approved plan over HTTP states the approval outcome (withdrawn, re-approval needed), and the old revision can never bring the approval back', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const list = await call('GET', `${CAL}?${q(pidA())}`);
+    const target = list.body.data.items.filter((i) => i.status === 'planned' && i.topic !== 'A manual post over HTTP').pop();
+    assert.ok(target, 'a planned item to work with');
+    const approve = await call('POST', `${CAL}/items/${target.id}/approve`, { body: { projectId: pidA(), expectedRevision: target.revision } });
+    assert.equal(approve.status, 200, JSON.stringify(approve.body));
+    assert.equal(approve.body.data.item.status, 'plan_approved');
+    const approved = approve.body.data.item;
+
+    setCalendarProviderOverride(mockCalendarProvider({ behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, { caption: 'A brand new caption from the AI over HTTP.' })) }) }));
+    const regen = await call('POST', `${CAL}/items/${target.id}/regenerate`, { body: { projectId: pidA(), expectedRevision: approved.revision, fields: ['caption'] } });
+    assert.equal(regen.status, 200, JSON.stringify(regen.body));
+    const { data } = regen.body;
+    assert.deepEqual([data.approvalStatus, data.approvalRevoked, data.requiresReapproval, data.contentLinked], ['not_approved', true, true, false]);
+    assert.equal(data.item.status, 'planned');
+    assert.equal(data.item.caption, 'A brand new caption from the AI over HTTP.');
+
+    const replay = await call('POST', `${CAL}/items/${target.id}/approve`, { body: { projectId: pidA(), expectedRevision: approved.revision } });
+    assert.equal(replay.status, 409);
+    assert.equal(replay.body.details.code, 'ITEM_CONFLICT');
+    assert.equal(replay.body.details.item.status, 'planned', 'the conflict shows the current, not-approved item');
+  });
+
   test('11: the two AI routes are rate limited per user (429 + Retry-After + RATE_LIMITED), the edit routes are not', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     process.env.SOCIAL_AI_CALENDAR_ITEM_RATE_LIMIT_ENABLED = 'true';

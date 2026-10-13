@@ -54,6 +54,12 @@ export const PLANS = {
     // never read at module load time, so this file's import order relative
     // to dotenv.config() never matters.
     stripePriceEnvVar: 'STRIPE_STARTER_PRICE_ID',
+    // Social Media AI: calendar posts the AI may plan per UTC month for this plan (see getSocialAiAllowance()).
+    //   number      = the allowance
+    //   'unlimited' = deliberately unlimited (a decision, written here)
+    //   null        = NOT DECIDED YET. The allowance is then read from SOCIAL_AI_STARTER_CALENDAR_POSTS_PER_MONTH; if that is unset too,
+    //                 production refuses calendar generation (fail closed) instead of allowing unlimited use.
+    socialAi: { calendarPostsPerMonth: null },
   },
   pro: {
     id: 'pro',
@@ -85,6 +91,12 @@ export const PLANS = {
     },
     active: true,
     stripePriceEnvVar: 'STRIPE_PRO_PRICE_ID',
+    // Social Media AI: calendar posts the AI may plan per UTC month for this plan (see getSocialAiAllowance()).
+    //   number      = the allowance
+    //   'unlimited' = deliberately unlimited (a decision, written here)
+    //   null        = NOT DECIDED YET. The allowance is then read from SOCIAL_AI_PRO_CALENDAR_POSTS_PER_MONTH; if that is unset too,
+    //                 production refuses calendar generation (fail closed) instead of allowing unlimited use.
+    socialAi: { calendarPostsPerMonth: null },
   },
   premium: {
     id: 'premium',
@@ -114,6 +126,12 @@ export const PLANS = {
     },
     active: true,
     stripePriceEnvVar: 'STRIPE_PREMIUM_PRICE_ID',
+    // Social Media AI: calendar posts the AI may plan per UTC month for this plan (see getSocialAiAllowance()).
+    //   number      = the allowance
+    //   'unlimited' = deliberately unlimited (a decision, written here)
+    //   null        = NOT DECIDED YET. The allowance is then read from SOCIAL_AI_PREMIUM_CALENDAR_POSTS_PER_MONTH; if that is unset too,
+    //                 production refuses calendar generation (fail closed) instead of allowing unlimited use.
+    socialAi: { calendarPostsPerMonth: null },
   },
 };
 

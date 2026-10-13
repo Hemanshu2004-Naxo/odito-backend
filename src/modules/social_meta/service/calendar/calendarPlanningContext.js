@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import SocialAIStrategy from '../../model/SocialAIStrategy.js';
-import { getActiveFacebookAccount, getActiveInstagramAccount } from '../facebookAccountService.js';
+import { getActiveFacebookAccount, getActiveInstagramAccount, getExpiredFacebookAccount, getExpiredInstagramAccount } from '../facebookAccountService.js';
 import { findProfile } from '../socialBusinessProfileService.js';
 import { listActiveProducts } from '../socialProductService.js';
 import { snapshotFactsText } from '../aiStrategy/profileSnapshot.js';
@@ -51,6 +51,22 @@ export function calendarFailureFor(error) {
 }
 
 export const latestReadyStrategy = (projectId) => SocialAIStrategy.findOne({ project_id: toId(projectId), status: 'ready' }).sort({ version: -1 }).lean();
+
+/**
+ * The state of each platform's connection as a person needs to act on it: 'connected', 'expired' (it WAS connected, the token died or access was
+ * revoked in Meta: the fix is Reconnect, not Connect) or 'none'. connectedPlatforms (below) is the yes/no view of the same thing.
+ */
+export async function platformStates(projectId) {
+  const [facebook, instagram] = await Promise.all([getActiveFacebookAccount(projectId).catch(() => null), getActiveInstagramAccount(projectId).catch(() => null)]);
+  const expiredFacebook = facebook ? null : await getExpiredFacebookAccount(projectId).catch(() => null);
+  const pageId = (facebook || expiredFacebook)?.platformAccountId;
+  const expiredInstagram = instagram ? null : await getExpiredInstagramAccount(projectId, pageId).catch(() => null);
+  return {
+    facebook: facebook ? 'connected' : (expiredFacebook ? 'expired' : 'none'),
+    // an expired Page token marks every row that shares it (the Instagram account too) expired, so an Instagram account that WAS connected shows up here
+    instagram: instagram ? 'connected' : (expiredInstagram ? 'expired' : 'none'),
+  };
+}
 
 export async function connectedPlatforms(projectId) {
   const [facebook, instagram] = await Promise.all([getActiveFacebookAccount(projectId).catch(() => null), getActiveInstagramAccount(projectId).catch(() => null)]);

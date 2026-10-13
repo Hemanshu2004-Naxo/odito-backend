@@ -17,6 +17,7 @@
     "seed:ranking-history": "node src/modules/app_user/scripts/seedRankingHistory.js",
     "migrate:split-google-visibility": "node src/modules/app_user/scripts/splitGoogleVisibilityConnections.js",
     "migrate:backfill-recrawl-quota": "node src/modules/app_user/scripts/backfillRecrawlQuota.js",
+    "inspect:social-indexes": "node src/modules/social_meta/scripts/inspectSocialAiIndexes.js",
     "package:seo-bridge-plugin": "node src/modules/external_integration/scripts/packageSeoBridgePlugin.js",
     "load:smoke": "node load-tests/index.js --level=smoke",
     "load:light": "node load-tests/index.js --level=light",

@@ -54,7 +54,7 @@ const run = (label, call, ok = ({ success: _s, ...rest }) => rest, successStatus
   }
 };
 
-export const getOptionsHandler = run('load the editor options', (req) => getItemOptions(req.projectId));
+export const getOptionsHandler = run('load the editor options', (req) => getItemOptions(req.projectId, { userId: req.userId }));
 export const getItemHandler = run('load the calendar item', (req) => getItem(req.projectId, req.params.itemId));
 // the body also carries the routing key `projectId`; it is the access middleware's, not a field of the item
 const bodyWithoutRouting = (req) => { const { projectId: _p, ...rest } = req.body || {}; return rest; };

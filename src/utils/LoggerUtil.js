@@ -2,6 +2,47 @@
  * Logger Utility - Structured Logging
  * Replaces all console.log with structured, searchable logging
  */
+/**
+ * Defence in depth: whatever a caller puts in a log line, credentials do not reach the log. Values of keys that name a secret (token, password,
+ * authorization, cookie, api key, client secret, ...) are replaced, and well-known secret shapes inside any string (Bearer tokens,
+ * access_token=..., connection-string passwords, Anthropic / OpenAI / Meta token prefixes) are masked. Counters such as inputTokens / outputTokens
+ * are not secrets and are untouched. Callers should still never pass a credential.
+ */
+const REDACTED = '[REDACTED]';
+const SENSITIVE_KEY = /^(authorization|proxy-authorization|cookie|set-cookie|password|passwd|secret|token|bearer|client_?secret|app_?secret|api_?key|x-api-key|private_?key|access_?token|refresh_?token|id_?token|fb_exchange_token|long_?lived_?token|page_?token)$/i;
+const SENSITIVE_SUFFIX = /(secret|password|api_?key|access_?token|refresh_?token)$/i;
+const SECRET_PATTERNS = [
+  [/(Bearer\s+)[A-Za-z0-9\-._~+/]{8,}=*/gi, '$1' + REDACTED],
+  [/\b((?:access|refresh|id)_token|client_secret|app_secret|api[_-]?key|fb_exchange_token|password)=([^&\s"'<>]+)/gi, '$1=' + REDACTED],
+  [/(mongodb(?:\+srv)?:\/\/)[^@\s/]+@/gi, '$1' + REDACTED + '@'],
+  [/\bsk-ant-[A-Za-z0-9\-_]{10,}/g, REDACTED],
+  [/\bsk-[A-Za-z0-9]{24,}/g, REDACTED],
+  [/\bEAA[A-Za-z0-9]{24,}/g, REDACTED],
+];
+const MAX_REDACT_DEPTH = 8;
+
+export function redactString(text) {
+  let out = String(text);
+  for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement);
+  return out;
+}
+
+export function redactForLog(value, depth = 0) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return redactString(value);
+  if (typeof value !== 'object') return value;
+  if (typeof value.toJSON === 'function') return value; // Date, ObjectId, ...: serialised by JSON.stringify itself
+  if (depth >= MAX_REDACT_DEPTH) return '[TRUNCATED]';
+  if (Array.isArray(value)) return value.map((item) => redactForLog(item, depth + 1));
+  const out = {};
+  for (const [key, inner] of Object.entries(value)) {
+    // a boolean cannot hold a secret: presence flags such as hasAccessToken: true are kept (they are how code logs "a token existed" safely)
+    const named = SENSITIVE_KEY.test(key) || SENSITIVE_SUFFIX.test(key);
+    out[key] = named && inner !== null && inner !== undefined && typeof inner !== 'boolean' ? REDACTED : redactForLog(inner, depth + 1);
+  }
+  return out;
+}
+
 export class LoggerUtil {
   
   /**
@@ -23,8 +64,8 @@ export class LoggerUtil {
     return {
       timestamp: this.getTimestamp(),
       level: level.toUpperCase(),
-      message: message,
-      ...context
+      message: redactString(message),
+      ...redactForLog(context)
     };
   }
 

@@ -4,6 +4,7 @@ import SocialAccount from '../model/SocialAccount.js';
 // Graph-calling service in this module (see metaPageService.js).
 import metaApiService from './metaApiService.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
+import { recordConnectionExpired } from '../../../monitoring/socialAiMetrics.js';
 
 /**
  * MetaTokenService — the single, reusable place that answers "is this
@@ -141,6 +142,7 @@ export async function markAccountExpired(account, { reason = REASON_TOKEN_INVALI
   account.status = STATUS_EXPIRED;
   account.statusReason = reason;
 
+  if (res.modifiedCount > 0) recordConnectionExpired();
   LoggerUtil.info('SOCIAL_ACCOUNT_EXPIRED', {
     projectId: String(account.project_id),
     socialAccountId: String(account._id),

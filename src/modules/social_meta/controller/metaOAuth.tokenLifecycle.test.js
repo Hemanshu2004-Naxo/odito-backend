@@ -10,7 +10,7 @@ import SeoProject from '../../app_user/model/SeoProject.js';
 import SocialAccount from '../model/SocialAccount.js';
 import PendingMetaConnection from '../model/PendingMetaConnection.js';
 import metaApiService from '../service/metaApiService.js';
-import { signOAuthState } from '../../../utils/oauthState.js';
+import { mintState } from '../testSupport/metaState.js';
 import { handleMetaCallback, selectMetaPage } from './metaOAuthController.js';
 import { debugTokenResponse } from '../testSupport/metaDebugTokenStub.js';
 
@@ -84,7 +84,7 @@ describe('handleMetaCallback — long-lived user token exchange', () => {
     await PendingMetaConnection.deleteMany({ project_id: project._id });
   });
 
-  const stateFor = () => signOAuthState({ provider: 'meta', purpose: 'social_meta', projectId: project._id.toString(), userId: userId.toString() });
+  const stateFor = () => mintState({ userId, projectId: project._id });
 
   test('1+2: exchanges the code, THEN exchanges the short-lived token for a long-lived one, and stores ONLY the long-lived token with its real ~60 day expiry', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
@@ -95,7 +95,7 @@ describe('handleMetaCallback — long-lived user token exchange', () => {
         : { success: true, status: 200, data: { access_token: LONG, expires_in: 5184000 } }),
       request: () => GRANTED,
     }, async (calls) => {
-      await handleMetaCallback({ query: { code: 'auth-code-1', state: stateFor() } }, res);
+      await handleMetaCallback({ query: { code: 'auth-code-1', state: await stateFor() } }, res);
 
       // call 1: the authorization-code exchange
       assert.equal(calls.absolute[0].params.code, 'auth-code-1');
@@ -134,7 +134,7 @@ describe('handleMetaCallback — long-lived user token exchange', () => {
         ? { success: true, status: 200, data: { access_token: SHORT, expires_in: 3600 } }
         : { success: false, kind: 'http', status: 400, data: { error: { code: 190, message: 'bad' } }, message: 'bad' }),
       request: () => { throw new Error('permissions must not be fetched after a failed exchange'); },
-    }, async () => { await handleMetaCallback({ query: { code: 'c', state: stateFor() } }, res); });
+    }, async () => { await handleMetaCallback({ query: { code: 'c', state: await stateFor() } }, res); });
 
     assert.ok(res.redirectedTo.includes('meta_error=connection_failed'));
     assert.ok(!res.redirectedTo.includes('meta_connected'));
@@ -147,7 +147,7 @@ describe('handleMetaCallback — long-lived user token exchange', () => {
     await withGraph({
       absolute: (o, n) => (n === 1 ? { success: true, status: 200, data: { access_token: SHORT, expires_in: 3600 } } : { success: true, status: 200, data: {} }),
       request: () => GRANTED,
-    }, async () => { await handleMetaCallback({ query: { code: 'c', state: stateFor() } }, res); });
+    }, async () => { await handleMetaCallback({ query: { code: 'c', state: await stateFor() } }, res); });
     assert.ok(res.redirectedTo.includes('meta_error=connection_failed'));
     assert.equal(await PendingMetaConnection.countDocuments({ project_id: project._id }), 0);
   });
@@ -159,7 +159,7 @@ describe('handleMetaCallback — long-lived user token exchange', () => {
     await withGraph({
       absolute: () => { attempts += 1; return { success: false, kind: 'http', status: 400, data: { error: { code: 100, message: 'bad code' } }, message: 'bad code' }; },
       request: () => GRANTED,
-    }, async () => { await handleMetaCallback({ query: { code: 'bad', state: stateFor() } }, res); });
+    }, async () => { await handleMetaCallback({ query: { code: 'bad', state: await stateFor() } }, res); });
     assert.equal(attempts, 1);
     assert.ok(res.redirectedTo.includes('meta_error=connection_failed'));
   });
@@ -173,7 +173,7 @@ describe('handleMetaCallback — long-lived user token exchange', () => {
           ? { success: true, status: 200, data: { access_token: SHORT, expires_in: 3600 } }
           : { success: true, status: 200, data: { access_token: LONG, expires_in: 5184000 } }),
         request: () => GRANTED,
-      }, async () => { await handleMetaCallback({ query: { code: 'secret-auth-code-zzz', state: stateFor() } }, res); });
+      }, async () => { await handleMetaCallback({ query: { code: 'secret-auth-code-zzz', state: await stateFor() } }, res); });
     });
     for (const secret of [SHORT, LONG, 'secret-auth-code-zzz', String(process.env.META_APP_SECRET)]) {
       assert.ok(!res.redirectedTo.includes(secret), 'redirect URL must not carry a secret');

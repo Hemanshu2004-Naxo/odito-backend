@@ -7,7 +7,7 @@ dotenv.config();
 
 import SeoProject from '../../app_user/model/SeoProject.js';
 import SocialAccount from '../model/SocialAccount.js';
-import { signOAuthState } from '../../../utils/oauthState.js';
+import { mintState } from '../testSupport/metaState.js';
 import { handleMetaCallback } from './metaOAuthController.js';
 import { getSocialAccountsStatus } from './socialAccountController.js';
 
@@ -53,7 +53,7 @@ describe('OAuth return target for /app/social-media/connect-accounts', () => {
   // return target is read from the state — so the redirect shows where the
   // browser is sent back to, without needing a real Meta exchange.
   const redirectFor = async (returnTo) => {
-    const state = signOAuthState({ provider: 'meta', purpose: 'social_meta', projectId: project._id.toString(), userId: new mongoose.Types.ObjectId().toString(), ...(returnTo ? { returnTo } : {}) });
+    const state = await mintState({ userId: new mongoose.Types.ObjectId(), projectId: project._id, returnTo: returnTo || null });
     const res = mockRes();
     await handleMetaCallback({ query: { code: 'c', state } }, res);
     return res.redirectedTo;

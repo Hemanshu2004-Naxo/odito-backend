@@ -457,9 +457,9 @@ describe('AI Strategy service (real MongoDB, scripted provider)', () => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await fullProfile();
     const r = await run(mockProvider());
-    assert.deepEqual(Object.keys(r.generation).sort(), ['failure', 'finishedAt', 'id', 'startedAt', 'status', 'version']);
+    assert.deepEqual(Object.keys(r.generation).sort(), ['failure', 'finishedAt', 'id', 'planning', 'startedAt', 'status', 'version']);
     const state = await getStrategyState(pid);
-    assert.deepEqual(Object.keys(state.strategy).sort(), ['generatedAt', 'id', 'profileSnapshot', 'status', 'strategy', 'strategyGaps', 'version']);
+    assert.deepEqual(Object.keys(state.strategy).sort(), ['generatedAt', 'id', 'planning', 'profileSnapshot', 'status', 'strategy', 'strategyGaps', 'version']);
     const doc = await SocialAIStrategy.findOne({ project_id: project._id }).lean();
     assert.equal(doc.generation.model, 'mock-model');
     assert.equal(doc.generation.usage.inputTokens, 100);

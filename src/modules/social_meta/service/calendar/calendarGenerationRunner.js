@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import SocialContentCalendar from '../../model/SocialContentCalendar.js';
 import SocialContentCalendarItem from '../../model/SocialContentCalendarItem.js';
 import SocialAIStrategy from '../../model/SocialAIStrategy.js';
+import SocialAIUsage from '../../model/SocialAIUsage.js';
 import { attemptRecord, flattenAttempts, describeProviderFailure } from '../aiStrategy/strategyDiagnostics.js';
 import { buildCalendarToolSchema, validateCalendarBatch, applyVariety, varietyCarryFromItems } from './calendarOutputSchema.js';
 import { buildSystemPrompt, buildUserPrompt } from './calendarPromptBuilder.js';
@@ -15,6 +16,9 @@ import {
   CALENDAR_RETRY_BACKOFF_MS, CALENDAR_RETRY_BACKOFF_MAX_MS, CALENDAR_MAX_RUN_MS, CALENDAR_MAX_CONCURRENT_RUNS,
 } from './calendarConfig.js';
 import { getProjectState, getTrashedProjectIds, PROJECT_STATES } from '../projectLifecycleGuard.js';
+import { reserveCalendarQuota, releaseCalendarQuota, settleQuietly } from './calendarQuotaService.js';
+import { recordRunOutcome, recordTakeover, recordProviderError } from '../../../../monitoring/socialAiMetrics.js';
+import SeoProject from '../../../app_user/model/SeoProject.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
 /**
@@ -77,7 +81,7 @@ function startHeartbeat(calendarId, lockedBy) {
       if (!renewed.matchedCount) state.lost = true;
     } catch (error) {
       // a database blip: the lease may lapse, in which case the take-over is safe (batch writes are idempotent)
-      LoggerUtil.warn('[SOCIAL_CALENDAR] Heartbeat failed', { message: error.message }, { calendarId: String(calendarId) });
+      LoggerUtil.warn('[SOCIAL_CALENDAR] Heartbeat failed', { message: error.message }, { calendarId: String(calendarId), runId: lockedBy });
     }
   };
   const timer = setInterval(tick, CALENDAR_HEARTBEAT_MS);
@@ -213,6 +217,17 @@ async function execute(doc, lock, heartbeat) {
     }
     let carry = varietyCarryFromItems(saved);
 
+    // Every run that spends tokens has a reservation on the usage ledger. A new or resumed run already has one (idempotent here); one that
+    // does not - a crash between claiming and reserving, a run from before the ledger - gets it now, or stops before any AI call if it cannot.
+    if (!(await SocialAIUsage.exists({ 'reservations.calendar_id': calendarId }))) {
+      const owner = doc.generatedBy || (await SeoProject.findById(doc.project_id).select('user_id').lean())?.user_id;
+      const reserved = await reserveCalendarQuota({
+        userId: owner, projectId: doc.project_id, calendarId, posts: Math.max(0, slots.length - done.size),
+        base: { saved: done.size, inputTokens: doc.generation?.usage?.inputTokens || 0, outputTokens: doc.generation?.usage?.outputTokens || 0, aiCalls: doc.generation?.attempts || 0 },
+      });
+      if (!reserved.success) throw Object.assign(new Error(reserved.error.code), { code: reserved.error.code, quotaError: reserved.error });
+    }
+
     await checkpoint();
     await SocialContentCalendar.updateOne(lock, {
       $set: {
@@ -295,10 +310,12 @@ async function execute(doc, lock, heartbeat) {
     }, { new: true }).lean();
     if (!ready) throw coded('LOCK_LOST');
 
+    await settleQuietly(calendarId); // what this run produced is committed to the usage ledger; the reservation is released
     // The previous ready version is kept as history (never deleted here); very old history is pruned.
     await SocialContentCalendar.updateMany({ project_id: doc.project_id, status: 'ready', version: { $lt: ready.version } }, { $set: { status: 'archived' } });
     await pruneHistory(doc.project_id);
-    LoggerUtil.info('[SOCIAL_CALENDAR] Calendar ready', { projectId: String(doc.project_id), calendarId: String(calendarId), version: ready.version, items: items.length, batches: ready.generation?.batches, runAttempts: ready.generation?.runAttempts, durationMs: Date.now() - started, repairedAfter: rejected.length ? flattenAttempts(rejected) : undefined });
+    recordRunOutcome('ready', Date.now() - started);
+    LoggerUtil.info('[SOCIAL_CALENDAR] Calendar ready', { projectId: String(doc.project_id), calendarId: String(calendarId), runId: lock['generation.lockedBy'], version: ready.version, items: items.length, batches: ready.generation?.batches, runAttempts: ready.generation?.runAttempts, durationMs: Date.now() - started, repairedAfter: rejected.length ? flattenAttempts(rejected) : undefined });
     return ready;
   } catch (error) {
     heartbeat.stop(); // a late tick must not renew the lease over the retry time (or the final state) that settle() writes
@@ -310,6 +327,7 @@ async function execute(doc, lock, heartbeat) {
 /** What happens when a run stops: it is recoverable, retried later, or finished as partial / failed. Never throws. */
 async function settle(doc, lock, error, { started, usage, attempts, model, rejected }) {
   const calendarId = doc._id;
+  const runId = lock['generation.lockedBy']; // correlates every line of this run (and the takeover that continues it) in the logs
   try {
     const at = new Date();
     const carryUsage = { 'generation.usage.inputTokens': usage.inputTokens, 'generation.usage.outputTokens': usage.outputTokens, 'generation.attempts': attempts };
@@ -319,26 +337,32 @@ async function settle(doc, lock, error, { started, usage, attempts, model, rejec
       if (!(await SocialContentCalendar.exists({ _id: calendarId, status: { $in: ['generating', 'partial', 'ready', 'archived'] } }))) {
         await SocialContentCalendarItem.deleteMany({ calendar_id: calendarId });
       }
-      LoggerUtil.warn('[SOCIAL_CALENDAR] Run stopped: it no longer owns the generation', { calendarId: String(calendarId) });
+      recordRunOutcome('lock_lost');
+      LoggerUtil.warn('[SOCIAL_CALENDAR] Run stopped: it no longer owns the generation', { calendarId: String(calendarId), runId });
       return;
     }
 
     if (error?.code === 'PROJECT_PAUSED') {
       // trashed: stop dispatching, keep everything; the lease is released so it continues after a restore (a pause is not a failed attempt)
       await SocialContentCalendar.updateOne(lock, { $set: { 'generation.lease.expiresAt': at }, $inc: { 'generation.runAttempts': -1, ...carryUsage } });
-      LoggerUtil.warn('[SOCIAL_CALENDAR] Run paused: the project is in the trash', { calendarId: String(calendarId) });
+      recordRunOutcome('paused');
+      LoggerUtil.warn('[SOCIAL_CALENDAR] Run paused: the project is in the trash', { calendarId: String(calendarId), runId });
       return;
     }
 
     if (error?.code === 'PROJECT_GONE') {
+      recordRunOutcome('cancelled');
       await SocialContentCalendar.updateOne(lock, { $set: { status: 'cancelled', 'generation.finishedAt': at, 'generation.lease.expiresAt': null } });
+      await settleQuietly(calendarId); // before the posts go: what was generated is counted
       await SocialContentCalendarItem.deleteMany({ calendar_id: calendarId });
       return;
     }
 
-    const failure = error?.code === 'RUN_TOO_LONG'
-      ? { code: 'GENERATION_INTERRUPTED', message: CALENDAR_FAILURE_MESSAGES.GENERATION_INTERRUPTED }
-      : calendarFailureFor(error);
+    const failure = error?.quotaError
+      ? { code: error.quotaError.code, message: error.quotaError.message } // the allowance refused it: say how much is left, in the person's own terms
+      : error?.code === 'RUN_TOO_LONG'
+        ? { code: 'GENERATION_INTERRUPTED', message: CALENDAR_FAILURE_MESSAGES.GENERATION_INTERRUPTED }
+        : calendarFailureFor(error);
     const savedPosts = await SocialContentCalendarItem.countDocuments({ calendar_id: calendarId, slot: { $type: 'number' } });
     const current = await SocialContentCalendar.findOne(lock).select('generation.runAttempts').lean();
     if (!current) return;
@@ -348,7 +372,9 @@ async function settle(doc, lock, error, { started, usage, attempts, model, rejec
       // wait it out: the lease is set to the retry time, so the recovery sweep continues the run when that time comes
       const retryAt = new Date(at.getTime() + backoffMs(runAttempts));
       await SocialContentCalendar.updateOne(lock, { $set: { 'generation.lease.expiresAt': retryAt, 'generation.retry': { code: failure.code, at: retryAt }, 'generation.progress.plannedPosts': savedPosts }, $inc: carryUsage });
-      LoggerUtil.warn('[SOCIAL_CALENDAR] Transient failure; the run will continue automatically', { calendarId: String(calendarId), failureCode: failure.code, runAttempts, retryAt: retryAt.toISOString(), savedPosts });
+      recordRunOutcome('retry_scheduled');
+      recordProviderError(failure.code);
+      LoggerUtil.warn('[SOCIAL_CALENDAR] Transient failure; the run will continue automatically', { calendarId: String(calendarId), runId, failureCode: failure.code, runAttempts, retryAt: retryAt.toISOString(), savedPosts });
       return;
     }
 
@@ -367,16 +393,19 @@ async function settle(doc, lock, error, { started, usage, attempts, model, rejec
       },
       $inc: carryUsage,
     });
-    LoggerUtil.error('[SOCIAL_CALENDAR] Generation stopped', { ...describeProviderFailure(error), message: error?.code ? undefined : error?.message, validationErrors: error?.validation ? flattenAttempts(error.validation) : undefined, savedPosts, runAttempts }, { calendarId: String(calendarId), failureCode: failure.code, status });
+    await settleQuietly(calendarId); // a stopped generation keeps only what it really produced (a resume reserves just the missing posts)
+    recordRunOutcome(status, Date.now() - started);
+    recordProviderError(failure.code);
+    LoggerUtil.error('[SOCIAL_CALENDAR] Generation stopped', { ...describeProviderFailure(error), message: error?.code ? undefined : error?.message, validationErrors: error?.validation ? flattenAttempts(error.validation) : undefined, savedPosts, runAttempts }, { calendarId: String(calendarId), runId, failureCode: failure.code, status });
   } catch (inner) {
-    LoggerUtil.error('[SOCIAL_CALENDAR] Could not record how a generation stopped', { message: inner.message }, { calendarId: String(calendarId) });
+    LoggerUtil.error('[SOCIAL_CALENDAR] Could not record how a generation stopped', { message: inner.message }, { calendarId: String(calendarId), runId });
   }
 }
 
 /** Starts the run of an already-claimed generation: in the background by default, awaited in tests. */
 export async function launchRun(calendarId, lockedBy, { background = true } = {}) {
   const run = () => runCalendarGeneration(calendarId, lockedBy).catch((error) => {
-    LoggerUtil.error('[SOCIAL_CALENDAR] Generation bookkeeping failed', { message: error.message }, { calendarId: String(calendarId) });
+    LoggerUtil.error('[SOCIAL_CALENDAR] Generation bookkeeping failed', { message: error.message }, { calendarId: String(calendarId), runId: lockedBy });
   });
   if (background) { setImmediate(run); return null; }
   return run();
@@ -395,7 +424,7 @@ function isInFlightConflict(error) {
  * (partial -> generating); the run counter restarts, because the person has now decided to go on.
  * @returns {Promise<{ success: true, calendar, alreadyRunning: boolean } | { success: false, error }>}
  */
-export async function resumeCalendarGeneration(projectId, { now = new Date(), background = true } = {}) {
+export async function resumeCalendarGeneration(projectId, { now = new Date(), background = true, userId = null } = {}) {
   const pid = toId(projectId);
   const running = await SocialContentCalendar.findOne({ project_id: pid, status: 'generating' }).lean();
   if (running) return { success: true, alreadyRunning: true, calendar: running };
@@ -403,6 +432,16 @@ export async function resumeCalendarGeneration(projectId, { now = new Date(), ba
   if (!partial) return fail('NOTHING_TO_RESUME', 'There is no unfinished calendar to resume.');
   if (!getProvider().isAvailable()) return fail('AI_UNAVAILABLE', CALENDAR_FAILURE_MESSAGES.AI_UNAVAILABLE);
   if (!(await SocialAIStrategy.exists({ _id: partial.strategy.id, project_id: pid }))) return fail('NO_STRATEGY', 'The strategy this calendar was planned from is no longer available. Start a new calendar instead.');
+
+  // The usage allowance: only the posts still MISSING are reserved - the ones already saved were counted when it stopped.
+  const savedPosts = await SocialContentCalendarItem.countDocuments({ calendar_id: partial._id, slot: { $type: 'number' } });
+  const missing = Math.max(0, (partial.generation?.progress?.totalPosts || 0) - savedPosts);
+  const owner = userId || (await SeoProject.findById(pid).select('user_id').lean())?.user_id;
+  const reservation = await reserveCalendarQuota({
+    userId: owner, projectId: pid, calendarId: partial._id, posts: missing, now,
+    base: { saved: savedPosts, inputTokens: partial.generation?.usage?.inputTokens || 0, outputTokens: partial.generation?.usage?.outputTokens || 0, aiCalls: partial.generation?.attempts || 0 },
+  });
+  if (!reservation.success) return { success: false, error: reservation.error };
 
   const lockedBy = newOwner();
   let claimed = null;
@@ -413,11 +452,15 @@ export async function resumeCalendarGeneration(projectId, { now = new Date(), ba
       { new: true },
     ).lean();
   } catch (error) {
+    await releaseCalendarQuota({ userId: owner, projectId: pid, calendarId: partial._id, now });
     if (!isInFlightConflict(error)) throw error;
     return { success: true, alreadyRunning: true, calendar: await SocialContentCalendar.findOne({ project_id: pid, status: 'generating' }).lean() };
   }
-  if (!claimed) return fail('CONFLICT', 'That calendar changed at the same moment. Please try again.');
-  LoggerUtil.info('[SOCIAL_CALENDAR] Generation resumed', { projectId: String(projectId), calendarId: String(claimed._id), savedPosts: claimed.generation?.progress?.plannedPosts });
+  if (!claimed) {
+    await releaseCalendarQuota({ userId: owner, projectId: pid, calendarId: partial._id, now });
+    return fail('CONFLICT', 'That calendar changed at the same moment. Please try again.');
+  }
+  LoggerUtil.info('[SOCIAL_CALENDAR] Generation resumed', { projectId: String(projectId), calendarId: String(claimed._id), runId: lockedBy, savedPosts: claimed.generation?.progress?.plannedPosts });
   const result = await launchRun(claimed._id, lockedBy, { background });
   return { success: true, alreadyRunning: false, calendar: result || (await SocialContentCalendar.findById(claimed._id).lean()) };
 }
@@ -436,6 +479,7 @@ export async function cancelCalendarGeneration(projectId, { now = new Date() } =
     { new: true },
   ).lean();
   if (!cancelled) return fail('CONFLICT', 'That calendar changed at the same moment. Please try again.');
+  await settleQuietly(cancelled._id); // before the posts are discarded: what was generated was real work and is counted
   await SocialContentCalendarItem.deleteMany({ calendar_id: cancelled._id });
   LoggerUtil.info('[SOCIAL_CALENDAR] Generation cancelled', { projectId: String(projectId), calendarId: String(cancelled._id), version: cancelled.version });
   return { success: true, calendar: cancelled };
@@ -446,6 +490,7 @@ async function finishInterrupted(doc, filter, now) {
   const savedPosts = await SocialContentCalendarItem.countDocuments({ calendar_id: doc._id, slot: { $type: 'number' } });
   const failure = { code: 'GENERATION_INTERRUPTED', message: CALENDAR_FAILURE_MESSAGES.GENERATION_INTERRUPTED, at: now };
   const res = await SocialContentCalendar.updateOne(filter, { $set: { status: savedPosts > 0 ? 'partial' : 'failed', 'generation.finishedAt': now, 'generation.lease.expiresAt': null, 'generation.progress.plannedPosts': savedPosts, 'generation.retry': { code: null, at: null }, failure } });
+  if (res.modifiedCount > 0) await settleQuietly(doc._id);
   return res.modifiedCount > 0;
 }
 
@@ -465,7 +510,7 @@ export async function recoverInterruptedCalendars({ projectId = null, now = new 
   for (const doc of legacy) {
     summary.found += 1;
     // eslint-disable-next-line no-await-in-loop
-    if (await finishInterrupted(doc, { _id: doc._id, status: 'generating', 'generation.lease.expiresAt': null }, now)) summary.finished += 1;
+    if (await finishInterrupted(doc, { _id: doc._id, status: 'generating', 'generation.lease.expiresAt': null }, now)) { summary.finished += 1; recordTakeover('finished_interrupted'); }
   }
 
   const expired = { ...scope, status: 'generating', 'generation.lease.expiresAt': { $lt: now } };
@@ -480,13 +525,16 @@ export async function recoverInterruptedCalendars({ projectId = null, now = new 
       // eslint-disable-next-line no-await-in-loop
       await SocialContentCalendar.updateOne(filter, { $set: { status: 'cancelled', 'generation.lease.expiresAt': null } });
       // eslint-disable-next-line no-await-in-loop
+      await settleQuietly(doc._id);
+      // eslint-disable-next-line no-await-in-loop
       await SocialContentCalendarItem.deleteMany({ calendar_id: doc._id });
       summary.finished += 1;
+      recordTakeover('project_gone');
       continue;
     }
     if ((doc.generation?.runAttempts || 0) >= CALENDAR_MAX_RUN_ATTEMPTS || !resume) {
       // eslint-disable-next-line no-await-in-loop
-      if (await finishInterrupted(doc, filter, now)) summary.finished += 1;
+      if (await finishInterrupted(doc, filter, now)) { summary.finished += 1; recordTakeover('finished_interrupted'); }
       continue;
     }
     const lockedBy = newOwner();
@@ -494,7 +542,8 @@ export async function recoverInterruptedCalendars({ projectId = null, now = new 
     const claimed = await SocialContentCalendar.findOneAndUpdate(filter, { $set: { 'generation.lockedBy': lockedBy, 'generation.lease.expiresAt': leaseUntil(now) }, $inc: { 'generation.runAttempts': 1 } }, { new: true }).lean();
     if (!claimed) continue; // another instance took it first
     summary.resumed += 1;
-    LoggerUtil.warn('[SOCIAL_CALENDAR] Taking over an interrupted generation', { calendarId: String(claimed._id), projectId: String(claimed.project_id), runAttempts: claimed.generation?.runAttempts, savedPosts: claimed.generation?.progress?.plannedPosts });
+    recordTakeover('resumed');
+    LoggerUtil.warn('[SOCIAL_CALENDAR] Taking over an interrupted generation', { calendarId: String(claimed._id), runId: lockedBy, projectId: String(claimed.project_id), runAttempts: claimed.generation?.runAttempts, savedPosts: claimed.generation?.progress?.plannedPosts });
     // eslint-disable-next-line no-await-in-loop
     await launchRun(claimed._id, lockedBy, { background });
   }

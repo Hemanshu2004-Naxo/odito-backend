@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 import { composeDesign } from './compose/designComposer.js';
 import { MAX_IMAGE_PIXELS } from './designConfig.js';
+import { assessRaster } from './designQuality.js';
 
 /**
  * Produces ONE finished design from a built request: the photograph (only when the layout carries one, from the existing image
@@ -9,9 +10,13 @@ import { MAX_IMAGE_PIXELS } from './designConfig.js';
  *
  *   brief ──► photograph (provider, no text) ──► composition (fonts, shapes, real logo, real product photos) ──► PNG
  *
- * A failed photograph fails the design: there is no stand-in picture. Failures keep their own codes (provider errors stay
+ * A design with no photograph (lists, statistics, quotes, ...) never touches the provider, configured or not. A failed or unavailable photograph fails the design: there is no stand-in picture. Failures keep their own codes (provider errors stay
  * provider errors; a composition problem is DESIGN_COMPOSE_FAILED).
  */
+
+// Test seam only (same convention as the provider override): substitute the composition step, e.g. with one that returns a blank picture. Production never sets it.
+let composerOverride = null;
+export const setDesignComposerOverride = (fn) => { composerOverride = fn || null; };
 
 const composeFailure = (reason) => Object.assign(new Error('DESIGN_COMPOSE_FAILED'), { code: 'DESIGN_COMPOSE_FAILED', reason });
 
@@ -38,17 +43,24 @@ export async function produceDesign({ request, provider, generationId, logo = nu
     if (visualBuffer) {
       visual = visualBuffer;
     } else {
+      // The provider is needed ONLY here. If it is not configured the design fails before any request is made - there is no stand-in picture.
+      if (typeof provider?.isAvailable === 'function' && !provider.isAvailable()) throw Object.assign(new Error('AI_UNAVAILABLE'), { code: 'AI_UNAVAILABLE' });
       providerResult = await provider.generateImage({ prompt: visualPrompt, size: visualSize, generationId: String(generationId), referenceImages: [] });
       try { visual = await normalizeVisual(providerResult.buffer); } catch { throw Object.assign(new Error('MEDIA_INVALID'), { code: 'MEDIA_INVALID', reason: 'visual_not_decodable' }); }
+      // a picture that decodes but shows nothing (blank / one colour) is not a photograph: it is refused here, before it is composed and before it is saved
+      if ((await assessRaster(visual)).blank) throw Object.assign(new Error('MEDIA_INVALID'), { code: 'MEDIA_INVALID', reason: 'visual_blank' });
     }
   }
   let composed;
   try {
-    composed = await composeDesign({ brief, size, visual, logo, productImages });
+    composed = await (composerOverride || composeDesign)({ brief, size, visual, logo, productImages });
   } catch (error) {
     throw composeFailure(error?.reason || error?.code || 'compose_error');
   }
-  return { png: composed.buffer, visual, report: composed.report, provider: providerResult };
+  // the finished design must carry information too (a layout bug that draws nothing must never be saved as a success)
+  const finished = await assessRaster(composed.buffer);
+  if (finished.blank) throw composeFailure('blank_output');
+  return { png: composed.buffer, visual, report: { ...composed.report, quality: { stdev: finished.stdev, flatShare: finished.flatShare } }, provider: providerResult };
 }
 
 export default { produceDesign };

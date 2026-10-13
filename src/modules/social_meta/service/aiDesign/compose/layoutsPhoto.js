@@ -29,7 +29,8 @@ export async function photoHero(scene, ctx) {
   scene.rect({ x: 0, y: 0, w: W, h: H, fill: theme.page });
 
   if (!wide) {
-    const photoH = Math.round(H * (cls === 'tall' ? 0.6 : 0.64));
+    // no button and no contact line below the copy: the photograph takes that room instead of leaving it blank
+    const photoH = Math.round(H * ((cls === 'tall' ? 0.6 : 0.64) + (brief.cta || contact.length ? 0 : 0.08)));
     const frame = { x: 0, y: 0, w: W, h: photoH };
     if (ctx.visual) await scene.photo(ctx.visual, { ...frame, radius: 0 });
     else noVisual(scene, ctx, frame);
@@ -73,7 +74,8 @@ export async function photoHero(scene, ctx) {
   scene.rect({ x: split - 1.1 * u, y: 0, w: 1.1 * u, h: H, fill: pal.bright });
   scene.rect({ x: 0, y: 0, w: split, h: H, fill: theme.page });
   await placeLogo(scene, ctx, { x: 5 * u, y: 4.6 * u, maxW: 30 * u, maxH: 9.5 * u, surface: theme.page });
-  let y = 17 * u;
+  // with nothing to put under the copy (no button, no contact line) the text block sits lower, so the column is balanced instead of top-heavy with an empty bottom half
+  let y = brief.cta || contact.length ? 17 * u : H * 0.26;
   const head = await headlineBlock(scene, ctx, {
     x: 5 * u, y, w: split - 10 * u, maxH: H * 0.4, family: fonts.heading, weight: 800, maxSize: 8.6 * u, minSize: 4 * u,
     color: theme.lead, runs: emphasisRuns(brief.headline, theme.lead, pal.bright), lineGapRatio: -0.12,
@@ -201,8 +203,10 @@ export async function announcementBanner(scene, ctx) {
   scene.circle({ cx: W * 0.04, cy: H * 0.98, r: Math.min(W, H) * 0.26, fill: accent, opacity: 0.16 });
 
   await placeLogo(scene, ctx, { x: 5.5 * u, y: 5 * u, maxW: 34 * u, maxH: 11 * u, surface: field });
-  const textW = wide ? W * 0.56 : W - 12 * u;
   const photoD = wide ? H * 0.62 : Math.min(W, H) * 0.34;
+  // the text column ends before the photograph's ring (centre at 78% of the width): copy must never run into the picture
+  const ringLeft = W * 0.78 - photoD / 2 - 1.4 * u;
+  const textW = wide ? Math.min(W * 0.56, ringLeft - 6 * u - 3 * u) : W - 12 * u;
   let y = wide ? H * 0.2 : H * 0.2;
   const head = await headlineBlock(scene, ctx, {
     x: 6 * u, y, w: textW, maxH: H * (wide ? 0.42 : 0.3), family: fonts.heading, weight: 800, maxSize: (wide ? 9.2 : 9.6) * u, minSize: 4 * u,

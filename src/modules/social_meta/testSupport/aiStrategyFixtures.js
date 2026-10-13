@@ -80,6 +80,11 @@ export function validRawStrategy(overrides = {}) {
     },
     brandRules: { visualGuidelines: ['Bright, clean photography'], messagingRules: ['Explain, never scare'] },
     recommendations: ['Post consistently for 8 weeks before judging results.'],
+    planOutlook: {
+      seasonalThemes: [{ theme: 'Back-to-school check-ups', timing: 'Month 1', idea: 'Remind families to book a check-up before the term gets busy.' }],
+      campaignIdeas: [{ name: 'Smile check week', idea: 'A week of short tips ending with an invitation to book a check-up.' }],
+      successMetrics: [{ metric: 'Booking enquiries', whatGoodLooks: 'More messages asking to book after educational posts.' }],
+    },
     assumptions: [],
     gaps: [],
     ...overrides,

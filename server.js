@@ -93,6 +93,7 @@ import { startReviewSnapshotScheduler } from './src/services/businessProfileRevi
 import { handleStripeWebhook } from './src/modules/subscription/controller/subscriptionController.js';
 import auth from './src/modules/user/middleware/auth.js';
 import { requireAdmin } from './src/middleware/auth.middleware.js';
+import healthRoutes, { markStartupComplete } from './src/monitoring/healthRoutes.js';
 
 
 
@@ -456,6 +457,11 @@ const startServer = async () => {
 
 
 
+  // Liveness (/healthz), readiness (/readyz) and Prometheus metrics (/metrics, bearer-protected). Mounted at the root and under /api (a reverse
+  // proxy often forwards only /api), before the body parsers and the /api routes: no session, no JSON parsing. See src/monitoring/healthRoutes.js.
+  app.use('/api', healthRoutes);
+  app.use('/', healthRoutes);
+
   // Stripe webhook — MUST be registered before express.json() below with its
   // own raw-body parser. Stripe signature verification is an HMAC over the
   // exact raw request bytes; once express.json() has parsed the body into a
@@ -665,6 +671,8 @@ const startServer = async () => {
 
 
   server.listen(PORT, () => {
+
+    markStartupComplete(); // readiness turns green only once the database is connected, the schedulers are registered and the port is open
 
     console.log(`✓ Server is listening on port ${PORT}`);
 

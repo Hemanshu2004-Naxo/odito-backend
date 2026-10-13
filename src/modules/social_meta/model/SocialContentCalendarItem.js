@@ -2,10 +2,11 @@ import mongoose from 'mongoose';
 
 /**
  * SocialContentCalendarItem — ONE planned post of a content calendar version. Planning data: what the post is about
- * (topic, angle, hook, objective, KPI, CTA, creative direction, assets, review notes) plus, optionally, a person's own
- * planning copy (caption, hashtags, per-platform copy) and chosen product images. The AI plan never writes those; the
- * real caption of a post and its design are made later, from an approved item, by the existing content / design
- * generation and approval workflow, and live on the SocialPublication - never here.
+ * (topic, angle, hook, objective, KPI, CTA, creative direction, assets, review notes) plus the WRITTEN COPY of the post: a caption,
+ * hashtags and a version per platform. The calendar generation writes that copy for every post (calendar prompt v3) and a person can edit it.
+ * It is the PLAN's copy - what the person reviews and approves here. When the plan is approved, "Create post from this plan" copies exactly
+ * this text into a SocialPublication draft (generation.source 'calendar_plan', with the plan revision it came from); that draft, with its own
+ * approvals, is what is published - never this field. Designs are made later, on the publication, by the design workflow.
  *
  * `status` is the PLANNING state. It deliberately does not duplicate SocialPublication: once an item becomes a real
  * publication it points at it through `publicationIds`, and the publication's own state is the source of truth for
@@ -70,8 +71,8 @@ const socialContentCalendarItemSchema = new mongoose.Schema({
   approvalNotes: { type: String, default: '', maxlength: 260 },
   footerDisclaimer: { type: String, default: '', maxlength: 200 },
 
-  // The user's own planned copy. Optional: the AI plan only carries a caption DIRECTION. The caption of an actual post
-  // is written later by the content generator into a SocialPublication; this is the user's planning copy.
+  // The written copy of the plan: written by the calendar generation (or by the person, for a manual item) and editable. Optional - an older
+  // calendar, or a manual item, may have none. It becomes a real post only through "Create post from this plan" (see the header).
   caption: { type: String, default: '', maxlength: 3000 },
   hashtags: { type: [String], default: [] }, // '#tag' form, validated by the item service
   // Platform-specific copy for the platforms this item targets. A blank field falls back to the shared one.

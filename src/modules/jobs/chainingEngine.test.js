@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 
 import chainingEngine from './chainingEngine.js';
 import Job from './model/Job.js';
+import PageVerificationRun from '../verification/model/PageVerificationRun.js';
 import JobGroup from './model/JobGroup.js';
 import { JOB_TYPES } from './constants/jobTypes.js';
 
@@ -37,6 +38,7 @@ function makeJob(overrides = {}) {
 describe('chainingEngine.process — PAGE_SCRAPING mode-based CRAWL_GRAPH exclusion (P1-002)', () => {
   let originalCreateAndDispatch;
   let originalCheckGate;
+  let originalFindRun;
   let dispatchCalls;
   let gateCalls;
 
@@ -45,6 +47,11 @@ describe('chainingEngine.process — PAGE_SCRAPING mode-based CRAWL_GRAPH exclus
     gateCalls = [];
     originalCreateAndDispatch = chainingEngine._createAndDispatchJob;
     originalCheckGate = chainingEngine.checkDependencyGate;
+    // The url_verification branches look the verification run up before anything else. These tests connect to no database, so an
+    // un-stubbed lookup is not a fast failure: Mongoose BUFFERS the query for its full 10 s timeout, and the engine then swallows the error
+    // as "non-fatal" - five tests that passed after 10 s each (50 s of the backend run). "No run exists" is the answer the tests mean.
+    originalFindRun = PageVerificationRun.findOne;
+    PageVerificationRun.findOne = () => ({ select: async () => null });
 
     // Recording stubs — no real job is ever created, no real dispatch ever
     // happens, no real DB is touched by either.
@@ -59,6 +66,7 @@ describe('chainingEngine.process — PAGE_SCRAPING mode-based CRAWL_GRAPH exclus
   afterEach(() => {
     chainingEngine._createAndDispatchJob = originalCreateAndDispatch;
     chainingEngine.checkDependencyGate = originalCheckGate;
+    PageVerificationRun.findOne = originalFindRun;
   });
 
   // ── Mode recognition ──

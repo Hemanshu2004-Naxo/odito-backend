@@ -1,6 +1,7 @@
 // Environment configuration and validation - PRODUCTION READY
 import dotenv from 'dotenv';
 import { isPubliclyReachableUrl } from '../utils/publicUrlCheck.js';
+import { assertSocialAiConfig } from './socialAiAllowance.js';
 
 // Load environment variables
 dotenv.config();
@@ -114,6 +115,20 @@ export const validateEnvironment = () => {
     console.warn('   Facebook/Instagram media (image/video) publishing will fail for every attempt —');
     console.warn('   Meta\'s servers cannot fetch media from a localhost/private/non-HTTPS URL.');
     console.warn('   Text-only publishing is unaffected. Set BACKEND_URL (or PUBLIC_MEDIA_BASE_URL) to a public HTTPS origin that serves /storage/social_media to fix this.');
+  }
+
+  // Social Media AI calendar allowance: an invalid or contradictory value THROWS (server.js stops a production start), because a typo must
+  // never silently become "no limit". A plan with no allowance decided is only a warning here - in production the feature then refuses
+  // calendar generation for those accounts (fail closed) while the rest of the product keeps running. See config/socialAiAllowance.js.
+  const metricsToken = (process.env.METRICS_TOKEN || '').trim();
+  if (process.env.NODE_ENV === 'production' && metricsToken.length < 16) {
+    console.warn(`⚠️  METRICS_TOKEN is ${metricsToken ? 'shorter than 16 characters' : 'not set'}: GET /metrics stays disabled in production, so nothing can scrape the Social AI operational metrics.`);
+  }
+
+  const socialAi = assertSocialAiConfig(process.env);
+  if (socialAi.warnings.length > 0) {
+    console.warn('⚠️  Social Media AI quota configuration is incomplete:');
+    socialAi.warnings.forEach((line) => console.warn(`   - ${line}`));
   }
 
   return {

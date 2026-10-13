@@ -49,12 +49,16 @@ export async function infographicPoints(scene, ctx) {
   const rows = Math.ceil(points.length / cols);
   const gap = 2.2 * u;
   const cardW = (W - 12 * u - gap * (cols - 1)) / cols;
-  const cardH = Math.min(15 * u, (bottom - top - gap * (rows - 1)) / rows);
+  // a card is as tall as its text needs (never a big empty box), and the whole grid sits in the middle of the free height
+  const cardH = Math.min((wide ? 19 : 16) * u, (bottom - top - gap * (rows - 1)) / rows);
+  const gridOffset = Math.max(0, Math.min(6 * u, (bottom - top - (rows * cardH + gap * (rows - 1))) / 2));
   const numR = Math.min(cardH * 0.34, 4.4 * u);
   for (let i = 0; i < points.length; i += 1) {
     const col = i % cols; const row = Math.floor(i / cols);
-    const x = 6 * u + col * (cardW + gap); const y = top + row * (cardH + gap);
-    scene.rect({ x, y, w: cardW, h: cardH, radius: 2.4 * u, fill: '#ffffff', stroke: pal.deep, strokeW: 0.25 * u });
+    const spans = wide && i === points.length - 1 && points.length % 2 === 1; // a lone last card takes the whole row instead of leaving a hole
+    const cw = spans ? W - 12 * u : cardW;
+    const x = 6 * u + (spans ? 0 : col * (cardW + gap)); const y = top + gridOffset + row * (cardH + gap);
+    scene.rect({ x, y, w: cw, h: cardH, radius: 2.4 * u, fill: '#ffffff', stroke: pal.deep, strokeW: 0.25 * u });
     const cx = x + numR + 2.2 * u; const cy = y + cardH / 2;
     if (timeline && i < points.length - 1 && cols === 1) scene.rect({ x: cx - 0.3 * u, y: cy + numR, w: 0.6 * u, h: cardH + gap - numR * 2 + 0.01, fill: pal.bright, opacity: 0.5 });
     scene.circle({ cx, cy, r: numR, fill: i % 2 === 0 ? pal.deep : pal.bright });
@@ -62,7 +66,7 @@ export async function infographicPoints(scene, ctx) {
     // eslint-disable-next-line no-await-in-loop
     else await scene.line(String(i + 1).padStart(2, '0'), { x: cx - numR, y: cy - numR, boxH: numR * 2, nudge: 0.04, maxW: numR * 2, family: fonts.heading, weight: 800, maxSize: numR * 0.95, minSize: 10, color: i % 2 === 0 ? pal.onDeep : pal.onBright, align: 'center', label: `numeral:${i}` });
     // eslint-disable-next-line no-await-in-loop
-    await scene.text(points[i], { x: cx + numR + 2.4 * u, y: y + 0.8 * u, w: cardW - (cx - x) - numR - 4.8 * u, maxH: cardH - 1.6 * u, family: fonts.body, weight: 600, maxSize: 3.3 * u, minSize: 1.8 * u, color: pal.deep, valign: 'middle', label: `point:${i}` });
+    await scene.text(points[i], { x: cx + numR + 2.4 * u, y: y + 1.4 * u, w: cw - (cx - x) - numR - 4.8 * u, maxH: cardH - 2.8 * u, family: fonts.body, weight: 600, maxSize: 3.3 * u, minSize: 1.8 * u, color: pal.deep, valign: 'middle', label: `point:${i}` });
   }
   if (brief.cta || contact.length) await footer(scene, ctx, { y: H - footerH + 1.2 * u, onDark: theme.dark });
 }
@@ -88,12 +92,16 @@ export async function insightStats(scene, ctx) {
   const horizontal = wide || figures.length === 1 ? figures.length > 1 : false;
   const n = Math.max(1, figures.length);
   const gap = 2.4 * u;
+  const cardCap = (horizontal ? 46 : 30) * u;
+  const fullH = horizontal ? bottom - top : (bottom - top - gap * (n - 1)) / n;
+  const stackH = Math.min(fullH, cardCap);
+  const groupH = horizontal ? stackH : n * stackH + gap * (n - 1);
+  const groupTop = top + Math.max(0, Math.min(6 * u, ((bottom - top) - groupH) / 2));
   for (let i = 0; i < figures.length; i += 1) {
     const f = figures[i];
-    const stackH = horizontal ? bottom - top : (bottom - top - gap * (n - 1)) / n;
     const w = horizontal ? (W - 12 * u - gap * (n - 1)) / n : W - 12 * u;
     const x = 6 * u + (horizontal ? i * (w + gap) : 0);
-    const y = horizontal ? top : top + i * (stackH + gap);
+    const y = horizontal ? groupTop : groupTop + i * (stackH + gap);
     scene.rect({ x, y, w, h: stackH, radius: 2.6 * u, fill: '#ffffff' });
     scene.rect({ x, y: y + stackH * 0.18, w: 1 * u, h: stackH * 0.64, fill: pal.bright, radius: 0.5 * u });
     const numW = horizontal ? w - 5 * u : Math.min(w * 0.4, 40 * u);
@@ -176,7 +184,7 @@ export async function statementQuote(scene, ctx) {
     const q = 0.62 * u; // one scale for both marks
     for (const dx of [0, 24 * q]) scene.svg(`<g transform="translate(${6 * u + dx + 14 * q} ${H * 0.16 + 32 * q}) rotate(180)"><path d="M14 0C6 3 0 10.5 0 20v12h14V20H8c0-5 2.4-8.4 6-10.6z" transform="scale(${q})" fill="${pal.bright}"/></g>`);
   }
-  const y0 = quote ? H * 0.3 : H * 0.28;
+  const y0 = quote ? H * 0.4 : H * 0.28; // a quote's marks are ~20u tall from 16% of the height: the text starts below them
   const ink = theme.dark ? '#ffffff' : pal.deep;
   const head = await headlineBlock(scene, ctx, {
     x: 6 * u, y: y0, w: W - 12 * u, maxH: H * 0.42, family: fonts.heading, weight: quote ? 700 : 800, maxSize: (quote ? 7.4 : 9.4) * u, minSize: 3.4 * u,

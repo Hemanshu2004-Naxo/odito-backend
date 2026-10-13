@@ -67,6 +67,23 @@ export const CALENDAR_MAX_POSTS = num(process.env.SOCIAL_AI_CALENDAR_MAX_POSTS, 
 /** Room for hand-added posts on top of a full generated calendar. */
 export const CALENDAR_MAX_ITEMS = CALENDAR_MAX_POSTS + 50;
 
+/**
+ * Usage limits (database-enforced, per UTC calendar month - see calendarQuotaService.js). Odito has NO social-AI allowance in its plans yet,
+ * and these numbers are a business decision, so none is invented here:
+ *   - a plan may carry an entitlement  PLANS[plan].socialAi.calendarPostsPerMonth  (config/plans.js); no plan defines one today
+ *   - otherwise the environment can set a platform-wide ceiling (unset = unlimited)
+ * The only built-in number is the cap on generations running at once per account, which is a safety guard, not a price.
+ */
+const optionalNum = (v) => { const n = Number(v); return v !== undefined && v !== '' && Number.isFinite(n) && n > 0 ? n : null; };
+export const CALENDAR_QUOTA_USER_POSTS_PER_MONTH = optionalNum(process.env.SOCIAL_AI_CALENDAR_QUOTA_USER_POSTS_PER_MONTH);
+export const CALENDAR_QUOTA_PROJECT_POSTS_PER_MONTH = optionalNum(process.env.SOCIAL_AI_CALENDAR_QUOTA_PROJECT_POSTS_PER_MONTH);
+export const CALENDAR_QUOTA_MAX_IN_FLIGHT_PER_USER = num(process.env.SOCIAL_AI_CALENDAR_QUOTA_MAX_IN_FLIGHT_PER_USER, 3);
+/** Provider prices in USD per million tokens, for the cost estimate only. Unset = the ledger records tokens and calls but no cost. */
+export const CALENDAR_COST_USD_PER_MTOK_INPUT = optionalNum(process.env.SOCIAL_AI_COST_USD_PER_MTOK_INPUT);
+export const CALENDAR_COST_USD_PER_MTOK_OUTPUT = optionalNum(process.env.SOCIAL_AI_COST_USD_PER_MTOK_OUTPUT);
+/** A reservation older than this whose calendar is no longer running is released by the reconciliation sweep. */
+export const CALENDAR_QUOTA_RECONCILE_AFTER_MS = num(process.env.SOCIAL_AI_CALENDAR_QUOTA_RECONCILE_AFTER_MS, 5 * 60 * 1000);
+
 /** Archived (superseded) calendar versions kept per project. Versions that own a real post are never pruned. */
 export const CALENDAR_HISTORY_LIMIT = num(process.env.SOCIAL_AI_CALENDAR_HISTORY_LIMIT, 10);
 

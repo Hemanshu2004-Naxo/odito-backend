@@ -43,6 +43,20 @@ const socialAIStrategySchema = new mongoose.Schema({
   strategy: { type: mongoose.Schema.Types.Mixed, default: null },
   strategyGaps: { type: [gapSchema], default: [] },
 
+  // The person's planning choice made when this version was created (posts per week, months, platforms, the planner's estimate). null on
+  // versions saved before the wizard existed: those stay readable and simply have no saved choice. Never edited in place: a new choice is a new version.
+  planning: {
+    type: new mongoose.Schema({
+      postsPerWeek: { type: Number, required: true, min: 1, max: 7 },
+      months: { type: Number, required: true, min: 1, max: 6 },
+      platforms: { type: [String], default: [] },
+      estimatedPosts: { type: Number, default: null },
+      basisStartDate: { type: String, default: null },
+      confirmedAt: { type: Date, default: null },
+    }, { _id: false }),
+    default: null,
+  },
+
   profileSnapshot: {
     generatedAt: { type: Date, default: null },
     hash: { type: String, default: null },
@@ -53,6 +67,8 @@ const socialAIStrategySchema = new mongoose.Schema({
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
     lockedBy: { type: String, default: null },
+    // the client's idempotency key for this start: the same key never creates a second version (a retry after a lost response)
+    requestId: { type: String, default: null, maxlength: 80 },
     promptVersion: { type: String, default: null },
     model: { type: String, default: null },
     attempts: { type: Number, default: 0 },

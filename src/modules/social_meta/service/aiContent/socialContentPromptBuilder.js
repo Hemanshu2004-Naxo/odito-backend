@@ -1,3 +1,4 @@
+import { cleanPromptValue } from '../promptSafety.js';
 import { CONTENT_TOOL_NAME } from './contentOutputSchema.js';
 import { PLATFORM_TEXT_LIMITS } from './contentConfig.js';
 
@@ -58,7 +59,7 @@ export function buildSystemPrompt() {
 }
 
 const MAX_VALUE = 500;
-const clean = (v) => String(v).replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_VALUE);
+const clean = (v) => cleanPromptValue(v, { max: MAX_VALUE }); // one line, bounded, and nothing in it can imitate a `</block>` delimiter (promptSafety.js)
 const line = (label, value) => (value === undefined || value === null || value === '' || (Array.isArray(value) && !value.length) ? null : `${label}: ${Array.isArray(value) ? value.map(clean).join(' | ') : clean(value)}`);
 const BUSINESS_MODEL_TEXT = Object.freeze({ service: 'service-based', product: 'product-based' });
 
@@ -151,9 +152,9 @@ export function buildUserPrompt({ snapshotData, strategy, platform, pillar, obje
   ];
 
   // The calendar item this post executes (supplied by the server from a project-scoped lookup, never by the browser).
-  // Everything in it is DATA, like the rest of the message. `<` and `>` are dropped so a value cannot imitate a delimiter.
+  // Everything in it is DATA, like the rest of the message; clean() already makes a value unable to imitate a delimiter.
   if (planItem) {
-    const safe = (v) => clean(String(v ?? '').replace(/[<>]/g, ''));
+    const safe = (v) => clean(v ?? '');
     const platformCopy = (planItem.platformContent || []).find((p) => p.platform === platform) || {};
     const draftCaption = platformCopy.caption || planItem.caption;
     const tags = platformCopy.hashtags?.length ? platformCopy.hashtags : planItem.hashtags;

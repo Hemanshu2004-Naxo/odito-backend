@@ -210,7 +210,7 @@ describe('helpers', () => {
     assert.equal(fitHeadline('Positioning beats polish. Always.'), 'Positioning beats polish. Always');
     assert.equal(fitHeadline('x'), '');
     assert.equal(extractPoints({ caption: LIST }).length, 5);
-    assert.deepEqual(extractFigures('Up 42% from $1,200 to 3 offices'), ['42%', '$1,200', '3']);
+    assert.deepEqual(extractFigures('Up 42% from $1,200 to 3 offices'), ['42%', '$1,200']);
     assert.deepEqual(quotedText('say "A" and "Start here"'), ['Start here']);
   });
 });

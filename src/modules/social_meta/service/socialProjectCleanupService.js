@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 import SeoProject from '../../app_user/model/SeoProject.js';
 import SocialProjectCleanup, { EXTERNAL_REVOCATION, cleanupExpiry } from '../model/SocialProjectCleanup.js';
 import mediaStorageService from './media/mediaStorageService.js';
+import { settleQuietly } from './calendar/calendarQuotaService.js';
+import { recordCleanupFailure } from '../../../monitoring/socialAiMetrics.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 
 /**
@@ -72,6 +74,7 @@ export async function purgeProjectSocialData(projectId, { now = new Date() } = {
       const failure = { step: name, error: error.message };
       failures.push(failure);
       if (isCritical) critical.push(failure);
+      recordCleanupFailure(name);
       LoggerUtil.error(`${SERVICE}: step failed`, { step: name, message: error.message }, { projectId: String(projectId) });
     }
   };
@@ -109,6 +112,17 @@ export async function purgeProjectSocialData(projectId, { now = new Date() } = {
       { project_id: pid },
       { $set: { status: 'revoked', statusReason: 'PROJECT_DELETED', isActive: false, updatedAt: now }, $unset: { accessToken: '' } },
     );
+  });
+
+  // 1c. Usage allowance. A calendar that is still being generated holds a reservation on the OWNER's monthly ledger. It is settled now, while
+  // the calendar's saved posts still exist, so what was really generated is COUNTED - deleting the project must not refund AI work that was
+  // done. Not critical (the reconciliation sweep releases a stale reservation anyway), and settling twice is harmless.
+  await attempt('usage-reservations', false, async () => {
+    const running = await db.collection('social_content_calendars').find({ project_id: pid, status: { $in: ['generating', 'partial'] } }, { projection: { _id: 1 } }).toArray();
+    for (const calendar of running) {
+      // eslint-disable-next-line no-await-in-loop
+      await settleQuietly(calendar._id);
+    }
   });
 
   // 2. Publications: removing them is what stops anything scheduled from ever being dispatched.

@@ -12,9 +12,12 @@ import {
 } from './calendarConfig.js';
 import { effectiveStatusOf, isItemLocked, contentIdOf } from './calendarItemRules.js';
 import { listCalendarVersions, getCalendarVersion, restoreCalendarVersion } from './calendarHistoryService.js';
+import { reserveCalendarQuota, getUsageSummary, checkQuotaFor } from './calendarQuotaService.js';
+import { toApiPlanning } from '../aiStrategy/strategyPlanning.js';
+import mongoose from 'mongoose';
 import { loadPublicationSummaries } from './calendarItemLinks.js';
 import {
-  getProvider, latestReadyStrategy, connectedPlatforms, CALENDAR_FAILURE_MESSAGES, toId, fail,
+  getProvider, latestReadyStrategy, connectedPlatforms, platformStates, CALENDAR_FAILURE_MESSAGES, toId, fail,
 } from './calendarPlanningContext.js';
 import {
   INSTANCE, launchRun, resumeCalendarGeneration, cancelCalendarGeneration, recoverInterruptedCalendars, pruneHistory,
@@ -184,7 +187,7 @@ export async function getCalendarGenerationStatus(projectId, { now = new Date() 
 }
 
 /** Full read model: the current calendar and its items, the latest attempt, what the user can choose, and whether the calendar is out of date. */
-export async function getCalendarState(projectId, { now = new Date() } = {}) {
+export async function getCalendarState(projectId, { now = new Date(), userId = null } = {}) {
   if (!(await SeoProject.exists({ _id: toId(projectId), is_deleted: { $ne: true } }))) return null;
   await recoverStaleCalendarGenerations(projectId, { now });
   const [{ latest, current }, strategyDoc, connected] = await Promise.all([latestAndCurrent(projectId), latestReadyStrategy(projectId), connectedPlatforms(projectId)]);
@@ -226,10 +229,16 @@ export async function getCalendarState(projectId, { now = new Date() } = {}) {
         version: strategyDoc.version,
         platforms: (strategy.platformStrategy || []).map((p) => p.platform),
         hasHooks: (strategy.workingHooks || []).length > 0,
+        // the choice made when this strategy was created: the calendar form starts from it (null for a strategy saved before the wizard)
+        planning: toApiPlanning(strategyDoc.planning),
         recommended: { postsPerWeek: strategy.postingStrategy?.postsPerWeek ?? null, range: strategy.postingStrategy?.postsPerWeekRange || null, days: strategy.postingStrategy?.recommendedDays || [] },
       }
       : { available: false },
     connectedPlatforms: connected,
+    // 'connected' | 'expired' | 'none' per platform: an expired connection is fixed with Reconnect, not Connect
+    platformStates: await platformStates(projectId),
+    // this month's allowance for the account and the project (null limit = unlimited)
+    quota: userId ? await getUsageSummary({ userId, projectId, now }) : null,
     // minDays / maxDays are kept for older clients; the product's model is months
     limits: { minDays: CALENDAR_MIN_DAYS, maxDays: CALENDAR_MAX_DAYS, minMonths: CALENDAR_MIN_MONTHS, maxMonths: CALENDAR_MAX_MONTHS, maxPostsPerWeek: 7, maxPosts: CALENDAR_MAX_POSTS },
   };
@@ -243,10 +252,33 @@ function isInFlightConflict(error) {
   return String(error.message).includes('unique_calendar_generating_in_flight');
 }
 
+/**
+ * The strategy's saved planning choice fills in what a calendar request leaves out (posts per week, months, platforms), and ONLY that: anything the
+ * request does state wins, the strategy is never modified, and a strategy saved before the wizard (no choice) changes nothing. Legacy requests that
+ * give an explicit endDate keep their own length.
+ */
+async function withStrategyPlanning(projectId, input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const missing = ['postsPerWeek', 'months', 'platforms'].filter((k) => input[k] === undefined);
+  if (!missing.length || (input.endDate !== undefined && input.months === undefined)) return input;
+  const strategyDoc = await latestReadyStrategy(projectId);
+  const planning = toApiPlanning(strategyDoc?.planning);
+  if (!planning) return input;
+  const filled = { ...input };
+  for (const key of missing) filled[key] = Array.isArray(planning[key]) ? [...planning[key]] : planning[key];
+  return filled;
+}
+
 /** What a set of choices means (end date, exact post count, steps), with no AI call and no write. */
-export async function previewCalendar(input, { today } = {}) {
+export async function previewCalendar(rawInput, { today, userId = null, projectId = null } = {}) {
+  const input = projectId ? await withStrategyPlanning(projectId, rawInput) : rawInput;
   const result = previewCalendarPlan(input, today ? { today } : undefined);
-  return result.error ? { success: false, error: result.error } : { success: true, preview: result.value };
+  if (result.error) return { success: false, error: result.error };
+  if (!userId || !projectId) return { success: true, preview: result.value };
+  // the same allowance /generate will enforce, read without reserving anything: the form can say so BEFORE the person clicks
+  const quota = await checkQuotaFor({ userId, projectId, posts: result.value.totalPosts });
+  if (!quota.ok) return { success: false, error: quota.error };
+  return { success: true, preview: { ...result.value, quota: quota.summary } };
 }
 
 /**
@@ -259,7 +291,8 @@ export async function previewCalendar(input, { today } = {}) {
  * @param {boolean} [options.background=true]  false awaits the whole run (tests)
  * @param {string} [options.today]  YYYY-MM-DD, tests only
  */
-export async function startCalendarGeneration(projectId, userId, input = {}, { now = new Date(), background = true, today } = {}) {
+export async function startCalendarGeneration(projectId, userId, rawInput = {}, { now = new Date(), background = true, today } = {}) {
+  const input = await withStrategyPlanning(projectId, rawInput);
   const checked = validateCalendarInput(input, today ? { today } : undefined);
   if (checked.error) return { success: false, error: checked.error };
   const config = checked.value;
@@ -281,6 +314,12 @@ export async function startCalendarGeneration(projectId, userId, input = {}, { n
   // Platforms: connected NOW (decided here from the database, never from the client) and covered by the strategy.
   const connected = await connectedPlatforms(projectId);
   const missing = config.platforms.filter((p) => !connected[p]);
+  const label = (p) => (p === 'facebook' ? 'Facebook Page' : 'Instagram account');
+  if (missing.length) {
+    const states = await platformStates(projectId);
+    const expired = missing.filter((p) => states[p] === 'expired');
+    if (expired.length) return fail('PLATFORM_RECONNECT_REQUIRED', `The connection to your ${expired.map(label).join(' and ')} has expired or was revoked in Meta. Reconnect ${expired.length > 1 ? 'them' : 'it'} before planning content for ${expired.length > 1 ? 'them' : 'it'}.`, { platforms: expired });
+  }
   if (missing.length) return fail('PLATFORM_NOT_CONNECTED', `Connect your ${missing.map((p) => (p === 'facebook' ? 'Facebook Page' : 'Instagram account')).join(' and ')} before planning content for ${missing.length > 1 ? 'them' : 'it'}.`, { platforms: missing });
   const uncovered = config.platforms.filter((p) => !(strategy.platformStrategy || []).some((s) => s.platform === p));
   if (uncovered.length) return fail('PLATFORM_NOT_IN_STRATEGY', `Your current strategy does not cover ${uncovered.join(' and ')}. Regenerate the strategy to include it.`, { platforms: uncovered });
@@ -298,12 +337,15 @@ export async function startCalendarGeneration(projectId, userId, input = {}, { n
   const running = await SocialContentCalendar.findOne({ project_id: toId(projectId), status: 'generating' }).lean();
   if (running) return { success: true, started: false, alreadyRunning: true, generation: toApiGeneration(running) };
 
+  const calendarId = new mongoose.Types.ObjectId();
+
   const lockedBy = `${INSTANCE}:${crypto.randomUUID()}`;
   let doc = null;
   for (let attempt = 0; attempt < 3 && !doc; attempt += 1) {
     const last = await SocialContentCalendar.findOne({ project_id: toId(projectId) }).sort({ version: -1 }).select('version').lean();
     try {
       doc = await SocialContentCalendar.create({
+        _id: calendarId,
         project_id: toId(projectId),
         version: (last?.version || 0) + 1,
         status: 'generating',
@@ -329,6 +371,14 @@ export async function startCalendarGeneration(projectId, userId, input = {}, { n
   }
   if (!doc) return fail('CONFLICT', 'Another generation started at the same time. Please try again.');
 
+  // The usage allowance, reserved BEFORE any AI call and by the request that WON the claim above (so a double click is simply "already
+  // running", never a second reservation). Database-enforced, so it holds across instances. When it refuses, the claim is withdrawn: nothing ran.
+  const reservation = await reserveCalendarQuota({ userId, projectId, calendarId, posts: plannedSize.value.totalPosts, now });
+  if (!reservation.success) {
+    await SocialContentCalendar.deleteOne({ _id: doc._id, status: 'generating' });
+    return { success: false, error: reservation.error };
+  }
+
   LoggerUtil.info('[SOCIAL_CALENDAR] Generation claimed', { projectId: String(projectId), calendarId: String(doc._id), version: doc.version, strategyVersion: strategyDoc.version, totalPosts: plannedSize.value.totalPosts, months: config.months });
 
   // starting afresh replaces any unfinished calendar of this project (never the last READY one, which stays until this one is ready)
@@ -348,8 +398,8 @@ export async function startCalendarGeneration(projectId, userId, input = {}, { n
 }
 
 /** Resumes an unfinished (partial) calendar: only the missing posts are generated. */
-export async function resumeCalendar(projectId, { now = new Date(), background = true } = {}) {
-  const result = await resumeCalendarGeneration(projectId, { now, background });
+export async function resumeCalendar(projectId, { now = new Date(), background = true, userId = null } = {}) {
+  const result = await resumeCalendarGeneration(projectId, { now, background, userId });
   if (!result.success) return result;
   return { success: true, started: !result.alreadyRunning, alreadyRunning: result.alreadyRunning, generation: result.calendar ? toApiGeneration(result.calendar) : null };
 }

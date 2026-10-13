@@ -8,6 +8,8 @@ import { buildProfileSnapshot, buildProfileData, hashProfileData, diffProfileDat
 import { buildSystemPrompt, buildUserPrompt, PROMPT_VERSION } from './socialAIStrategyPromptBuilder.js';
 import { attemptRecord, flattenAttempts, describeProviderFailure } from './strategyDiagnostics.js';
 import { validateStrategyOutput } from './strategyOutputSchema.js';
+import { validateStrategyPlanning, toStoredPlanning, toApiPlanning, splitAcross } from './strategyPlanning.js';
+import { checkQuotaFor } from '../calendar/calendarQuotaService.js';
 import claudeStrategyProvider from './claudeStrategyProvider.js';
 import { STRATEGY_STALE_MS, STRATEGY_MAX_REPAIR_ATTEMPTS, STRATEGY_HISTORY_LIMIT } from './strategyConfig.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
@@ -85,6 +87,8 @@ function toApiStrategy(doc) {
     generatedAt: iso(doc.generation?.finishedAt),
     strategy: doc.strategy,
     strategyGaps: doc.strategyGaps || [],
+    // the planning choice this version was created with (null for a version saved before the wizard)
+    planning: toApiPlanning(doc.planning),
     // the exact business facts the AI was given (no tokens, no Google ids)
     profileSnapshot: { generatedAt: iso(doc.profileSnapshot?.generatedAt), data: doc.profileSnapshot?.data || null },
   };
@@ -97,6 +101,8 @@ function toApiGeneration(doc) {
     status: doc.status,
     startedAt: iso(doc.generation?.startedAt),
     finishedAt: iso(doc.generation?.finishedAt),
+    // the choice this attempt was started with: a failed attempt keeps it, so the person retries with the same selections
+    planning: toApiPlanning(doc.planning),
     failure: doc.status === 'failed' ? { code: doc.failure?.code || 'GENERATION_FAILED', message: doc.failure?.message || FAILURE_MESSAGES.GENERATION_FAILED } : null,
   };
 }
@@ -195,7 +201,17 @@ function isInFlightConflict(error) {
  * @param {object} [options]
  * @param {boolean} [options.background=true]  false awaits the whole run (tests)
  */
-export async function startGeneration(projectId, userId, { now = new Date(), background = true } = {}) {
+export async function startGeneration(projectId, userId, { now = new Date(), background = true, planning: planningInput, expectedVersion, requestId, today } = {}) {
+  // The planning choice is checked FIRST and by the calendar planner: an unsupported value is refused before anything is claimed or written.
+  let planning = null;
+  if (planningInput !== undefined && planningInput !== null) {
+    const checked = validateStrategyPlanning(planningInput, today ? { today } : undefined);
+    if (checked.error) return { success: false, error: checked.error };
+    planning = checked.value;
+  }
+  if (expectedVersion !== undefined && expectedVersion !== null && (!Number.isInteger(expectedVersion) || expectedVersion < 0)) return fail('INVALID_FIELD', 'expectedVersion must be a whole number.', { field: 'expectedVersion' });
+  if (requestId !== undefined && requestId !== null && !(typeof requestId === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(requestId))) return fail('INVALID_FIELD', 'requestId must be 8-80 letters, digits, - or _.', { field: 'requestId' });
+
   const provider = getProvider();
   // Fail fast, before anything is claimed or written, when AI is not configured.
   if (!provider.isAvailable()) return fail('AI_UNAVAILABLE', FAILURE_MESSAGES.AI_UNAVAILABLE);
@@ -204,6 +220,18 @@ export async function startGeneration(projectId, userId, { now = new Date(), bac
 
   const running = await SocialAIStrategy.findOne({ project_id: toId(projectId), status: 'generating' }).lean();
   if (running) return { success: true, started: false, alreadyRunning: true, generation: toApiGeneration(running) };
+
+  // The same request sent again (a lost response, a double click that slipped past the client) is the same version, never a second one.
+  if (requestId) {
+    const same = await SocialAIStrategy.findOne({ project_id: toId(projectId), 'generation.requestId': requestId, status: { $in: ['generating', 'ready'] } }).lean();
+    if (same) return { success: true, started: false, alreadyRunning: same.status === 'generating', alreadyDone: same.status === 'ready', generation: toApiGeneration(same) };
+  }
+
+  // Optimistic concurrency: the person decided against the strategy they saw. If a newer one exists, they must look again first.
+  if (expectedVersion !== undefined && expectedVersion !== null) {
+    const current = await SocialAIStrategy.findOne({ project_id: toId(projectId), status: 'ready' }).sort({ version: -1 }).select('version').lean();
+    if ((current?.version || 0) !== expectedVersion) return fail('STRATEGY_CONFLICT', 'The strategy changed since you opened this page. Reload to see the latest version, then try again.', { currentVersion: current?.version || 0 });
+  }
 
   const live = await liveProfile(projectId);
   if (!live) return fail('NOT_FOUND', 'Project not found.');
@@ -221,7 +249,8 @@ export async function startGeneration(projectId, userId, { now = new Date(), bac
         version: (last?.version || 0) + 1,
         status: 'generating',
         profileSnapshot: snapshot,
-        generation: { startedAt: now, lockedBy, promptVersion: PROMPT_VERSION },
+        generation: { startedAt: now, lockedBy, promptVersion: PROMPT_VERSION, requestId: requestId || null },
+        planning: planning ? toStoredPlanning(planning, now) : null,
         generatedBy: userId || null,
       });
     } catch (error) {
@@ -250,8 +279,19 @@ export async function startGeneration(projectId, userId, { now = new Date(), bac
 }
 
 /** The strategy as saved: the AI's validated output plus the parts the SERVER owns. */
-function assemble(validated, snapshotData, profileGaps) {
+function assemble(validated, snapshotData, profileGaps, planning = null) {
   const strategy = JSON.parse(JSON.stringify(validated.strategy));
+
+  // The person's frequency is a decision, not a suggestion: whatever the AI wrote, the stored strategy says what was chosen, and the per-platform
+  // numbers add up to it.
+  if (planning) {
+    const ppw = planning.postsPerWeek;
+    const range = strategy.postingStrategy.postsPerWeekRange;
+    strategy.postingStrategy.postsPerWeek = ppw;
+    strategy.postingStrategy.postsPerWeekRange = { min: Math.min(range.min, ppw), max: Math.max(range.max, ppw) };
+    const split = splitAcross(strategy.platformStrategy.map((p) => p.postsPerWeek), ppw);
+    strategy.platformStrategy = strategy.platformStrategy.map((p, i) => ({ ...p, postsPerWeek: split[i] }));
+  }
 
   // Do not let the AI present an audience / goals the business never supplied.
   if (!(snapshotData.audience.primary || '').trim()) {
@@ -296,6 +336,9 @@ export async function runGeneration(strategyId, lockedBy) {
   try {
     const previousDoc = await SocialAIStrategy.findOne({ project_id: doc.project_id, status: 'ready' }).sort({ version: -1 }).select('strategy.summary strategy.contentPillars').lean();
     const previous = previousDoc?.strategy ? { summary: previousDoc.strategy.summary, contentPillars: previousDoc.strategy.contentPillars } : null;
+    // the choice stored on THIS attempt (re-validated, so a document edited by hand can never feed the prompt something unsupported)
+    const chosen = doc.planning ? validateStrategyPlanning({ postsPerWeek: doc.planning.postsPerWeek, months: doc.planning.months, platforms: doc.planning.platforms }) : null;
+    const planning = chosen?.value ? { postsPerWeek: chosen.value.postsPerWeek, months: chosen.value.months, totalPosts: chosen.value.estimatedPosts, platforms: chosen.value.platforms } : null;
     const provider = getProvider();
     const system = buildSystemPrompt();
 
@@ -303,7 +346,7 @@ export async function runGeneration(strategyId, lockedBy) {
     let feedback = [];
     const rejected = []; // sanitized record of every attempt Odito's validation refused: paths + codes + rules, never values
     for (let i = 0; i <= STRATEGY_MAX_REPAIR_ATTEMPTS && !validated; i += 1) {
-      const result = await provider.generateStrategy({ system, user: buildUserPrompt({ snapshotData, profileGaps, previous, repairFeedback: feedback }), generationId: String(strategyId) });
+      const result = await provider.generateStrategy({ system, user: buildUserPrompt({ snapshotData, profileGaps, previous, repairFeedback: feedback, planning }), generationId: String(strategyId) });
       attempts += result.attempts || 1;
       usage.inputTokens += result.usage?.inputTokens || 0;
       usage.outputTokens += result.usage?.outputTokens || 0;
@@ -312,6 +355,7 @@ export async function runGeneration(strategyId, lockedBy) {
         prohibitedPhrases: snapshotData.prohibitedPhrases,
         suppliedCompetitors: (snapshotData.competitors || []).map((c) => c.name),
         allowedFactsText: snapshotFactsText(snapshotData),
+        expectedPlatforms: planning?.platforms || null,
       });
       if (check.ok) validated = check;
       else {
@@ -326,7 +370,7 @@ export async function runGeneration(strategyId, lockedBy) {
       throw err;
     }
 
-    const { strategy, gaps } = assemble(validated, snapshotData, profileGaps);
+    const { strategy, gaps } = assemble(validated, snapshotData, profileGaps, planning);
     const finishedAt = new Date();
     const saved = await SocialAIStrategy.findOneAndUpdate(
       { _id: strategyId, status: 'generating', 'generation.lockedBy': lockedBy },

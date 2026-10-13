@@ -22,7 +22,7 @@ import { unsupportedFigures } from '../aiContent/contentOutputSchema.js';
  */
 
 export const STRATEGY_TOOL_NAME = 'emit_social_strategy';
-export const STRATEGY_SCHEMA_VERSION = 2;
+export const STRATEGY_SCHEMA_VERSION = 3;
 
 export const PLATFORMS = Object.freeze(['facebook', 'instagram']);
 export const PRIORITIES = Object.freeze(['high', 'medium', 'low']);
@@ -66,6 +66,8 @@ export const LIMITS = Object.freeze({
   recommendations: { max: 6, length: 200 },
   assumptions: { max: 5, length: 200 },
   gaps: { max: 8, field: 60, reason: 200 },
+  // v3: what the chosen planning period needs (seasonal themes, campaign ideas, how success is read). Short phrases; no invented figures.
+  outlook: { themesMax: 4, theme: 60, timing: 40, idea: 140, campaignsMax: 3, campaign: 60, metricsMax: 4, metric: 60, success: 140 },
 });
 
 // ── tool schema (what the model is asked to produce) ─────────────────────────
@@ -78,7 +80,7 @@ export function buildStrategyToolSchema() {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['summary', 'overview', 'brandAnalysis', 'positioning', 'audience', 'goals', 'contentPillars', 'contentMix', 'trendingTopics', 'workingHooks', 'competitorAnalysis', 'platformStrategy', 'toneAndVoice', 'postingStrategy', 'hashtagStrategy', 'ctaStrategy', 'brandRules', 'recommendations', 'assumptions', 'gaps'],
+    required: ['summary', 'overview', 'brandAnalysis', 'positioning', 'audience', 'goals', 'contentPillars', 'contentMix', 'trendingTopics', 'workingHooks', 'competitorAnalysis', 'platformStrategy', 'toneAndVoice', 'postingStrategy', 'hashtagStrategy', 'ctaStrategy', 'brandRules', 'recommendations', 'assumptions', 'gaps', 'planOutlook'],
     properties: {
       summary: str(L.summary, 'One or two sentences: what this business should do on social media and why.'),
       overview: {
@@ -221,6 +223,15 @@ export function buildStrategyToolSchema() {
         type: 'array', maxItems: L.gaps.max,
         description: 'Important information that was missing and limited this strategy.',
         items: { type: 'object', additionalProperties: false, required: ['field', 'reason', 'importance'], properties: { field: str(L.gaps.field), reason: str(L.gaps.reason), importance: { type: 'string', enum: PRIORITIES } } },
+      },
+      planOutlook: {
+        type: 'object', additionalProperties: false, required: ['seasonalThemes', 'campaignIdeas', 'successMetrics'],
+        description: 'What the chosen planning period needs. Suggestions only: no dates, statistics or figures that were not supplied.',
+        properties: {
+          seasonalThemes: { type: 'array', maxItems: L.outlook.themesMax, items: { type: 'object', additionalProperties: false, required: ['theme', 'timing', 'idea'], properties: { theme: str(L.outlook.theme), timing: str(L.outlook.timing, 'Where in the planning period, e.g. "Month 1" or "Late in the period".'), idea: str(L.outlook.idea) } } },
+          campaignIdeas: { type: 'array', maxItems: L.outlook.campaignsMax, items: { type: 'object', additionalProperties: false, required: ['name', 'idea'], properties: { name: str(L.outlook.campaign), idea: str(L.outlook.idea) } } },
+          successMetrics: { type: 'array', maxItems: L.outlook.metricsMax, items: { type: 'object', additionalProperties: false, required: ['metric', 'whatGoodLooks'], properties: { metric: str(L.outlook.metric), whatGoodLooks: str(L.outlook.success, 'What success looks like in plain words, without inventing a number the business never supplied.') } } },
+        },
       },
     },
   };
@@ -389,9 +400,10 @@ function collectStrings(value, out, skipPaths, path = '') {
  * @param {string[]} [context.prohibitedPhrases]
  * @param {string[]} [context.suppliedCompetitors]  names the business supplied; the analysis may name no one else
  * @param {string} [context.allowedFactsText]  every string the business supplied; numbers / links in the new analytic sections must come from it
+ * @param {string[]} [context.expectedPlatforms]  when the person chose platforms, the strategy must cover exactly those
  * @returns {{ ok: true, strategy: object, gaps: object[] } | { ok: false, errors: string[] }}
  */
-export function validateStrategyOutput(raw, { prohibitedPhrases = [], suppliedCompetitors = null, allowedFactsText } = {}) {
+export function validateStrategyOutput(raw, { prohibitedPhrases = [], suppliedCompetitors = null, allowedFactsText, expectedPlatforms = null } = {}) {
   const c = new Collector();
   const L = LIMITS;
   if (!isObj(raw)) return { ok: false, errors: ['The strategy must be an object.'] };
@@ -548,6 +560,12 @@ export function validateStrategyOutput(raw, { prohibitedPhrases = [], suppliedCo
     };
   });
 
+  if (Array.isArray(expectedPlatforms) && expectedPlatforms.length) {
+    const covered = [...seenPlatforms].sort().join(', ');
+    const wanted = [...expectedPlatforms].sort().join(', ');
+    if (covered !== wanted) c.fail('platformStrategy', `must cover exactly the platforms the business chose (${wanted}), not (${covered || 'none'})`);
+  }
+
   const tone = c.obj(raw.toneAndVoice, 'toneAndVoice');
   strategy.toneAndVoice = {
     primaryTone: c.text(tone.primaryTone, 'toneAndVoice.primaryTone', L.tone.primary),
@@ -599,6 +617,14 @@ export function validateStrategyOutput(raw, { prohibitedPhrases = [], suppliedCo
     messagingRules: c.list(brand.messagingRules, 'brandRules.messagingRules', { max: L.brand.rulesMax, length: L.brand.rule }),
   };
 
+  const outlook = c.obj(raw.planOutlook, 'planOutlook');
+  const outlookList = (key, max, map) => (Array.isArray(outlook[key]) ? outlook[key].slice(0, max).map((e, i) => map(c.obj(e, `planOutlook.${key}[${i}]`), i)) : []);
+  strategy.planOutlook = {
+    seasonalThemes: outlookList('seasonalThemes', L.outlook.themesMax, (o, i) => ({ theme: c.text(o.theme, `planOutlook.seasonalThemes[${i}].theme`, L.outlook.theme), timing: c.text(o.timing, `planOutlook.seasonalThemes[${i}].timing`, L.outlook.timing, { allowEmpty: true }), idea: c.text(o.idea, `planOutlook.seasonalThemes[${i}].idea`, L.outlook.idea) })),
+    campaignIdeas: outlookList('campaignIdeas', L.outlook.campaignsMax, (o, i) => ({ name: c.text(o.name, `planOutlook.campaignIdeas[${i}].name`, L.outlook.campaign), idea: c.text(o.idea, `planOutlook.campaignIdeas[${i}].idea`, L.outlook.idea) })),
+    successMetrics: outlookList('successMetrics', L.outlook.metricsMax, (o, i) => ({ metric: c.text(o.metric, `planOutlook.successMetrics[${i}].metric`, L.outlook.metric), whatGoodLooks: c.text(o.whatGoodLooks, `planOutlook.successMetrics[${i}].whatGoodLooks`, L.outlook.success) })),
+  };
+
   strategy.recommendations = c.list(raw.recommendations, 'recommendations', { max: L.recommendations.max, length: L.recommendations.length });
   strategy.assumptions = c.list(raw.assumptions, 'assumptions', { max: L.assumptions.max, length: L.assumptions.length });
 
@@ -626,7 +652,7 @@ export function validateStrategyOutput(raw, { prohibitedPhrases = [], suppliedCo
   // The analytic sections must not invent statistics, prices, links or contact details: any such figure has to be one the business supplied.
   if (allowedFactsText !== undefined) {
     const analytic = [];
-    collectStrings({ t: strategy.trendingTopics, h: strategy.workingHooks, c: strategy.competitorAnalysis, b: strategy.brandAnalysis }, analytic, []);
+    collectStrings({ t: strategy.trendingTopics, h: strategy.workingHooks, c: strategy.competitorAnalysis, b: strategy.brandAnalysis, o: strategy.planOutlook }, analytic, []);
     const extra = unsupportedFigures(analytic.join(' \n '), allowedFactsText);
     if (extra.length) c.fail('strategy', `states figures or addresses that were not in the supplied business information: ${extra.slice(0, 4).join(', ')}`);
   }

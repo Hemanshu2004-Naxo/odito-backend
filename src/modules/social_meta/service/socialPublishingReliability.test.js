@@ -15,6 +15,8 @@ import {
 import { recordPublished, settleFailure, getInstanceId } from './publicationLifecycle.js';
 import { createPublicationHandler } from '../controller/socialPublishingController.js';
 import '../testSupport/stubPermalinkLookup.js';
+import { renderMetrics } from '../../../monitoring/metrics.js';
+import '../../../monitoring/socialAiMetrics.js';
 import { ensureProject, removeProject } from '../testSupport/projectFixture.js';
 
 /**
@@ -38,6 +40,11 @@ after(async () => { if (mongoAvailable) await mongoose.connection.close(); });
 
 const MIN = 60_000;
 const TIMEOUT = { success: false, kind: 'timeout', status: null, data: null, message: 'Meta API request timed out' };
+/** One series of the operational metrics (publish outcomes, expired connections). */
+const metric = async (name, label, value) => {
+  const wanted = label ? `${name}{${label}="${value}"} ` : `${name} `;
+  return Number((await renderMetrics()).split('\n').find((l) => l.startsWith(wanted)).slice(wanted.length));
+};
 const http = (status, error) => ({ success: false, kind: 'http', status, data: error ? { error } : null, message: error?.message || 'err' });
 const metaErr = (code, message = 'm', extra = {}) => ({ type: 'OAuthException', code, message, ...extra });
 
@@ -111,6 +118,7 @@ describe('socialPublishing reliability', () => {
     test('two concurrent manual publishNow calls on the same post reach Meta ONCE — the loser gets NOT_PUBLISHABLE', async (t) => {
       if (!mongoAvailable) return t.skip('local MongoDB not reachable');
       const id = await dueFb();
+      const publishedBefore = await metric('odito_social_publish_total', 'outcome', 'published');
       let publishCalls = 0;
       const [a, b] = await withGraph(async (o) => {
         if (isPublishPost(o)) { publishCalls += 1; await new Promise((r) => setTimeout(r, 80)); return { success: true, status: 200, data: { id: 'p1' } }; }
@@ -120,6 +128,7 @@ describe('socialPublishing reliability', () => {
       assert.equal([a, b].filter((r) => r.success).length, 1);
       assert.equal([a, b].find((r) => !r.success).error.code, 'NOT_PUBLISHABLE');
       assert.equal((await reload(id)).status, 'published');
+      assert.equal(await metric('odito_social_publish_total', 'outcome', 'published') - publishedBefore, 1, 'one real publish is one "published" event');
     });
 
     test('eight concurrent SCHEDULER claims of one due post (simulating several PM2 instances) publish exactly once', async (t) => {
@@ -503,6 +512,8 @@ describe('socialPublishing reliability', () => {
     test('Facebook HTTP 400 code 190: the post fails with FACEBOOK_TOKEN_INVALID, the account (and its Instagram) becomes EXPIRED, nothing is retried, and the response says "reconnect"', async (t) => {
       if (!mongoAvailable) return t.skip('local MongoDB not reachable');
       const id = await dueFb();
+      const reconnectBefore = await metric('odito_social_publish_total', 'outcome', 'reconnect_required');
+      const expiredBefore = await metric('odito_social_connections_expired_total');
       let r;
       const logs = await captureLogs(async () => {
         r = await withGraph((o) => (isPublishPost(o) ? http(400, metaErr(190, 'Error validating access token: Session has expired', { fbtrace_id: 'TRACEXYZ' })) : listOf()), () => publishNow(project, id, null, { trigger: 'scheduler' }));
@@ -521,6 +532,8 @@ describe('socialPublishing reliability', () => {
       assert.ok(!JSON.stringify(r).includes(PAGE_TOKEN), 'response carries no token');
       assert.ok(!logs.includes(PAGE_TOKEN), 'logs carry no token');
       assert.ok(!JSON.stringify(r).includes('TRACEXYZ'), 'no Meta trace id leaks to the caller');
+      assert.equal(await metric('odito_social_publish_total', 'outcome', 'reconnect_required') - reconnectBefore, 1, 'counted as a publish that needs a reconnect');
+      assert.equal(await metric('odito_social_connections_expired_total') - expiredBefore, 1, 'and the expired connection is counted once');
     });
 
     test('once expired, further publishes are refused up-front (ACCOUNT_RECONNECT_REQUIRED) without calling Meta', async (t) => {

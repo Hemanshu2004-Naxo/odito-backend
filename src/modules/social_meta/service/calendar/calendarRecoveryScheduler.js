@@ -1,7 +1,9 @@
 import { schedule } from 'node-cron';
 import { recoverInterruptedCalendars } from './calendarGenerationRunner.js';
+import { reconcileQuotaReservations } from './calendarQuotaService.js';
 import { CALENDAR_RECOVERY_CRON, CALENDAR_RECOVERY_ENABLED } from './calendarConfig.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
+import { recordRecoverySweep } from '../../../../monitoring/socialAiMetrics.js';
 
 /**
  * Content Calendar recovery sweep. A generation is a long job running inside one API process; if that process dies, restarts or
@@ -21,9 +23,13 @@ let task = null;
 export async function runOnce({ now = new Date() } = {}) {
   try {
     const summary = await recoverInterruptedCalendars({ now });
+    // reservations of generations that are gone or finished without settling are released, so an allowance can never leak
+    summary.quota = await reconcileQuotaReservations({ now });
+    recordRecoverySweep(true);
     if (summary.found) LoggerUtil.info(`${SERVICE}: sweep`, summary);
     return summary;
   } catch (error) {
+    recordRecoverySweep(false);
     LoggerUtil.error(`${SERVICE}: sweep failed`, { message: error.message });
     return { found: 0, resumed: 0, finished: 0, error: error.message };
   }

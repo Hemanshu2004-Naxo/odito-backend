@@ -60,7 +60,7 @@ describe('AI strategy routes — wiring', () => {
   });
 
   test('2: the strategy is read-only over HTTP — no PUT / PATCH / DELETE and nothing else', () => {
-    assert.equal(routes.length, 3);
+    assert.equal(routes.length, 4, 'GET /, GET /status, POST /generate and the read-only POST /plan-preview');
     for (const r of routes) assert.ok(r.methods.every((m) => ['get', 'post'].includes(m)));
   });
 

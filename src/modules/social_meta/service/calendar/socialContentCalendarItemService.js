@@ -19,6 +19,7 @@ import { buildCalendarToolSchema, validateCalendarBatch, PURCHASE_CTA_RE } from 
 import { buildSystemPrompt, buildUserPrompt } from './calendarPromptBuilder.js';
 import { CALENDAR_MAX_REPAIR_ATTEMPTS, CALENDAR_MAX_ITEMS } from './calendarConfig.js';
 import { formatDate } from './calendarPlanner.js';
+import User from '../../../user/model/User.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
 /**
@@ -133,16 +134,39 @@ const respond = async (projectId, doc, extra = {}) => {
   return { success: true, item: toApiItem(doc, pubs), ...extra };
 };
 
+/**
+ * What a change did to the PLAN APPROVAL, in the response, so no client has to guess: `approvalStatus` is the state after the change,
+ * `approvalRevoked` / `requiresReapproval` say it was withdrawn by this change, `contentLinked` that a post already exists for the plan
+ * (an approval is then never withdrawn: the post keeps its own reviewed caption).
+ */
+const approvalOutcome = (doc, { revoked = false, hasContent = false } = {}) => ({
+  approvalStatus: doc.status === 'plan_approved' || hasContent ? 'approved' : 'not_approved',
+  approvalRevoked: revoked,
+  requiresReapproval: revoked,
+  contentLinked: hasContent,
+});
+
+/** A stored value and an AI value compared as the editor would see them: blank = missing, platform copy by its four fields. */
+const canonicalValue = (v) => {
+  if (v === undefined || v === null) return '';
+  if (Array.isArray(v)) return v.map((x) => (x && typeof x === 'object' ? { platform: x.platform ?? '', caption: x.caption ?? '', primaryCta: x.primaryCta ?? '', hashtags: [...(x.hashtags || [])] } : canonicalValue(x)));
+  return typeof v === 'string' ? v.trim() : v;
+};
+const sameValue = (a, b) => JSON.stringify(canonicalValue(a)) === JSON.stringify(canonicalValue(b));
+
 // ── reads ────────────────────────────────────────────────────────────────────
 
 /** Everything the editor needs to offer real choices: the strategy's pillars and hooks, the live catalog (with product images), formats per platform, connection state. */
-export async function getItemOptions(projectId) {
+export async function getItemOptions(projectId, { userId = null } = {}) {
   const c = await loadContext(projectId);
   if (!c.ok) return { success: false, error: c.error };
   const { strategy, catalog, connected, calendar } = c;
   return {
     success: true,
     calendar: { id: String(calendar._id), version: calendar.version, startDate: calendar.config.startDate, endDate: calendar.config.endDate },
+    // Planning vs. publishing: an item has a DATE; the exact time is chosen when its post is scheduled (behind the approvals). These are what the
+    // strategy suggests - free text written by the AI, never parsed into a schedule - and the account's own time zone, for display only.
+    scheduling: { timeWindows: [...(strategy.postingStrategy?.recommendedTimeWindows || [])], timezone: userId ? ((await User.findById(toId(userId)).select('timezone').lean())?.timezone || null) : null },
     pillars: (strategy.contentPillars || []).map((p) => ({ name: p.name, purpose: p.purpose || '' })),
     hooks: (strategy.workingHooks || []).map((h, index) => ({ index, hook: h.hook, category: h.category })),
     objectives: MARKETING_OBJECTIVES.map((value) => ({ value, kpis: [...KPIS_BY_OBJECTIVE[value]] })),
@@ -207,7 +231,7 @@ export async function updateItem(projectId, userId, itemId, body = {}, { today }
   if (!doc) return conflict(projectId, itemId);
 
   if (result.changed.includes('contentPillar') || result.changed.includes('platforms')) await recomputePlanSummary(projectId, c.calendar._id);
-  return respond(projectId, doc, { changed: result.changed, approvalRevoked });
+  return respond(projectId, doc, { changed: result.changed, ...approvalOutcome(doc, { revoked: approvalRevoked, hasContent }) });
 }
 
 /** A manual item: the same model, planned by a person, attached to the current calendar. */
@@ -419,10 +443,20 @@ export async function regenerateItem(projectId, userId, itemId, body = {}) {
   // the platform versions follow the caption / hashtags that were rewritten (an Instagram caption must not outlive a new shared one)
   const rewroteCopy = fields.includes('caption') || fields.includes('hashtags');
   if (rewroteCopy) $set.platformContent = mergePlatformCopy(item, result, { caption: fields.includes('caption'), hashtags: fields.includes('hashtags') });
+  // The AI may land on exactly the words that are already there. When EVERY chosen field is identical, nothing is written: the revision stays,
+  // the person's edit markers stay, and an approval stays valid - it is provable from the stored values, not assumed.
+  const identical = Object.entries($set).filter(([key]) => key !== 'updatedBy').every(([key, value]) => sameValue(item[key], value));
+  if (identical) {
+    const current = await SocialContentCalendarItem.findOne({ _id: item._id, project_id: toId(projectId), calendar_id: calendar._id, revision: expectedRevision, status: { $ne: 'cancelled' } }).lean();
+    if (!current) return conflict(projectId, itemId); // changed while the AI was working
+    return respond(projectId, current, { regenerated: [], unchanged: true, warnings, ...approvalOutcome(current, { hasContent: c.pubs.length > 0 }) });
+  }
+
   const editedFields = (item.editedFields || []).filter((f) => !fields.includes(f) && !(rewroteCopy && f === 'platformContent'));
   $set.editedFields = editedFields;
   const hasContent = c.pubs.length > 0;
   if (!hasContent) { $set.status = editedFields.length ? 'edited' : 'planned'; $set.planApprovedAt = null; $set.planApprovedBy = null; }
+  if (hasContent && rewroteCopy) warnings.push('A post was already created from this plan. It keeps its own reviewed caption and hashtags; only the plan changed.');
 
   const doc = await SocialContentCalendarItem.findOneAndUpdate(
     { _id: item._id, project_id: toId(projectId), calendar_id: calendar._id, revision: expectedRevision, status: { $ne: 'cancelled' } },
@@ -430,7 +464,8 @@ export async function regenerateItem(projectId, userId, itemId, body = {}) {
     { new: true, runValidators: true },
   ).lean();
   if (!doc) return conflict(projectId, itemId); // edited while the AI was working: nothing was overwritten
-  return respond(projectId, doc, { regenerated: fields.filter((f) => $set[f] !== undefined), warnings, approvalRevoked: !hasContent && item.status === 'plan_approved' });
+  const revoked = !hasContent && item.status === 'plan_approved';
+  return respond(projectId, doc, { regenerated: fields.filter((f) => $set[f] !== undefined), warnings, ...approvalOutcome(doc, { revoked, hasContent }) });
 }
 
 // ── content hand-off ─────────────────────────────────────────────────────────

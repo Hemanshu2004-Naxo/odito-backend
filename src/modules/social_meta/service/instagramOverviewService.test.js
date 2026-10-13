@@ -177,11 +177,17 @@ describe('getInstagramOverview — real service + real Mongo, mocked Graph respo
 
   test('5: the comments-vs-likes chart is built from real, already-synced SocialPost documents, grouped by real publish day', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    // The service charts the last 30 days (dateRangeUtil: DEFAULT_RANGE = month) and that window is NOT changed here. The fixture days are therefore
+    // taken relative to "now" (10 and 9 days ago, at UTC day boundaries) instead of being hard-coded dates that age out of the window.
+    const firstDay = new Date(Date.now() - 10 * 86_400_000);
+    firstDay.setUTCHours(0, 0, 0, 0);
+    const secondDay = new Date(firstDay.getTime() + 86_400_000);
+    const isoDay = (d) => d.toISOString().slice(0, 10);
     const socialAccount = await SocialAccount.findOne({ project_id: projectA._id, platform: 'instagram' });
     await SocialPost.insertMany([
-      { project_id: projectA._id, social_account_id: socialAccount._id, platform: 'instagram', externalPostId: 'p1', accountId: 'ig_test_account', status: 'published', publishedAt: new Date('2026-08-01T00:00:00Z'), metrics: { likes: 10, comments: 2, shares: null, views: null } },
-      { project_id: projectA._id, social_account_id: socialAccount._id, platform: 'instagram', externalPostId: 'p2', accountId: 'ig_test_account', status: 'published', publishedAt: new Date('2026-08-01T12:00:00Z'), metrics: { likes: 5, comments: 1, shares: null, views: null } },
-      { project_id: projectA._id, social_account_id: socialAccount._id, platform: 'instagram', externalPostId: 'p3', accountId: 'ig_test_account', status: 'published', publishedAt: new Date('2026-08-02T00:00:00Z'), metrics: { likes: 3, comments: 0, shares: null, views: null } },
+      { project_id: projectA._id, social_account_id: socialAccount._id, platform: 'instagram', externalPostId: 'p1', accountId: 'ig_test_account', status: 'published', publishedAt: new Date(firstDay.getTime()), metrics: { likes: 10, comments: 2, shares: null, views: null } },
+      { project_id: projectA._id, social_account_id: socialAccount._id, platform: 'instagram', externalPostId: 'p2', accountId: 'ig_test_account', status: 'published', publishedAt: new Date(firstDay.getTime() + 12 * 3_600_000), metrics: { likes: 5, comments: 1, shares: null, views: null } },
+      { project_id: projectA._id, social_account_id: socialAccount._id, platform: 'instagram', externalPostId: 'p3', accountId: 'ig_test_account', status: 'published', publishedAt: new Date(secondDay.getTime()), metrics: { likes: 3, comments: 0, shares: null, views: null } },
     ]);
 
     const result = await withMockedInstagramData(
@@ -190,8 +196,8 @@ describe('getInstagramOverview — real service + real Mongo, mocked Graph respo
     );
 
     assert.equal(result.chart.length, 2, 'two distinct real publish days');
-    const day1 = result.chart.find((d) => d.date === '2026-08-01');
-    assert.equal(day1.likes, 15, 'real sum of both posts published on 2026-08-01');
+    const day1 = result.chart.find((d) => d.date === isoDay(firstDay));
+    assert.equal(day1.likes, 15, 'real sum of both posts published on the first day');
     assert.equal(day1.comments, 3);
   });
 

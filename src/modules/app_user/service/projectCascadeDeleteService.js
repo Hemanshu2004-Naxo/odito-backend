@@ -104,6 +104,8 @@ const CASCADE_REGISTRY = [
   // Content Calendar: the run records and their planned items (planning metadata only; no files).
   { category: 'social', collection: 'social_content_calendars', field: 'project_id' },
   { category: 'social', collection: 'social_content_calendar_items', field: 'project_id' },
+  // The usage ledger: the PROJECT's own monthly counters (scope_id is the project id). The account's ledger is the owner's, not the project's, and stays.
+  { category: 'social', collection: 'social_ai_usage', field: 'scope_id' },
 
   // 9. Jobs (8 = screenshot metadata, handled separately below — it needs
   // file cleanup before its documents can be deleted)

@@ -9,7 +9,7 @@ import { attachGeneratedDesign, submitDesignForApproval, getPublication } from '
 import mediaStorageService from '../media/mediaStorageService.js';
 import {
   getDesignProvider, loadBriefContext, loadDesignAssets, productFacts, activeAccountFor, DESIGNABLE_STATES, designFailureFor, DESIGN_FAILURE_MESSAGES,
-  toApiGeneration, recoverStaleDesignGenerations,
+  toApiGeneration, recoverStaleDesignGenerations, briefFailureCode,
 } from './socialDesignGenerationService.js';
 import sharp from 'sharp';
 import { buildDesignRequest, DESIGN_PROMPT_VERSION } from './designBrief.js';
@@ -241,11 +241,9 @@ export async function startStudioGeneration(projectId, userId, input = {}, { now
     productMediaIds = [...new Set(ids)].map(toId);
   }
 
-  const provider = getDesignProvider();
-  if (!provider.isAvailable()) {
-    LoggerUtil.warn(`${EVENT} design_studio_rejected`, { event: 'design_studio_rejected', projectId: String(projectId), publicationId: String(pub._id), reason: 'provider_unavailable' });
-    return fail('AI_UNAVAILABLE', DESIGN_FAILURE_MESSAGES.AI_UNAVAILABLE);
-  }
+  // No provider pre-check here: the studio always offers at least one design made only by Odito's own composition (list / statistics / quote / statement),
+  // and whether a refinement needs a NEW photograph is only known once the change is read. The producer calls the provider only for a design that carries a
+  // photograph and fails THAT design - with the provider-unavailable message - before any request when it is not configured.
 
   await recoverStaleDesignGenerations(projectId, { publicationId: String(pub._id), now });
   const running = await SocialDesignGeneration.findOne({ publication_id: pub._id, active: true }).lean();
@@ -375,7 +373,7 @@ export async function runStudioGeneration(generationId, lockedBy, userId = null)
           productAssetCount: assets.references.length, hasLogo: !!assets.logo, services: context.services, contact: context.contact, prohibitedPhrases: context.prohibitedPhrases,
           patch: direction?.patch || {}, visualChange: direction?.photoRequest || null, seed: `${pub._id}:${cand.slot}`, sceneSeed: String(pub._id), sceneOffset: cand.slot + 3 * ((reuse ? previousRevision : revision) - 1), variant: String(reuse ? previousRevision : revision), forceType: type, instruction: refine || '',
         });
-        if (request.problems.length) throw Object.assign(new Error('brief invalid'), { code: 'DESIGN_BRIEF_INVALID' });
+        if (request.problems.length) throw Object.assign(new Error('brief invalid'), { code: briefFailureCode(request.problems) });
         const produced = await produceDesign({ request, provider, generationId, logo: assets.logo, productImages: assets.references.map((r) => r.buffer), visualBuffer: reuse });
         usageIn += produced.provider?.usage?.inputTokens || 0; usageOut += produced.provider?.usage?.outputTokens || 0; model = produced.provider?.model || model;
         const media = { ...(await processAndStoreDesign({ buffer: produced.png, projectId, platform: rec.platform, logo: null })), logoApplied: produced.report.logoApplied };

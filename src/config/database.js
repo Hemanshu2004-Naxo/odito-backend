@@ -1,9 +1,12 @@
 import mongoose from 'mongoose';
 
+/** mongodb://user:secret@host:27017/db?x=1 -> mongodb://***@host:27017/db (credentials and query string removed) */
+export const redactMongoUri = (uri) => String(uri || '').replace(/^(mongodb(?:\+srv)?:\/\/)[^@/]*@/i, '$1***@').replace(/\?.*$/, '');
+
 const connectDB = async () => {
   try {
     const mongoURI = process.env.MONGO_URI;
-    console.log(`--- Attempting to connect to MongoDB with URI: ${mongoURI} ---`);
+    console.log(`--- Attempting to connect to MongoDB (${redactMongoUri(mongoURI)}) ---`);
     // MONGO_DB_NAME pins the database explicitly. The Python workers write
     // seo_* collections (e.g. seo_audit_url_pool) straight into Mongo and must
     // use the SAME database this backend reads — set the same MONGO_DB_NAME in

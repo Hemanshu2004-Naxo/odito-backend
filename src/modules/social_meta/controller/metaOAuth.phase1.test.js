@@ -8,7 +8,11 @@ dotenv.config();
 
 import SeoProject from '../../app_user/model/SeoProject.js';
 import PendingMetaConnection from '../model/PendingMetaConnection.js';
+import crypto from 'crypto';
 import { signOAuthState, verifyOAuthState } from '../../../utils/oauthState.js';
+import MetaOAuthState from '../model/MetaOAuthState.js';
+import { verifyMetaStateToken } from '../service/metaOAuthStateService.js';
+import { mintState, mintStateWith } from '../testSupport/metaState.js';
 import { startMetaConnection, handleMetaCallback } from './metaOAuthController.js';
 import { buildAuthorizationUrl, META_OAUTH_SCOPES } from '../service/metaOAuthService.js';
 import metaApiService, { graphApiBaseUrl, oauthDialogBaseUrl } from '../service/metaApiService.js';
@@ -111,11 +115,19 @@ describe('startMetaConnection — real controller, mock req/res', () => {
     assert.ok(res.body.data.url.includes('/dialog/oauth'));
 
     const url = new URL(res.body.data.url);
-    const decoded = verifyOAuthState(url.searchParams.get('state'));
+    const token = url.searchParams.get('state');
+    const decoded = verifyMetaStateToken(token);
     assert.equal(decoded.provider, 'meta');
     assert.equal(decoded.purpose, 'social_meta');
-    assert.equal(decoded.projectId, req.projectId);
-    assert.equal(decoded.userId, req.user._id);
+    // the URL (and anyone who reads it) learns neither the user nor the project: only an unpredictable nonce is in it
+    assert.equal('projectId' in decoded, false);
+    assert.equal('userId' in decoded, false);
+    assert.ok(!token.includes(req.projectId) && !JSON.stringify(decoded).includes(req.user._id));
+    const record = await MetaOAuthState.findOne({ nonce_hash: crypto.createHash('sha256').update(decoded.nonce).digest('hex') }).lean();
+    assert.equal(String(record.project_id), req.projectId);
+    assert.equal(String(record.user_id), req.user._id);
+    assert.equal(record.usedAt, null);
+    await MetaOAuthState.deleteOne({ _id: record._id });
 
     // Never the app secret, anywhere in this response.
     assert.ok(!res.body.data.url.includes(process.env.META_APP_SECRET));
@@ -262,7 +274,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
   // value, not an assumption.
   test('a successful callback persists the scopes Meta ACTUALLY granted, never blindly the full requested META_OAUTH_SCOPES list', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const state = signOAuthState({ provider: 'meta', purpose: 'social_meta', projectId: projectA._id.toString(), userId: userA.toString() });
+    const state = await mintState({ userId: userA, projectId: projectA._id });
     const req = { query: { code: 'fake-real-looking-code', state } };
     const res = mockRes();
 
@@ -325,11 +337,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
 
   test('expired state is rejected', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const state = jwt.sign(
-      { provider: 'meta', purpose: 'social_meta', projectId: projectA._id.toString(), userId: userA.toString() },
-      process.env.JWT_SECRET,
-      { expiresIn: '-1s' }
-    );
+    const state = await mintStateWith({ userId: userA, projectId: projectA._id, expiresIn: '-1s' });
     const req = { query: { code: 'fake', state } };
     const res = mockRes();
     await handleMetaCallback(req, res);
@@ -338,7 +346,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
 
   test('wrong provider in state is rejected', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const state = signOAuthState({ provider: 'google', purpose: 'social_meta', projectId: projectA._id.toString(), userId: userA.toString() });
+    const state = await mintStateWith({ userId: userA, projectId: projectA._id, provider: 'google' });
     const req = { query: { code: 'fake', state } };
     const res = mockRes();
     await handleMetaCallback(req, res);
@@ -347,7 +355,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
 
   test('wrong purpose in state is rejected', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const state = signOAuthState({ provider: 'meta', purpose: 'google_visibility', projectId: projectA._id.toString(), userId: userA.toString() });
+    const state = await mintStateWith({ userId: userA, projectId: projectA._id, purpose: 'google_visibility' });
     const req = { query: { code: 'fake', state } };
     const res = mockRes();
     await handleMetaCallback(req, res);
@@ -360,7 +368,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
     // exactly the "client-controlled project ownership" attack the spec
     // calls out; the signature is valid (state itself isn't forged), but
     // the claimed relationship between userId and projectId is false.
-    const state = signOAuthState({ provider: 'meta', purpose: 'social_meta', projectId: projectA._id.toString(), userId: userB.toString() });
+    const state = await mintState({ userId: userB, projectId: projectA._id });
     const req = { query: { code: 'fake', state } };
     const res = mockRes();
     await handleMetaCallback(req, res);
@@ -369,7 +377,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
 
   test('CASE A: valid state but a NONEXISTENT project is rejected', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const state = signOAuthState({ provider: 'meta', purpose: 'social_meta', projectId: new mongoose.Types.ObjectId().toString(), userId: userA.toString() });
+    const state = await mintState({ userId: userA, projectId: new mongoose.Types.ObjectId() });
     const req = { query: { code: 'fake', state } };
     const res = mockRes();
     await handleMetaCallback(req, res);
@@ -395,7 +403,7 @@ describe('handleMetaCallback — real controller + real Mongo project fixtures',
 
     try {
       // 3: a genuinely valid, correctly-signed state for this real project/user.
-      const state = signOAuthState({ provider: 'meta', purpose: 'social_meta', projectId: softDeletedProject._id.toString(), userId: userA.toString() });
+      const state = await mintState({ userId: userA, projectId: softDeletedProject._id });
       const req = { query: { code: 'fake-code-should-never-be-used', state } };
       const res = mockRes();
 

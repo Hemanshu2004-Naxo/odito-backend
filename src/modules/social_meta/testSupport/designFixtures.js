@@ -7,10 +7,20 @@ import sharp from 'sharp';
 import { promises as fs } from 'fs';
 import path from 'path';
 
-/** A real image of the given size/format with a random flat colour (so two generations never share bytes). */
+const rand = (n) => Math.floor(Math.random() * n);
+
+/**
+ * A real image of the given size/format (so two generations never share bytes). By default it is PHOTOGRAPH-LIKE - a random gradient with a few
+ * shapes - because the pipeline now refuses a blank picture; pass `background` for a deliberately flat one (a logo, a blank-image test).
+ */
 export async function makeImage({ width = 1024, height = 1024, format = 'png', background } = {}) {
-  const color = background || { r: Math.floor(Math.random() * 200) + 30, g: Math.floor(Math.random() * 200) + 30, b: Math.floor(Math.random() * 200) + 30 };
+  const color = background || { r: rand(200) + 30, g: rand(200) + 30, b: rand(200) + 30 };
   let pipeline = sharp({ create: { width, height, channels: 3, background: color } });
+  if (!background) {
+    const hue = () => `rgb(${rand(256)},${rand(256)},${rand(256)})`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${hue()}"/><stop offset="1" stop-color="${hue()}"/></linearGradient></defs><rect width="${width}" height="${height}" fill="url(#g)"/><circle cx="${width * 0.7}" cy="${height * 0.35}" r="${Math.min(width, height) * 0.22}" fill="${hue()}" opacity="0.8"/><rect x="${width * 0.1}" y="${height * 0.6}" width="${width * 0.5}" height="${height * 0.25}" fill="${hue()}" opacity="0.7"/></svg>`;
+    pipeline = sharp({ create: { width, height, channels: 3, background: color } }).composite([{ input: Buffer.from(svg), left: 0, top: 0 }]);
+  }
   if (format === 'jpeg') pipeline = pipeline.withMetadata({ exif: { IFD0: { Copyright: 'SECRET-EXIF-MARKER' } } }).jpeg();
   else if (format === 'webp') pipeline = pipeline.webp();
   else pipeline = pipeline.png();

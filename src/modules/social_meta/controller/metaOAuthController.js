@@ -1,4 +1,4 @@
-import { signOAuthState, verifyOAuthState } from '../../../utils/oauthState.js';
+import { issueMetaOAuthState, consumeMetaOAuthState, readCookie, bindingCookieOptions, BINDING_COOKIE, BINDING_COOKIE_PATH } from '../service/metaOAuthStateService.js';
 import { buildAuthorizationUrl, exchangeCodeForToken, exchangeForLongLivedToken, fetchGrantedScopes } from '../service/metaOAuthService.js';
 import { inspectToken } from '../service/metaTokenService.js';
 import { getFrontendUrl } from '../../../config/env.js';
@@ -100,13 +100,14 @@ export async function startMetaConnection(req, res) {
     // why this must never be the default for a normal Connect.
     const reconnect = req.query.reconnect === 'true';
 
-    const state = signOAuthState({
-      provider: PROVIDER,
-      purpose: PURPOSE,
-      projectId: req.projectId,
+    // A one-time, unpredictable state whose owner / project / return target live on the server (metaOAuthStateService.js), plus a secret for
+    // the initiating browser's httpOnly cookie that the callback must present when the browser sends it.
+    const { state, bindingSecret } = await issueMetaOAuthState({
       userId,
-      ...(returnTo ? { returnTo } : {}),
+      projectId: req.projectId,
+      returnTo: returnTo && Object.prototype.hasOwnProperty.call(RETURN_TARGETS, returnTo) ? returnTo : null,
     });
+    if (typeof res.cookie === 'function') res.cookie(BINDING_COOKIE, bindingSecret, bindingCookieOptions());
 
     const url = buildAuthorizationUrl({ redirectUri: metaRedirectUri(), state, reconnect });
 
@@ -167,26 +168,17 @@ export async function handleMetaCallback(req, res) {
       return redirectToSocialPage(res, { error: 'invalid_request' });
     }
 
-    // Validate state BEFORE the code is ever exchanged (Section 5,
-    // requirement #2) — a tampered/expired/malformed token fails
-    // verification outright (jwt.verify throws), never silently degrades.
-    try {
-      decodedState = verifyOAuthState(state);
-    } catch (stateError) {
-      LoggerUtil.service('MetaOAuth', 'callback', 'rejected', { reason: 'invalid_or_expired_state', message: stateError.message });
-      return redirectToSocialPage(res, { error: 'expired_or_invalid_request' });
+    // Validate AND consume the state BEFORE the code is ever exchanged (Section 5, requirement #2): a tampered, expired, unknown, already-used
+    // (replayed) or wrong-browser state is refused outright and never silently degrades. It can be used exactly once.
+    const consumed = await consumeMetaOAuthState(state, { bindingSecret: readCookie(req, BINDING_COOKIE) });
+    if (typeof res.clearCookie === 'function') res.clearCookie(BINDING_COOKIE, { path: BINDING_COOKIE_PATH });
+    if (!consumed.ok) {
+      LoggerUtil.service('MetaOAuth', 'callback', 'rejected', { reason: `state_${consumed.reason}` });
+      const code = ['wrong_provider', 'binding_mismatch', 'binding_missing'].includes(consumed.reason) ? 'invalid_request' : 'expired_or_invalid_request';
+      return redirectToSocialPage(res, { error: code });
     }
-
-    if (decodedState?.provider !== PROVIDER || decodedState?.purpose !== PURPOSE) {
-      LoggerUtil.service('MetaOAuth', 'callback', 'rejected', { reason: 'provider_or_purpose_mismatch' });
-      return redirectToSocialPage(res, { error: 'invalid_request' });
-    }
-
+    decodedState = { projectId: consumed.projectId, userId: consumed.userId, returnTo: consumed.returnTo };
     const { projectId, userId, returnTo } = decodedState;
-    if (!projectId || !userId) {
-      LoggerUtil.service('MetaOAuth', 'callback', 'rejected', { reason: 'incomplete_state' });
-      return redirectToSocialPage(res, { error: 'invalid_request', returnTo });
-    }
 
     // Re-check ownership at callback time too (Section 5, requirement #4)
     // — mirrors oauth.routes.js's own "defense in depth" comment exactly:

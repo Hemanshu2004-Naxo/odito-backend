@@ -704,6 +704,23 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
   };
   const create = (doc, over = {}) => generateItemContent(pid, userId, String(doc._id), { platform: 'facebook', expectedRevision: doc.revision, ...over });
 
+  test("S1: the editor options carry the strategy's suggested posting windows (text, never parsed into a schedule) and the account's time zone; the plan item itself still has only a date", async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const none = await getItemOptions(pid, { userId });
+    assert.equal(none.scheduling.timezone, null, 'no time zone known: none is invented');
+    assert.ok(Array.isArray(none.scheduling.timeWindows) && none.scheduling.timeWindows.length > 0, "the strategy's own windows");
+    const User = (await import('../../../user/model/User.js')).default;
+    await User.collection.insertOne({ _id: userId, email: `tz-${userId}@example.com`, timezone: 'Asia/Kolkata' });
+    try {
+      assert.equal((await getItemOptions(pid, { userId })).scheduling.timezone, 'Asia/Kolkata');
+    } finally { await User.collection.deleteOne({ _id: userId }); }
+    const doc = await first();
+    assert.match(doc.contentDate, /^\d{4}-\d{2}-\d{2}$/, 'a plan item is a calendar DATE: no time of day, so nothing can be published by planning');
+    assert.equal('scheduledAt' in doc, false);
+    assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
+  });
+
   test('P1: the draft IS the reviewed caption, word for word, with its hashtags - no AI call, nothing rewritten - and it records which plan revision it came from', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await seedStrategy(); await seedCalendar();
@@ -956,5 +973,158 @@ describe('Content Calendar item workspace (real MongoDB, scripted providers)', (
     ok(await regenerateItem(pid, userId, String(doc._id), { expectedRevision: 3, overwriteEdited: true }));
     assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
     assert.deepEqual(fetchCalls, []);
+  });
+  // ── approval + regeneration (Phase 4): the response says what happened to the approval, and approval can never be restored by a stale request ──
+
+  test('R1: regenerating an APPROVED plan whose caption was never edited replaces it, WITHDRAWS the approval and says so - the replacement must be approved again before any post can be made from it', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: doc.revision ?? 0 }));
+    const approved = await reload(doc);
+    assert.deepEqual([approved.status, approved.editedFields], ['plan_approved', []], 'approved exactly as generated: the caption was never edited');
+
+    setCalendarProviderOverride(regenProvider({ caption: 'A different caption written by the AI for this plan.' }));
+    const r = ok(await regenerateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, fields: ['caption'] }));
+    assert.deepEqual([r.approvalStatus, r.approvalRevoked, r.requiresReapproval, r.contentLinked, r.unchanged], ['not_approved', true, true, false, undefined]);
+    const saved = await reload(doc);
+    assert.notEqual(saved.caption, approved.caption, 'the caption really was replaced');
+    assert.deepEqual([saved.status, saved.planApprovedAt, saved.planApprovedBy], ['planned', null, null]);
+
+    // nothing can be made from the replacement until a person approves it
+    setContentProviderOverride(contentProvider());
+    assert.equal((await create(saved)).error.code, 'PLAN_NOT_APPROVED');
+    assert.equal(await SocialPublication.countDocuments({ project_id: project._id }), 0);
+    // the approval given to the OLD plan cannot be replayed onto the new one
+    assert.equal((await approveItem(pid, userId, String(doc._id), { expectedRevision: approved.revision })).error.code, 'ITEM_CONFLICT');
+    assert.equal((await reload(doc)).status, 'planned');
+    // approving the NEW revision is the only way back
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: saved.revision }));
+    assert.equal((await reload(doc)).status, 'plan_approved');
+  });
+
+  test('R2: when the AI lands on EXACTLY the stored words, nothing is written - the revision, the edit markers and the approval stay, and the response says "unchanged"', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: doc.revision ?? 0 }));
+    const approved = await reload(doc);
+    setCalendarProviderOverride(mockCalendarProvider({ behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, { topic: approved.topic })) }) }));
+    const r = ok(await regenerateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, fields: ['topic'] }));
+    assert.deepEqual([r.unchanged, r.regenerated, r.approvalStatus, r.approvalRevoked, r.requiresReapproval], [true, [], 'approved', false, false]);
+    const saved = await reload(doc);
+    assert.deepEqual([saved.status, saved.revision], ['plan_approved', approved.revision], 'no revision bump');
+    assert.equal(saved.planApprovedAt.getTime(), approved.planApprovedAt.getTime(), 'the approval itself is untouched');
+    assert.equal(saved.updatedAt.getTime(), approved.updatedAt.getTime(), 'nothing was written at all');
+    // a different result for the same request is a real change and does withdraw it (the control case)
+    setCalendarProviderOverride(regenProvider());
+    const changed = ok(await regenerateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, fields: ['topic'] }));
+    assert.deepEqual([changed.unchanged, changed.approvalRevoked, changed.approvalStatus], [undefined, true, 'not_approved']);
+  });
+
+  test('R3: a stale revision cannot regenerate (or re-approve) anything: the AI is not even asked and the approval is exactly as it was', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: doc.revision ?? 0 }));
+    const approved = await reload(doc);
+    const provider = regenProvider();
+    setCalendarProviderOverride(provider);
+    const stale = await regenerateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision - 1, fields: ['caption'] });
+    assert.equal(stale.error.code, 'ITEM_CONFLICT');
+    assert.equal(stale.error.item.status, 'plan_approved', 'the conflict hands back the CURRENT item');
+    assert.equal(provider.calls.length, 0);
+    assert.equal((await regenerateItem(pid, userId, String(doc._id), { fields: ['caption'] })).error.code, 'INVALID_FIELD', 'no revision at all is refused too');
+    const saved = await reload(doc);
+    assert.deepEqual([saved.status, saved.revision, saved.caption], ['plan_approved', approved.revision, approved.caption]);
+  });
+
+  test('R4: edited by someone else while the AI works on an APPROVED plan: the regeneration is discarded, their edit survives, and the approval state is the one THEIR edit produced', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: doc.revision ?? 0 }));
+    const approved = await reload(doc);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    setCalendarProviderOverride(mockCalendarProvider({ gate, behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, { caption: 'Late AI caption that must never land' })) }) }));
+    const pending = regenerateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, fields: ['caption'] });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    ok(await updateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, topic: 'Edited while the AI worked' }));
+    release();
+    const r = await pending;
+    assert.equal(r.error.code, 'ITEM_CONFLICT');
+    const saved = await reload(doc);
+    assert.equal(saved.topic, 'Edited while the AI worked');
+    assert.equal(saved.caption, approved.caption, 'the late AI caption was not applied');
+    assert.equal(saved.status, 'edited', 'the edit reopened the plan; the discarded regeneration did not change that');
+    assert.equal(saved.planApprovedAt, null);
+  });
+
+  test('R5: approved by someone else while the AI works: the regeneration is discarded, so the approval stays attached to the content that was actually approved', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    const before = await reload(doc);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    setCalendarProviderOverride(mockCalendarProvider({ gate, behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, { caption: 'Late AI caption that was never reviewed' })) }) }));
+    const pending = regenerateItem(pid, userId, String(doc._id), { expectedRevision: before.revision ?? 0, fields: ['caption'] });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: before.revision ?? 0 }));
+    release();
+    assert.equal((await pending).error.code, 'ITEM_CONFLICT');
+    const saved = await reload(doc);
+    assert.equal(saved.status, 'plan_approved');
+    assert.equal(saved.caption, before.caption, 'the approved caption is the one the person reviewed, not the late one');
+  });
+
+  test('R6: when an unchanged AI answer arrives after the item changed, it is a conflict - never a quiet "unchanged" that would keep a stale approval', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: doc.revision ?? 0 }));
+    const approved = await reload(doc);
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    setCalendarProviderOverride(mockCalendarProvider({ gate, behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, { topic: approved.topic })) }) }));
+    const pending = regenerateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, fields: ['topic'] });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    ok(await updateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, caption: 'Edited while the AI worked' }));
+    release();
+    const r = await pending;
+    assert.equal(r.error?.code, 'ITEM_CONFLICT', JSON.stringify(r));
+    assert.equal((await reload(doc)).status, 'edited');
+  });
+
+  test('R7: once a post exists for the plan its approval is NOT withdrawn by a regeneration, the post keeps its own reviewed caption, and the response says both', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    setContentProviderOverride(contentProvider());
+    const doc = await approvedItem();
+    const made = await create(doc);
+    assert.equal(made.success, true, JSON.stringify(made.error));
+    const draftBefore = await SocialPublication.findById(made.publication.id).lean();
+    const linked = await reload(doc);
+    setCalendarProviderOverride(regenProvider());
+    const r = ok(await regenerateItem(pid, userId, String(doc._id), { expectedRevision: linked.revision, fields: ['caption'], overwriteEdited: true }));
+    assert.deepEqual([r.approvalStatus, r.approvalRevoked, r.requiresReapproval, r.contentLinked], ['approved', false, false, true]);
+    assert.ok(r.warnings.some((w) => /already created from this plan/.test(w)));
+    const draftAfter = await SocialPublication.findById(made.publication.id).lean();
+    assert.equal(draftAfter.content, draftBefore.content, 'the reviewed post text is untouched');
+    assert.equal(draftAfter.status, 'draft');
+    assert.equal((await reload(doc)).status, 'content_generated');
+  });
+
+  test('R8: a person\'s own edit reports its approval outcome with the same fields (so every client reads one shape)', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    await seedStrategy(); await seedCalendar();
+    const doc = await first();
+    ok(await approveItem(pid, userId, String(doc._id), { expectedRevision: doc.revision ?? 0 }));
+    const approved = await reload(doc);
+    const r = ok(await updateItem(pid, userId, String(doc._id), { expectedRevision: approved.revision, topic: 'Reworded topic' }));
+    assert.deepEqual([r.approvalStatus, r.approvalRevoked, r.requiresReapproval, r.contentLinked], ['not_approved', true, true, false]);
+    const plain = ok(await updateItem(pid, userId, String(doc._id), { expectedRevision: r.item.revision, angle: 'A new angle' }));
+    assert.deepEqual([plain.approvalStatus, plain.approvalRevoked], ['not_approved', false], 'already open: nothing further to withdraw');
   });
 });

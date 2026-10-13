@@ -77,31 +77,144 @@ export function clampText(value, { maxWords, maxChars }) {
  * (the caller then tries the next candidate). Never "the first nine words of a longer sentence".
  */
 export function fitHeadline(value) {
-  const text = clean(value, 300).replace(/[.!?]+$/, '').trim();
+  // a closing full stop or exclamation mark is dropped on a headline; a QUESTION MARK is part of the meaning ("Is your agency ready?") and stays
+  const text = clean(value, 300).replace(/[.!]+$/, '').replace(/\?{2,}$/, '?').trim();
   const words = (t) => t.split(' ').filter(Boolean).length;
   const fits = (t, maxWords, maxChars) => t && words(t) >= 2 && words(t) <= maxWords && t.length <= maxChars;
   if (fits(text, 9, 70)) return text;
   const clause = text.split(/[,;:–—]\s|\s-\s/)[0].trim(); // only a punctuation break is a real clause boundary
   if (clause && clause !== text && fits(clause, 9, 70) && words(clause) >= 3) return clause;
-  if (fits(text, 14, 95)) return text;
+  if (fits(text, HEADLINE_MAX_WORDS, HEADLINE_MAX_CHARS)) return text;
   return '';
 }
 
+/** Headline room: a whole sentence up to this long (the composer shrinks the type to fit; anything longer is refused rather than cut). */
+export const HEADLINE_MAX_WORDS = 16;
+export const HEADLINE_MAX_CHARS = 100;
+
 const sentences = (text) => String(text || '').split(/(?<=[.!?])\s+|\n+/).map((s) => clean(s, 240)).filter(Boolean);
+
+/** An unambiguous call to action ("Book a check-up this month", "Follow us for..."): never the subject of a post, so never chosen as its headline while a real subject exists. */
+const CTA_VERB_RE = /^(book|call|visit|contact|follow|shop|order|sign up|join|download|schedule|reserve|request|message|dm|subscribe|register|enquire|inquire|claim|learn more|tap|click|drop us|send us|reach out|get in touch|talk to|speak to)\b/i;
+export const isCtaSentence = (s) => CTA_VERB_RE.test(String(s || '').trim());
+
+/** The caption's own sentences with the structure removed: numbered / bulleted lines, the trailing hashtag block, links and hashtag lines. */
+export function proseSentences(caption) {
+  const prose = String(caption || '').split('\n').filter((l) => !/^\s*(?:\d{1,2}[.)]|\d{1,2}\s*[-–:]|[-•*▪✓✔→])\s/.test(l)).join('\n').replace(/(?:\s*#[\p{L}\p{N}_]+)+\s*$/u, '');
+  return sentences(prose).filter((s) => !/https?:\/\//i.test(s) && !/^#/.test(s)).slice(0, 8);
+}
+
+/** The caption's own call to action when it is a short sentence ("Book a check-up this month"), so a button can carry it; '' when there is none. */
+export function ctaFromCaption(caption) {
+  const found = proseSentences(caption).find((s) => isCtaSentence(s) && s.replace(/[.!?]+$/, '').split(' ').length <= 6);
+  return found ? found.replace(/[.!?]+$/, '').trim() : '';
+}
+
+/** Enough real words to be a headline: letters, and at least two different words. */
+const isMeaningful = (t) => /\p{L}{3,}/u.test(t) && new Set(String(t).toLowerCase().split(/\s+/).filter(Boolean)).size >= 2;
+
+const JOINERS_RE = /^(?:a|an|the|and|but|or|so|to|of|for|in|on|at|by|with|as|that|which|is|are|was|were|be|it|its|this|these|those|your|our|their|my|his|her|from|than|then|if|when|while|because|since|about)$/i;
+// where a clause can end: a conjunction, or a preposition that starts the rest ("...the simplest way | to protect your smile")
+const CONJUNCTION_RE = /\s(?:and|but|because|so|which|that|while|when|as|although|though|or|since|if|to|for|with|from|into|than)\s/gi;
+
+/**
+ * A safe, bounded headline from ONE long sentence that has no punctuation to cut at (the post is real; it just is not written for a thumbnail):
+ * the longest clause that ends where a conjunction or preposition begins (4-12 words, 80 characters), else its first words up to a word boundary,
+ * never ending on a joining word - always shown with an ellipsis so it reads as an excerpt. Never splits a word, never adds a word. '' when the sentence
+ * is too short or too empty to carry a design (fewer than 8 words, fewer than 4 real words, or repeated filler).
+ */
+export function boundedHeadline(sentence) {
+  const text = clean(sentence, 400).replace(/[.!]+$/, '').trim();
+  const words = text.split(' ').filter(Boolean);
+  const real = words.filter((w) => /\p{L}{4,}/u.test(w));
+  if (words.length < 8 || real.length < 4 || new Set(words.map((w) => w.toLowerCase())).size < 5) return '';
+  const trimTail = (list) => { const out = [...list]; while (out.length > 3 && JOINERS_RE.test(String(out[out.length - 1]).replace(/[,;:]+$/, ''))) out.pop(); return out; };
+  let clause = '';
+  for (const m of text.matchAll(CONJUNCTION_RE)) {
+    const left = trimTail(text.slice(0, m.index).trim().split(' ').filter(Boolean));
+    if (left.length >= 4 && left.length <= 12 && left.join(' ').length <= 80) clause = left.join(' ');
+  }
+  if (clause) return `${clause.replace(/[,;:\s–—-]+$/, '')}…`;
+  const cut = trimTail(words.slice(0, 10));
+  const out = cut.join(' ').replace(/[,;:\s–—-]+$/, '');
+  return cut.length >= 4 && out.length <= 70 ? `${out}…` : '';
+}
+
+/**
+ * The headline: (1) the plan's own text; (2) a complete, concise sentence of the caption that is not a call to action - the first one that
+ * fits, with its punctuation (a question stays a question); (3) a bounded excerpt of a long unpunctuated sentence; (4) only then a call to
+ * action, rather than nothing. Returns { headline, source: 'plan' | 'caption' | 'shortened' | 'cta' | null }.
+ */
+export function chooseHeadline({ planItem = null, caption = '', allowedText = () => true } = {}) {
+  for (const candidate of [planItem?.onCreativeText, planItem?.topic]) {
+    const h = fitHeadline(candidate);
+    if (h && allowedText(h)) return { headline: h, source: 'plan' };
+  }
+  const all = proseSentences(caption);
+  const subject = all.filter((s) => !isCtaSentence(s));
+  for (const s of subject) {
+    const h = fitHeadline(s);
+    if (h && isMeaningful(h) && allowedText(h)) return { headline: h, source: 'caption' };
+  }
+  for (const s of subject) {
+    const h = boundedHeadline(s);
+    if (h && allowedText(h)) return { headline: h, source: 'shortened' };
+  }
+  for (const s of all.filter(isCtaSentence)) {
+    const h = fitHeadline(s);
+    if (h && isMeaningful(h) && allowedText(h)) return { headline: h, source: 'cta' };
+  }
+  return { headline: '', source: null };
+}
 const firstSentence = (text) => clean(sentences(text)[0] || '', 200).replace(/[.!?]+$/, '');
 
-/** The numbers / percentages / amounts a text states. Used to know which figures the business actually supplied. */
-export function extractFigures(text) {
-  const found = String(text || '').match(/(?:[$€£₹]\s?)?\d[\d,]*(?:\.\d+)?\s?%?/g) || [];
-  return [...new Set(found.map((f) => f.replace(/\s+/g, '')).filter(Boolean))];
+/** The caption's wording without the digits that are only structure: list numerals ("1." / "2)" / "3 -"), hashtags, links, e-mail addresses and phone numbers. */
+export function withoutStructuralDigits(text) {
+  return String(text || '')
+    .replace(/(^|\n)[ \t]*(?:\d{1,2}[.)]|\d{1,2}[ \t]*[-–:])[ \t]+/g, '$1')
+    .replace(/https?:\/\/\S+|www\.\S+|\S+@\S+\.\S+/gi, ' ')
+    .replace(/#[\p{L}\p{N}_]+/gu, ' ')
+    .replace(/\+?\d[\d\s().-]{7,}\d/g, ' ');
 }
+
+/**
+ * Whether a number is something a design may show BIG as a statistic: a percentage, an amount of money, a decimal or a thousands figure, or a whole
+ * number of 10 or more that is not a year. A bare 1-9 is a count in a sentence ("3 tips", "step 2") or a list numeral - never a statistic.
+ */
+export function isStatFigure(value) {
+  const v = String(value || '');
+  if (/%|[$€£₹]/.test(v)) return true;
+  if (/[.,]/.test(v)) return true;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 10 && !/^(19|20)\d{2}$/.test(v);
+}
+
+/** The statistics a text states (see isStatFigure). Used to know which figures the business actually supplied. */
+export function extractFigures(text) {
+  const found = withoutStructuralDigits(text).match(/(?:[$€£₹]\s?)?\d[\d,]*(?:\.\d+)?\s?%?/g) || [];
+  return [...new Set(found.map((f) => f.replace(/\s+/g, '').replace(/[,.]+$/, '')).filter((f) => f && isStatFigure(f)))];
+}
+
+/** A line that explains a figure or a point in words: at least three words and some real letters (never just "1." or "42"). */
+export const hasReadableContext = (s) => {
+  const t = String(s || '').trim();
+  return t.split(/\s+/).filter((w) => /\p{L}{2,}/u.test(w)).length >= 3;
+};
 
 /** A sentence of `text` that states `figure`, as the figure's context (so a big number is never shown without its meaning). */
 function sentenceWith(text, figure) {
-  const hay = String(text || '').split(/(?<=[.!?])\s+|\n+/);
+  const hay = withoutStructuralDigits(text).split(/(?<=[.!?])\s+|\n+/);
   const spaced = figure.replace(/(\d)(%)/, '$1 $2');
-  return clean(hay.find((s) => s.includes(figure) || s.includes(spaced)) || '', 110);
+  const sentence = clean(hay.find((s) => s.includes(figure) || s.includes(spaced)) || '', 300).replace(/[.!?]+$/, '');
+  if (sentence.length <= 110) return sentence;
+  // too long for a card: the clause that states the figure, else the first words up to a word boundary
+  const clause = sentence.split(/[,;]\s|\s[-–—]\s/).find((c) => c.includes(figure) || c.includes(spaced));
+  return clause && hasReadableContext(clause) && clause.length <= 110 ? clause.trim() : clampText(sentence, { maxWords: 20, maxChars: 110 });
 }
+
+/** What one list card can carry: a whole sentence of a numbered list reads better than its first seven words ("... because your"). */
+const POINT_MAX_WORDS = 16;
+const POINT_MAX_CHARS = 100;
 
 const WORD_NUMBERS = 'three|four|five|six|seven|eight|nine|ten|\\d+';
 const LIST_RE = new RegExp(`\\b(${WORD_NUMBERS})\\b\\s+(?:\\w+\\s+){0,2}(mistakes|tips|ways|steps|signs|reasons|things|ideas|rules|habits|questions|myths|lessons|factors|pillars|strategies)\\b`, 'i');
@@ -118,11 +231,21 @@ const ANNOUNCE_RE = /\b(launch(ing|ed)?|introducing|now (open|available|live)|ne
  * The short points a list / process design may show: numbered or bulleted lines of the caption, or "Point N: ..." / "Slide N: ..."
  * entries of the plan's brief. Each is taken as written (only shortened), never composed here.
  */
+export function fitPoint(value) {
+  const text = clean(value, 300).replace(/[.!?]+$/, '').trim();
+  const words = (t) => t.split(' ').filter(Boolean).length;
+  const fits = (t) => t && words(t) <= POINT_MAX_WORDS && t.length <= POINT_MAX_CHARS;
+  if (fits(text)) return text;
+  const clause = text.split(/[,;]\s|\s[-–—]\s/)[0].trim();
+  if (clause && words(clause) >= 3 && fits(clause)) return clause;
+  return clampText(text, { maxWords: POINT_MAX_WORDS, maxChars: POINT_MAX_CHARS });
+}
+
 export function extractPoints({ caption, planItem }) {
   const found = [];
   const push = (raw) => {
     const head = String(raw).split(/\s[-–—:]\s|:\s/)[0];
-    const point = clampText(head.length >= 3 ? head : raw, { maxWords: 7, maxChars: 48 });
+    const point = fitPoint(head.length >= 3 ? head : raw);
     if (point.length >= 3 && !found.some((p) => p.toLowerCase() === point.toLowerCase())) found.push(point);
   };
   for (const lineText of String(caption || '').split(/\n+/)) {
@@ -245,9 +368,11 @@ export function classifyCreative({ caption, planItem = null, pillar = '', object
   let reason = 'default';
   if (hasProduct && hasProductAsset) { type = 'product_showcase'; reason = 'product with a real photo'; }
   else if (CASE_RE.test(text)) { type = 'case_study'; reason = 'case-study wording'; }
-  else if (figures.length && DATA_RE.test(text) && !LIST_RE.test(text)) { type = 'data_insight'; reason = 'supplied figures in a data-led post'; }
+  else if (figures.length && DATA_RE.test(text) && !LIST_RE.test(text) && points.length < 3) { type = 'data_insight'; reason = 'supplied figures in a data-led post'; }
   else if (extractQuote(caption)) { type = 'quote'; reason = 'quoted sentence'; }
-  else if (contentType === 'behind_the_scenes' || TEAM_RE.test(text)) { type = 'team_story'; reason = 'team / behind the scenes'; }
+  // a team story is a PEOPLE post: the plan says so, or the wording does - but keyword wording alone must not beat a numbered list of points
+  // (a plan angle such as "a behind-the-scenes fulfillment partner" is a business phrase, not a team post)
+  else if (contentType === 'behind_the_scenes' || (TEAM_RE.test(text) && points.length < 3)) { type = 'team_story'; reason = 'team / behind the scenes'; }
   else if (COMPARE_RE.test(text) && !LIST_RE.test(text) && points.length >= 3) { type = 'comparison'; reason = 'comparison wording'; }
   else if (points.length >= 3 && !PROCESS_RE.test(text)) { type = 'educational_list'; reason = 'numbered points'; }
   else if (points.length >= 3 && PROCESS_RE.test(text)) { type = 'process_checklist'; reason = 'process / checklist points'; }
@@ -376,11 +501,17 @@ export function buildDesignBrief({
   // ── the words (all from the caption / plan / profile / catalog) ──
   const quote = creativeType === 'quote' ? extractQuote(caption) : null;
   let headline = quote || '';
-  for (const candidate of [planItem?.onCreativeText, planItem?.topic, firstSentence(caption)]) {
-    if (headline) break;
-    const c = fitHeadline(candidate);
-    if (c && allowedText(c)) headline = c;
+  // The plan's own words, else a complete sentence of the caption that is not a call to action, else a bounded excerpt of a long unpunctuated one
+  // (chooseHeadline). The call to action is taken separately below.
+  if (!headline) {
+    const chosen = chooseHeadline({ planItem, caption, allowedText });
+    headline = chosen.headline;
+    // nothing usable only BECAUSE of the business's prohibited phrases is a different problem from a caption with nothing to say
+    if (!headline && banned.length && chooseHeadline({ planItem, caption }).headline) notes.push('headline_blocked_by_prohibited_phrase');
+    if (chosen.source === 'shortened') notes.push('headline_shortened');
+    if (chosen.source === 'cta') notes.push('headline_is_cta');
   }
+  const prose = proseSentences(caption).join('\n');
   if (changes.headline && allowedText(changes.headline)) headline = clampText(changes.headline, { maxWords: 14, maxChars: 95 }) || headline;
   if (!headline) { creativeType = 'premium_editorial'; notes.push('no_safe_headline'); }
 
@@ -389,7 +520,7 @@ export function buildDesignBrief({
   const suppliedFigures = extractFigures([caption, planItem?.topic, planItem?.angle, planItem?.hook, planItem?.contentBrief].filter(Boolean).join(' '));
   const figureSource = [caption, planItem?.topic, planItem?.angle, planItem?.hook, planItem?.contentBrief].filter(Boolean).join(' . ');
   const figures = ['data_insight', 'case_study'].includes(creativeType)
-    ? suppliedFigures.slice(0, 3).map((value) => ({ value, context: sentenceWith(figureSource, value) })).filter((f) => f.context && allowedText(f.context))
+    ? suppliedFigures.map((value) => ({ value, context: sentenceWith(figureSource, value) })).filter((f) => hasReadableContext(f.context) && allowedText(f.context)).slice(0, 3)
     : [];
   const serviceInfo = pickServices({ services, planItem });
   const serviceItems = serviceInfo.items.filter(allowedText);
@@ -401,21 +532,27 @@ export function buildDesignBrief({
   const usesPoints = layoutId === 'infographic_points';
   const points = usesPoints ? layoutPoints.slice(0, 5) : [];
 
+  const goal = planItem?.objective || objective || '';
+  const ctaOk = WANTS_CTA.has(effectiveType) || ['lead_generation', 'conversion', 'traffic'].includes(goal);
+  const captionCta = ctaFromCaption(caption); // the post's own call to action, when it is a short sentence the button can carry
+
   // supporting line: the plan's hook, else the post's next sentence - never the headline again, never when points carry the message
   let subheadline = '';
   {
-    const hook = clampText(planItem?.hook, { maxWords: 16, maxChars: 100 });
-    const next = sentences(String(caption || '').replace(/(?:\s*#[\p{L}\p{N}_]+)+\s*$/u, '')).map((s) => clampText(s.replace(/[.!?]+$/, ''), { maxWords: 16, maxChars: 100 })).find((s) => s && s.toLowerCase() !== headline.toLowerCase() && !points.some((p) => p.toLowerCase() === s.toLowerCase()) && s.split(' ').length >= 4);
-    subheadline = [hook, next].find((s) => s && s.toLowerCase() !== headline.toLowerCase() && allowedText(s)) || '';
+    // a supporting line is a WHOLE sentence that fits (never "... marketing felt"), and never one that repeats the headline (the headline is often the first clause of it)
+    const whole = (s) => { const t = fitPoint(s); return t && t === clean(s, 300).replace(/[.!?]+$/, "").trim() ? t : ""; };
+    const repeatsHeadline = (s) => { const a = s.toLowerCase(); const h = String(headline).toLowerCase(); const c = String(captionCta).toLowerCase(); return (!!h && (a === h || a.includes(h) || h.includes(a))) || (ctaOk && !!c && a === c); };
+    const hook = whole(planItem?.hook);
+    const next = sentences(prose).map(whole).find((s) => s && !repeatsHeadline(s) && !points.some((p) => p.toLowerCase() === s.toLowerCase()) && s.split(" ").length >= 4);
+    subheadline = [hook, next].find((s) => s && !repeatsHeadline(s) && allowedText(s)) || '';
     if (['educational_list', 'process_checklist', 'comparison', 'data_insight', 'quote'].includes(effectiveType) && usesPoints) subheadline = '';
     if (effectiveType === 'quote') subheadline = '';
   }
   if (changes.subheadline && allowedText(changes.subheadline)) subheadline = clampText(changes.subheadline, { maxWords: 20, maxChars: 120 });
 
-  // call to action: only the plan's own CTA, only where a button belongs
-  const goal = planItem?.objective || objective || '';
-  const ctaOk = WANTS_CTA.has(effectiveType) || ['lead_generation', 'conversion', 'traffic'].includes(goal);
-  let cta = ctaOk ? clampText(planItem?.primaryCta, { maxWords: 5, maxChars: 40 }) : '';
+  // call to action: the plan's own CTA, else the post's own short call to action - only where a button belongs, and never the headline again
+  let cta = ctaOk ? (clampText(planItem?.primaryCta, { maxWords: 5, maxChars: 40 }) || clampText(captionCta, { maxWords: 6, maxChars: 40 })) : '';
+  if (cta && headline && cta.toLowerCase() === headline.toLowerCase()) cta = '';
   if (changes.cta && allowedText(changes.cta)) cta = clampText(changes.cta, { maxWords: 5, maxChars: 40 });
 
   // contact details: the profile's real values, only where the design's purpose needs them
@@ -490,13 +627,18 @@ export function checkBrief(brief, { prohibitedPhrases = [], caption = '', planIt
   const problems = [];
   if (!CREATIVE_TYPES[brief.creativeType]) problems.push('unknown creative type');
   if (!LAYOUT_NEEDS[brief.layoutId]) problems.push('unknown layout');
-  if (!brief.headline && !brief.product?.name) problems.push('no headline');
-  else if (brief.headline.split(' ').length > 14 || brief.headline.length > 95) problems.push('headline too long to read as a thumbnail');
+  if (!brief.headline && !brief.product?.name) problems.push((brief.notes || []).includes('headline_blocked_by_prohibited_phrase') ? 'no headline: every candidate uses a prohibited phrase' : 'no headline');
+  else if (brief.headline.split(' ').length > HEADLINE_MAX_WORDS + 1 || brief.headline.length > HEADLINE_MAX_CHARS + 5) problems.push('headline too long to read as a thumbnail');
   const banned = prohibitedPhrases.map((p) => String(p).trim().toLowerCase()).filter(Boolean);
   const strings = [brief.headline, brief.subheadline, ...brief.points, ...(brief.services || []), brief.cta, ...(brief.figures || []).map((f) => f.context), ...(brief.product?.benefits || [])].filter(Boolean);
   for (const s of strings) if (banned.some((b) => s.toLowerCase().includes(b))) problems.push('a prohibited phrase would appear in the design');
   const supplied = new Set(extractFigures([caption, planItem?.topic, planItem?.angle, planItem?.hook, planItem?.contentBrief].filter(Boolean).join(' ')));
-  for (const f of brief.figures || []) if (!supplied.has(f.value)) problems.push(`the figure ${f.value} was not supplied`);
+  for (const f of brief.figures || []) {
+    if (!supplied.has(f.value)) problems.push(`the figure ${f.value} was not supplied`);
+    if (!isStatFigure(f.value)) problems.push(`${f.value} is a count or a list number, not a statistic`);
+    if (!hasReadableContext(f.context)) problems.push(`the figure ${f.value} has no readable context`);
+  }
+  for (const p of [...(brief.points || []), ...(brief.services || [])]) if (!hasReadableContext(p) && !/\p{L}{3,}/u.test(p)) problems.push('a list item has no readable text');
   const missing = LAYOUT_NEEDS[brief.layoutId] ? missingForLayout(brief.layoutId, brief, { productImages: brief.productAssets?.count || 0 }) : null;
   if (missing) problems.push(`the ${brief.layoutId} layout needs ${missing}`);
   if (brief.points.length > 6) problems.push('too many points to read');
