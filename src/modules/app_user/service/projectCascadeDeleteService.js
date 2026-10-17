@@ -57,6 +57,10 @@ const CASCADE_REGISTRY = [
 
   // 4. Recommendations
   { category: 'recommendations', collection: 'recommendations', field: 'projectId' },
+  // Owner-confirmed breadcrumb hierarchies (schema-evidence/SchemaBreadcrumbEvidence.js).
+  { category: 'recommendations', collection: 'schema_breadcrumb_evidence', field: 'projectId' },
+  // Owner-confirmed Organization address (schema-evidence/SchemaOrganizationAddress.js).
+  { category: 'recommendations', collection: 'schema_organization_address', field: 'projectId' },
 
   // 5. Tasks
   { category: 'tasks', collection: 'tasks', field: 'projectId' },

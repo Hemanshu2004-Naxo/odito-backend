@@ -156,6 +156,7 @@ export class Page09Service {
       const schemaErrors = await db.collection('seo_page_issues')
         .countDocuments({
           projectId: projectIdObj,
+          status: { $ne: 'excluded' },
           $or: schemaErrorPatterns.map(pattern => ({
             issue_code: { $regex: pattern, $options: 'i' }
           }))

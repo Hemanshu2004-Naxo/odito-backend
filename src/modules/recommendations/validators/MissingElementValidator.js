@@ -23,6 +23,7 @@
  */
 
 import { BaseValidator } from './BaseValidator.js';
+import { GROUP, resolveGroup } from '../prompts/GroupRegistry.js';
 
 // Patterns that indicate a generic, placeholder, or template output.
 // These patterns MUST NOT appear in recommendedVersion for missing elements.
@@ -107,10 +108,17 @@ class MissingElementValidator extends BaseValidator {
     this._validateCoreSections(sections, errors);
 
     // ── 2. Placeholder check (inherited from BaseValidator) ───────────────────
-    this._checkNoPlaceholders(sections, errors);
+    // For schema recommendations only the published code is checked: the surrounding prose is guidance to the owner
+    // ("add your phone number", "needs your input: logo") and must not be rejected as an ungrounded placeholder.
+    const isSchema = resolveGroup(recommendationContext?.identity?.issueId || '') === GROUP.SCHEMA;
+    this._checkNoPlaceholders(
+      isSchema ? { recommendedVersion: sections?.recommendedVersion, implementationExample: sections?.implementationExample } : sections,
+      errors,
+    );
 
     // ── 3. Generic output check for missing elements ──────────────────────────
     const rv = sections.recommendedVersion || '';
+    if (!rv.trim()) warnings.push('recommendedVersion is empty — the generated element was not returned as text');
     if (rv) {
       const matchedPattern = GENERIC_PATTERNS.find(p => p.test(rv));
       if (matchedPattern) {

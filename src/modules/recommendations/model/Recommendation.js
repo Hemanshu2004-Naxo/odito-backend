@@ -79,6 +79,9 @@ const recommendationSchema = new mongoose.Schema({
 
     // Phase 3 context-aware fields — present when generated from IssueContext
     recommendedVersion: { type: String, default: null },
+    // images_missing_alt_text only: one proposal per image, keyed by the image's exact URL (see service/imageAltProposals.js).
+    // undefined (not []) on every other recommendation, and on alt recommendations made before this existed.
+    imageAltProposals: { type: [mongoose.Schema.Types.Mixed], default: undefined },
     contentRewrite: {
       optimized:         { type: String },
       characterCount:    { type: Number },

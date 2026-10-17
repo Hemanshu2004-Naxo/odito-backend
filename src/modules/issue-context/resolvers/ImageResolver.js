@@ -1,4 +1,5 @@
 import { BaseResolver } from './BaseResolver.js';
+import { classifyImageUrl } from '../../external_integration/mediaFix/imageResource.js';
 
 /**
  * ImageResolver
@@ -20,30 +21,63 @@ export class ImageResolver extends BaseResolver {
     switch (issueId) {
 
       case 'images_missing_alt_text': {
-        // Filter to images with empty/missing alt.
+        // Filter to images with empty/missing alt — but never an analytics/advertising tracker (the Facebook Pixel's <noscript>
+        // fallback and the like): it is not a picture, so listing it would make the recommendation describe an image that does not
+        // exist. Same classifier as the crawler and the WordPress fix (imageResource.js).
         // Row keys must exactly match the column names so TableRenderer can look them up.
+        const pageUrl = pageData?.url || pageData?.page_url || null;
+        const trackers = new Set();
+        const isActionable = (src, img = {}) => {
+          const ok = classifyImageUrl(src, { pageUrl, width: img.width, height: img.height, lazySrc: img.lazy_src }).actionable;
+          if (!ok && src) trackers.add(src);
+          return ok;
+        };
+        // The same image file can be used more than once on a page (a header logo and a footer logo), each with its own alt. One row per
+        // image file, and the status says how its uses split, so "Missing" is never read as "no use of this image has alt text".
+        const uses = new Map();
+        for (const img of images) {
+          const key = img.src || img.url || '';
+          const u = uses.get(key) || { total: 0, withAlt: 0 };
+          u.total += 1;
+          if (img.alt && img.alt.trim() !== '') u.withAlt += 1;
+          uses.set(key, u);
+        }
+        const statusFor = (src) => {
+          const u = uses.get(src);
+          if (!u || u.total < 2) return 'Missing';
+          const without = u.total - u.withAlt;
+          return u.withAlt > 0
+            ? `Missing on ${without} of ${u.total} uses of this image (another use has alt text)`
+            : `Missing on all ${u.total} uses of this image`;
+        };
+        const seenSrc = new Set();
         const affected = images
           .filter(img => !img.alt || img.alt.trim() === '')
+          .filter(img => isActionable(img.src || img.url || '', img))
+          .filter(img => { const k = img.src || img.url || ''; if (seenSrc.has(k)) return false; seenSrc.add(k); return true; })
           .map(img => ({
             'Image':       img.src || img.url || '',
             'Current Alt': img.alt || 'Missing',
-            'Status':      'Missing',
+            'Status':      statusFor(img.src || img.url || ''),
           }));
 
-        const fallback = _parseDetectedImages(detectedFromDoc).map(item => ({
-          'Image':       item.src || item.url || String(item),
-          'Current Alt': 'Missing',
-          'Status':      'Missing',
-        }));
+        const fallback = affected.length > 0 ? [] : _parseDetectedImages(detectedFromDoc)
+          .filter(item => isActionable(item.src || item.url || String(item)))
+          .map(item => ({
+            'Image':       item.src || item.url || String(item),
+            'Current Alt': 'Missing',
+            'Status':      'Missing',
+          }));
+        const rows = affected.length > 0 ? affected : fallback;
 
         return {
-          currentState: this._tableState(
-            ['Image', 'Current Alt', 'Status'],
-            affected.length > 0 ? affected : fallback
-          ),
+          currentState: this._tableState(['Image', 'Current Alt', 'Status'], rows),
           expectedState: this._expectedState(
             'All content images have a descriptive alt attribute'
           ),
+          // What the finding really covers: how many pictures are left to describe, and how many flagged addresses were set aside as
+          // trackers. actionable === 0 with ignoredTracking > 0 means the finding was only ever a tracker (nothing to fix).
+          contextExtras: { altFindingScope: { actionable: rows.length, ignoredTracking: trackers.size } },
         };
       }
 

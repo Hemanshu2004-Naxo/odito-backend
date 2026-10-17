@@ -132,6 +132,10 @@ describe('the real odito-seo-bridge source — one authoritative version', () =>
       site_schema: /site-level|site_schema/i,
       faq_schema: /faq-schema|faqpage/i,
       rating_schema: /rating-schema|aggregaterating/i,
+      organization_type: /organization type|organization-type|business type/i,
+      media_alt: /media alt text|media\/<id>\/alt/i,
+      conditional_writes: /conditional/i,
+      organization_address: /organization address/i,
     };
     assert.deepEqual(Object.keys(keywords).sort(), Object.keys(BRIDGE_CAPABILITY_MIN_VERSIONS).sort());
 

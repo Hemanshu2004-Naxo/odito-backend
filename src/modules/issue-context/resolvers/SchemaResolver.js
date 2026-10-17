@@ -1,6 +1,7 @@
 import { BaseResolver } from './BaseResolver.js';
 import { getFaqDetection } from '../../tasks/service/faqSchema.js';
 import { getRatingDetection } from '../../tasks/service/aggregateRatingSchema.js';
+import { analyzeOrganizations, flattenJsonLd, typeSatisfies, typesOf } from '../../schema-evidence/schemaGraph.js';
 
 /**
  * SchemaResolver
@@ -43,21 +44,38 @@ export class SchemaResolver extends BaseResolver {
 
       case 'organization_schema':
       case 'primary_organization_schema': {
-        const orgSchema = _findSchemaByType(structuredData, ['Organization', 'LocalBusiness']);
+        // The site's own entity in ANY form: root object, array, @graph node, "@type" as a string or an
+        // array (["Hospital","Organization"]), or a subtype such as Hospital/MedicalClinic. Comparing
+        // @type to a string used to report such a page as "no Organization", which produced a duplicate
+        // entity (with an invented logo URL) as the "fix".
+        const orgSchema = _findPrimaryOrganization(structuredData, pageData?.url);
+        // The detection already decided WHICH entity the finding is about (Organization vs LocalBusiness vs "the site
+        // already has one"). It travels with the issue context so the expected state, and later the recommendation, speak
+        // about the same entity instead of a hard-coded "Organization". Informational: the recommendation re-derives the
+        // intent from verified evidence and never trusts this hint for a fact.
+        const detectedSchemaIntent = onPageIssue?.context?.schema_intent || null;
+        const local = detectedSchemaIntent === 'local_business_schema';
+        const contextExtras = detectedSchemaIntent ? { contextExtras: { detectedSchemaIntent } } : {};
         if (orgSchema) {
           return {
             currentState: this._codeState(_prettyJson(orgSchema), 'json'),
-            expectedState: this._expectedState('Organization schema with name, url, logo, address, telephone, sameAs, @id'),
+            expectedState: this._expectedState(local
+              ? 'LocalBusiness (or a more specific subtype) schema with name, url, address, telephone, opening hours, @id'
+              : 'Organization schema with name, url, logo, address, telephone, sameAs, @id'),
+            ...contextExtras,
           };
         }
         return {
-          currentState: this._absentState('Organization schema'),
-          expectedState: this._expectedState('Complete Organization schema with name, url, logo, sameAs, @id'),
+          currentState: this._absentState(local ? 'LocalBusiness schema' : 'Organization schema'),
+          expectedState: this._expectedState(local
+            ? 'LocalBusiness (or a more specific subtype) schema with name, url, verified address, @id'
+            : 'Complete Organization schema with name, url, logo, sameAs, @id'),
+          ...contextExtras,
         };
       }
 
       case 'sameas_array': {
-        const orgSchema = _findSchemaByType(structuredData, ['Organization', 'LocalBusiness']);
+        const orgSchema = _findPrimaryOrganization(structuredData, pageData?.url);
         if (orgSchema) {
           const existingSameAs = orgSchema.sameAs;
           const hasSameAs = existingSameAs && (Array.isArray(existingSameAs) ? existingSameAs.length > 0 : Boolean(existingSameAs));
@@ -370,9 +388,18 @@ function _findSchemas(data) {
   return data;
 }
 
+// First entity whose @type (a string OR an array) is, or descends from, one of `types` -
+// searching arrays and @graph the same way the crawler stores them.
 function _findSchemaByType(data, types) {
-  if (!data || !Array.isArray(data)) return null;
-  return data.find(s => types.includes(s['@type'])) || null;
+  return flattenJsonLd(data).find((n) => typesOf(n).some((t) => types.some((x) => typeSatisfies(t, x)))) || null;
+}
+
+// The site's primary Organization/LocalBusiness entity (see schemaGraph.analyzeOrganizations):
+// a node whose own url is on another site is never picked.
+function _findPrimaryOrganization(data, pageUrl) {
+  let siteUrl;
+  try { siteUrl = pageUrl ? new URL(pageUrl).origin + '/' : undefined; } catch { siteUrl = undefined; }
+  return analyzeOrganizations(flattenJsonLd(data), { siteUrl }).primary;
 }
 
 function _prettyJson(obj) {

@@ -138,12 +138,77 @@ export class WordPressCoreAdapter extends SeoProviderAdapter {
       throw new WordPressConnectionError('FIELD_NOT_WRITABLE', 'This image could not be found in the WordPress media library.', 422);
     }
 
+    return this._putAltText(match.id, newAlt);
+  }
+
+  // ── Exact-target media access (used by the typed image-alt fix, ../mediaFix/) ───────────────────────────────────
+  // writeAltText() above finds a media item by file-name search + equality with its source_url. The typed fix instead
+  // identifies the attachment itself (imageIdentity.js) and then reads/writes THAT id only, so none of these methods searches
+  // for anything to write. Only the alt_text field is ever sent.
+
+  /** One PUT, one field: the single place an attachment's alt text is written. */
+  async _putAltText(attachmentId, newAlt) {
     const { status } = await wordPressService.wpRequest(this.connection, {
       method: 'PUT',
-      path: `/wp-json/wp/v2/media/${match.id}`,
+      path: `/wp-json/wp/v2/media/${attachmentId}`,
       data: { alt_text: newAlt },
     });
-    return { httpStatus: status, wordpressPostId: match.id };
+    return { httpStatus: status, wordpressPostId: attachmentId };
+  }
+
+  /** @returns {Promise<object|null>} the attachment as the authenticated user may edit it, or null when it does not exist. */
+  async readMediaById(attachmentId) {
+    const id = Number(attachmentId);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    const result = await wordPressService.wpRequest(this.connection, {
+      method: 'GET',
+      path: `/wp-json/wp/v2/media/${id}?context=edit&_fields=id,source_url,alt_text,caption,post,media_type,mime_type,media_details,modified_gmt`,
+      skipErrorClassification: true,
+    });
+    return this._mediaOrNull(result, 'attachment');
+  }
+
+  /** Candidate attachments for a search term (acceptance is decided by exact file equality, never by this search). */
+  async searchMedia(term, page = 1) {
+    if (typeof term !== 'string' || !term) return [];
+    const result = await wordPressService.wpRequest(this.connection, {
+      method: 'GET',
+      path: `/wp-json/wp/v2/media?context=edit&search=${encodeURIComponent(term)}&per_page=100&page=${Number(page) || 1}&_fields=id,source_url,alt_text,caption,post,media_type,mime_type,media_details,modified_gmt`,
+      skipErrorClassification: true,
+    });
+    if (result.status === 400) return []; // a page beyond the last one
+    const list = this._mediaOrNull(result, 'media library');
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** The page's raw (unrendered) content, to learn whether an image's alt is stored inside it. null when unreadable. */
+  async readPostRawContent(postType, postId) {
+    if (!/^[a-z0-9_-]+$/i.test(String(postType)) || !Number.isInteger(Number(postId))) return null;
+    const result = await wordPressService.wpRequest(this.connection, {
+      method: 'GET',
+      path: `/wp-json/wp/v2/${postType}/${Number(postId)}?context=edit&_fields=id,content`,
+      skipErrorClassification: true,
+    });
+    if (result.status === 401 || result.status === 403 || result.status === 404) return null;
+    const raw = result.data?.content?.raw;
+    return typeof raw === 'string' ? raw : null;
+  }
+
+  /** Writes ONLY alt_text of exactly this attachment. */
+  async writeAltTextForAttachment(attachmentId, newAlt) {
+    const id = Number(attachmentId);
+    if (!Number.isInteger(id) || id <= 0 || typeof newAlt !== 'string') {
+      throw new WordPressConnectionError('FIELD_NOT_WRITABLE', 'A valid attachment and alt text are required.', 422);
+    }
+    return this._putAltText(id, newAlt);
+  }
+
+  _mediaOrNull(result, what) {
+    if (result.status === 404) return null;
+    if (result.status === 401) throw new WordPressConnectionError('INVALID_CREDENTIALS', 'Invalid WordPress username or Application Password.', 401);
+    if (result.status === 403) throw new WordPressConnectionError('PERMISSION_DENIED', `This WordPress account may not edit the ${what}.`, 403);
+    if (result.status < 200 || result.status >= 300) throw new WordPressConnectionError('UNKNOWN_ERROR', `The ${what} could not be read from WordPress.`, 502);
+    return result.data;
   }
 }
 

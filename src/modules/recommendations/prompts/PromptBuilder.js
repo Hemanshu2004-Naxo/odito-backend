@@ -36,7 +36,9 @@
  */
 
 import { resolveGroup, resolveMaxTokens, GROUP } from './GroupRegistry.js';
+import { renderSchemaEvidence } from '../../schema-evidence/schemaEvidencePrompt.js';
 import { PROMPT_MODE } from '../context/RecommendationContextSchema.js';
+import { altImagesFromContext } from '../service/imageAltProposals.js';
 
 // Extended anti-hallucination block for entity-sensitive groups (7 & 8)
 const ANTI_HALLUCINATION_STRICT = `
@@ -675,7 +677,7 @@ ${OUTPUT_FORMAT}`;
   // The generated schema MUST be valid, complete, and page-specific.
 
   _group4_Schema(rc, ruleMetadata) {
-    const { identity, currentState, expectedState, pageContext, aiVisibilityContext, missingElementContext, contentContext, recommendationObjective: obj } = rc;
+    const { identity, currentState, expectedState, pageContext, aiVisibilityContext, missingElementContext, contentContext, schemaEvidence, recommendationObjective: obj } = rc;
     const issueId  = identity.issueId;
     const isAbsent = currentState.isAbsent;
     const fw       = pageContext.framework;
@@ -746,6 +748,13 @@ ${OUTPUT_FORMAT}`;
     lines.push(`SUCCESS: ${obj.successCriteria}`);
     lines.push(`PRESERVE: ${obj.preserveContext}`);
 
+    // Verified evidence (existing entity, verified logo, canonical URL, real hierarchy, article
+    // facts). Replaces "derive it from the title/URL" for everything it covers.
+    if (schemaEvidence) {
+      lines.push('');
+      lines.push(renderSchemaEvidence(schemaEvidence));
+    }
+
     const context = lines.join('\n');
 
     // Placement guidance only — it belongs in implementationNotes. The
@@ -786,7 +795,9 @@ RULES FOR SCHEMA GENERATION:
 1. Use Schema.org vocabulary only (https://schema.org)
 2. @context must be "https://schema.org"
 3. Use real values from the CONTEXT block — never placeholder values like "Your Brand Name" or "https://example.com"
-4. If brand/business details are not provided, derive from page URL and page title
+4. ${schemaEvidence
+      ? 'The VERIFIED SCHEMA EVIDENCE block is authoritative: copy its @id, @type, name, URLs, logo and dimensions exactly; never replace an existing value with your own; never output a URL, logo, phone, address or profile that is not listed there'
+      : 'If brand/business details are not provided, derive only the name and page URL from the page title and URL — never a logo, contact detail or profile URL'}
 5. Include every field of the schema type whose real value is in the CONTEXT block. If a required or recommended field's value is NOT in the CONTEXT (for example a street address or phone number), OMIT it from the JSON-LD — never invent a value or use a placeholder — and name it in "implementationNotes" as "needs your input: <field>"
 6. JSON must be valid — properly escaped, no trailing commas
 7. Implementation: ${schemaImplInstr}
@@ -854,13 +865,15 @@ ${OUTPUT_FORMAT}`;
 
 CONTEXT:
 PAGE URL: ${pageContext?.pageUrl || ''}
-ISSUE: breadcrumblist_schema — BreadcrumbList structured data is missing from this page (and, most likely, the whole site — breadcrumbs are a site-wide setting).
+${rc.schemaEvidence ? `${renderSchemaEvidence(rc.schemaEvidence)}\n` : ''}ISSUE: breadcrumblist_schema — BreadcrumbList structured data is missing from this page (and, most likely, the whole site — breadcrumbs are a site-wide setting).
 
 TASK:
 Explain why BreadcrumbList schema matters for search result display and site-hierarchy signals.
 For "recommendedVersion": output ONLY the exact literal string: enabled
   This is a closed, single-answer field — every current finding for this issue means the same fix (turn breadcrumbs on site-wide). Do not write anything else in this field — no explanation, no JSON.
-For "implementationCode": an example rendered BreadcrumbList JSON-LD snippet for THIS page's own URL hierarchy, for illustration only.
+For "implementationCode": ${rc.schemaEvidence
+      ? 'an example BreadcrumbList built ONLY from the verified hierarchy in the evidence block below (exact names, URLs and order; the last item is the page URL given there). If the hierarchy is UNKNOWN, do not write JSON-LD at all.'
+      : 'an example rendered BreadcrumbList JSON-LD snippet for THIS page\'s own URL hierarchy, for illustration only.'}
 
 ${OUTPUT_FORMAT}`;
   }
@@ -895,8 +908,12 @@ ${OUTPUT_FORMAT}`;
       }
       if (contentContext?.pageTitle) lines.push(`PAGE TITLE: "${contentContext.pageTitle}"`);
     } else if (currentState.tableRows?.length) {
-      lines.push(`DETECTED VIOLATIONS (${currentState.tableRows.length} items):`);
-      currentState.tableRows.slice(0, 6).forEach(r => {
+      // For alt text, a tracker is not an image to describe (the resolver already drops it; this keeps the prompt safe on its own).
+      const violations = issueId === 'images_missing_alt_text'
+        ? currentState.tableRows.filter(r => !r?.Image || altImagesFromContext({ currentState: { tableRows: [r] } }).length > 0)
+        : currentState.tableRows;
+      lines.push(`DETECTED VIOLATIONS (${violations.length} items):`);
+      violations.slice(0, 6).forEach(r => {
         lines.push(`  ${Object.entries(r).map(([k, v]) => `${k}: "${v}"`).join(' | ')}`);
       });
     } else if (currentState.listItems?.length) {
@@ -914,12 +931,34 @@ ${OUTPUT_FORMAT}`;
     lines.push(`FRAMEWORK: ${fw !== 'unknown' ? fw : pageContext.cms || 'HTML'}`);
     lines.push(`SUCCESS: ${obj.successCriteria}`);
 
+    if (issueId === 'images_missing_alt_text') {
+      const listed = altImagesFromContext(rc);
+      if (listed.length > 0) lines.push(...['', 'AFFECTED IMAGES (the ONLY images you may write alt text for; copy each URL exactly):', ...listed.map((u, i) => `  [${i + 1}] ${u}`)]);
+    }
+
     const context = lines.join('\n');
 
     const wcagRef = _wcagReference(issueId);
 
     let task;
-    if (isAbsent && issueId === 'images_missing_alt_text' && mec?.isRich) {
+    const altImages = issueId === 'images_missing_alt_text' ? altImagesFromContext(rc) : [];
+    if (altImages.length > 0) {
+      // One alt text per image, keyed by the image's EXACT URL, returned in a structured field the WordPress fix can reuse.
+      task = [
+        `Write alt text for EACH image in AFFECTED IMAGES below.`,
+        `You cannot see the pictures. Use ONLY what the CONTEXT shows: the image file name, the page title/topic and the business.`,
+        `  - Describe what the file name and page context say the image is. Do NOT invent people, products, places or text.`,
+        `  - A person's name may appear ONLY if it is in that image's file name or the page title.`,
+        `  - Plain text, under 125 characters, no "image of" / "photo of", no file names, no HTML.`,
+        `  - If the context does not support a description for an image, give "alt": null for it instead of guessing.`,
+        `For "recommendedVersion": the same alt texts, one per line as: <file name> -> <alt text>.`,
+        `For "implementationCode": example <img> tags using exactly these alt texts.`,
+        `ADDITIONAL REQUIRED FIELD in the same JSON object — "imageAlts": an array with ONE entry per image in AFFECTED IMAGES:`,
+        `  { "src": "<copied EXACTLY from AFFECTED IMAGES>", "alt": "<alt text or null>", "basis": "<which context value supports it, e.g. the file name>" }`,
+        `  Never include a src that is not listed. Never change a src.`,
+        `BE CONCISE: "issueAnalysis" at most 2 sentences, "implementationNotes" at most 4 short steps.`,
+      ].join('\n');
+    } else if (isAbsent && issueId === 'images_missing_alt_text' && mec?.isRich) {
       const topic = mec.primaryTopic || mec.serviceName || 'the page content';
       task = [
         `Generate contextual alt text for images on this page.`,
@@ -932,6 +971,10 @@ ${OUTPUT_FORMAT}`;
         `  BAD:  alt="image"  or  alt="photo"  or  alt="[describe image]"`,
         `  GOOD: alt="Naxonify team reviewing SEO audit results"  (references the actual business/topic)`,
         `For "implementationCode": example <img> tags with generated alt text`,
+        ``,
+        `BE CONCISE: exactly 3 examples, one short <img> tag each, no repeated content between`,
+        `"recommendedVersion" and "implementationCode", "implementationNotes" at most 4 short steps,`,
+        `"issueAnalysis" at most 2 sentences.`,
       ].join('\n');
     } else {
       task = [
@@ -1131,6 +1174,10 @@ ${OUTPUT_FORMAT}`;
     lines.push(`FRAMEWORK: ${fw !== 'unknown' ? fw : pageContext.cms || 'HTML'}`);
     lines.push('');
     lines.push(`SUCCESS: ${obj.successCriteria}`);
+    if (rc.schemaEvidence) {
+      lines.push('');
+      lines.push(renderSchemaEvidence(rc.schemaEvidence));
+    }
 
     const context = lines.join('\n');
 

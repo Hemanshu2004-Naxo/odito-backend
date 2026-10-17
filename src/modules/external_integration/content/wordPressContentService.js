@@ -316,4 +316,7 @@ export async function applyH1Change(connection, { pageUrl, value, expectedFinger
   };
 }
 
+/** Page read / content write primitives, shared with the Divi image-alt fix so both go through the same authenticated, same-site path. */
+export { readPage as readPageById, writeContent as writePageContent };
+
 export default { fingerprintOf, loadTargetPage, getH1Context, applyH1Change, restoreContent };

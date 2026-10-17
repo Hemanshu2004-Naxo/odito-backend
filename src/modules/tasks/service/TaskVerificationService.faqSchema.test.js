@@ -111,6 +111,26 @@ describe('TaskVerificationService — faq_schema value_diff', () => {
     assert.equal((await Task.findById(task._id)).status, 'verified_fixed');
   });
 
+  test('DUPLICATE: the right pairs rendered by TWO FAQPage entities (e.g. a theme/plugin plus the Bridge) -> reopened, never verified', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+
+    const pageUrl = 'https://example.com/faq-duplicate';
+    await mongoose.connection.db.collection('seo_page_data').insertOne({
+      projectId, url: pageUrl,
+      structured_data: [buildFaqPageJsonLd(PAIRS), { '@context': 'https://schema.org', '@graph': [{ '@type': 'WebPage' }, buildFaqPageJsonLd(PAIRS)] }],
+      faq_howto_signals: { faq_pairs: PAIRS },
+    });
+    const task = await createFaqTask(projectId, pageUrl);
+
+    const result = await taskVerificationService.verifyImplementedTasks(projectId, 'FAQ-DUPLICATE');
+    assert.equal(result.reopened, 1);
+    const saved = await Task.findById(task._id);
+    assert.equal(saved.status, 'reopened');
+    const latest = saved.fixHistory[saved.fixHistory.length - 1];
+    assert.equal(latest.verification.matched, false);
+    assert.equal(latest.verification.after?.value?.faqEntityCount, 2, 'the diagnostic says why');
+  });
+
   test('issue gone but the schema does NOT match the generated pairs (an answer differs) -> reopened, matched:false', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
 

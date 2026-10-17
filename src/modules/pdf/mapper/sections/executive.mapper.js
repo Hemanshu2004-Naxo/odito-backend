@@ -138,7 +138,7 @@ export class ExecutiveMapper {
       
       // Fetch top issues directly from database
       const issues = await db.collection('seo_page_issues')
-        .find({ projectId: projectIdObj })
+        .find({ projectId: projectIdObj, status: { $ne: 'excluded' } })
         .sort({ severity: -1, page_url: 1 })
         .limit(50)
         .toArray();

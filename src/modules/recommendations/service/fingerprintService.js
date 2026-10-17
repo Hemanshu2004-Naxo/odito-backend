@@ -118,6 +118,12 @@ class FingerprintService {
       // No URL and no rawValue: truly global fingerprint (acceptable last resort)
     }
 
+    // Schema recommendations are generated from verified evidence (existing entity, verified logo,
+    // canonical URL, hierarchy). A cached recommendation built without it (or from different
+    // evidence) may contain values that are now known to be wrong, so the evidence is part of the key.
+    const evidenceKey = recommendationContext?.schemaEvidence?.fingerprintKey;
+    if (evidenceKey) base.push(`ev:${evidenceKey}`);
+
     return crypto.createHash('sha256').update(base.join('|')).digest('hex');
   }
 

@@ -29,7 +29,7 @@ describe('oditoSeoBridgeService.getBridgeStatus()', () => {
   test('a 404 (route not found) means the Bridge is not installed — never thrown as an error', async () => {
     mockWpRequest(async () => ({ status: 404, data: { code: 'rest_no_route', message: 'No route was found.' } }));
     const result = await oditoSeoBridgeService.getBridgeStatus(fakeConnection);
-    assert.deepEqual(result, { installed: false, provider: 'none', providers: [], bridgeVersion: null, siteSchemaSupported: false, faqSchemaSupported: false, ratingSchemaSupported: false });
+    assert.deepEqual(result, { installed: false, provider: 'none', providers: [], bridgeVersion: null, siteSchemaSupported: false, faqSchemaSupported: false, ratingSchemaSupported: false, organizationTypeSupported: false, organizationAddressSupported: false, mediaAltSupported: false, conditionalWritesSupported: false });
   });
 
   test('a 200 with a single provider is reported installed with that provider', async () => {
@@ -38,7 +38,7 @@ describe('oditoSeoBridgeService.getBridgeStatus()', () => {
       data: { installed: true, bridge_version: '1.0.0', provider: 'yoast', providers: ['yoast'], wordpress_version: '6.6' },
     }));
     const result = await oditoSeoBridgeService.getBridgeStatus(fakeConnection);
-    assert.deepEqual(result, { installed: true, provider: 'yoast', providers: ['yoast'], bridgeVersion: '1.0.0', siteSchemaSupported: false, faqSchemaSupported: false, ratingSchemaSupported: false });
+    assert.deepEqual(result, { installed: true, provider: 'yoast', providers: ['yoast'], bridgeVersion: '1.0.0', siteSchemaSupported: false, faqSchemaSupported: false, ratingSchemaSupported: false, organizationTypeSupported: false, organizationAddressSupported: false, mediaAltSupported: false, conditionalWritesSupported: false });
   });
 
   test('a Bridge version reporting supports.site_schema is surfaced as siteSchemaSupported', async () => {
@@ -367,8 +367,9 @@ describe('oditoSeoBridgeService.getSiteSchema() / updateSiteSchemaField()', () =
     const result = await oditoSeoBridgeService.getSiteSchema(fakeConnection);
     assert.deepEqual(result, {
       provider: 'rank_math',
+      operation: null,
       organization: {
-        name: 'Naxonify', description: '', url: 'https://naxonify.com', logo: '',
+        name: 'Naxonify', description: '', url: 'https://naxonify.com', logo: '', type: '', kind: '', hasAddress: false, address: {}, localSeoActive: false,
         sameAs: ['https://twitter.com/naxonify', 'https://linkedin.com/company/naxonify'],
         protectedSameAs: ['https://twitter.com/naxonify'],
         additionalSameAs: ['https://linkedin.com/company/naxonify'],
@@ -381,7 +382,7 @@ describe('oditoSeoBridgeService.getSiteSchema() / updateSiteSchemaField()', () =
     mockWpRequest(async () => ({ status: 200, data: { provider: 'rank_math' } }));
     const result = await oditoSeoBridgeService.getSiteSchema(fakeConnection);
     assert.deepEqual(result.organization, {
-      name: '', description: '', url: '', logo: '', sameAs: [], protectedSameAs: [], additionalSameAs: [],
+      name: '', description: '', url: '', logo: '', type: '', kind: '', hasAddress: false, address: {}, localSeoActive: false, sameAs: [], protectedSameAs: [], additionalSameAs: [],
     });
     assert.deepEqual(result.breadcrumbs, { enabled: false });
   });
@@ -527,5 +528,63 @@ describe('oditoSeoBridgeService AggregateRating schema read/write', () => {
   test('writeRatingSchema: Bridge validation rejection (400) -> WRITE_FAILED', async () => {
     mockWpRequest(async () => ({ status: 400, data: { message: 'A valid rating is required.' } }));
     await assert.rejects(() => oditoSeoBridgeService.writeRatingSchema(fakeConnection, 42, node), (e) => e instanceof WordPressConnectionError && e.code === 'WRITE_FAILED');
+  });
+});
+
+describe('oditoSeoBridgeService — conditional media alt write and conflict reasons (Bridge 1.5.0)', () => {
+  const conflict = (reason) => ({ status: 409, data: { code: 'odito_conflict', message: 'x', data: { status: 409, reason } } });
+
+  test('swapMediaAlt PUTs only value, expected and expectedFile to the attachment-scoped route — no field name, no meta key', async () => {
+    const calls = [];
+    mockWpRequest(async (_c, opts) => { calls.push(opts); return { status: 200, data: { id: 7, alt: 'New', file: '2026/10/a.png', operation: { id: 'op-1', atomic: true, alreadyApplied: false, created: false } } }; });
+    const result = await oditoSeoBridgeService.swapMediaAlt(fakeConnection, 7, { value: 'New', expected: '', expectedFile: '2026/10/a.png' });
+    assert.equal(calls[0].method, 'PUT');
+    assert.equal(calls[0].path, '/wp-json/odito/v1/media/7/alt');
+    assert.deepEqual(Object.keys(calls[0].data).sort(), ['expected', 'expectedFile', 'value']);
+    assert.deepEqual(result, { id: 7, alt: 'New', file: '2026/10/a.png', operation: { id: 'op-1', atomic: true, alreadyApplied: false, created: false, attempts: null } });
+  });
+
+  test('swapMediaAlt refuses a non-positive or non-numeric attachment id before any request is made', async () => {
+    const spy = mockWpRequest(async () => ({ status: 200, data: {} }));
+    for (const bad of [0, -1, 'abc', 1.5, null, undefined]) {
+      await assert.rejects(() => oditoSeoBridgeService.swapMediaAlt(fakeConnection, bad, { value: 'x', expected: '', expectedFile: 'f' }), (e) => e instanceof WordPressConnectionError);
+    }
+    assert.equal(spy.mock.callCount(), 0);
+  });
+
+  test('a 409 odito_conflict is CONFLICT and carries the machine reason', async () => {
+    for (const reason of ['expected_mismatch', 'target_changed', 'ambiguous_meta', 'contention']) {
+      mockWpRequest(async () => conflict(reason));
+      await assert.rejects(() => oditoSeoBridgeService.swapMediaAlt(fakeConnection, 7, { value: 'x', expected: '', expectedFile: 'f' }), (e) => e.code === 'CONFLICT' && e.reason === reason);
+      mock.restoreAll();
+    }
+  });
+
+  test('an unknown or malformed conflict reason falls back to expected_mismatch (never echoed back)', async () => {
+    mockWpRequest(async () => conflict('<script>alert(1)</script>'));
+    await assert.rejects(() => oditoSeoBridgeService.swapMediaAlt(fakeConnection, 7, { value: 'x', expected: '', expectedFile: 'f' }), (e) => e.code === 'CONFLICT' && e.reason === 'expected_mismatch' && !/script/.test(e.message));
+  });
+
+  test('a 409 without odito_conflict is still the multi-plugin error, not a conflict', async () => {
+    mockWpRequest(async () => ({ status: 409, data: { code: 'odito_ambiguous', message: 'Multiple SEO plugins' } }));
+    await assert.rejects(() => oditoSeoBridgeService.readMediaAlt(fakeConnection, 7), (e) => e.code === 'PLUGIN_NOT_SUPPORTED');
+  });
+
+  test('a permission failure on the attachment is PERMISSION_DENIED', async () => {
+    mockWpRequest(async () => ({ status: 403, data: { code: 'odito_permission_denied', message: 'no' } }));
+    await assert.rejects(() => oditoSeoBridgeService.swapMediaAlt(fakeConnection, 7, { value: 'x', expected: '', expectedFile: 'f' }), (e) => e.code === 'PERMISSION_DENIED');
+  });
+
+  test('updateSiteSchemaField exposes the Bridge operation record (id, atomic, attempts) for the ledger', async () => {
+    mockWpRequest(async () => ({ status: 200, data: { provider: 'rank_math', operation: { id: 'op-2', atomic: true, attempts: 2, field: 'name' }, organization: {}, breadcrumbs: {} } }));
+    const result = await oditoSeoBridgeService.updateSiteSchemaField(fakeConnection, 'organization', 'name', 'A', null, { expected: '' });
+    assert.deepEqual(result.operation, { id: 'op-2', atomic: true, alreadyApplied: false, created: false, attempts: 2 });
+  });
+
+  test('getBridgeStatus reports mediaAltSupported from supports.media_alt', async () => {
+    mockWpRequest(async () => ({ status: 200, data: { provider: 'rank_math', providers: ['rank_math'], version: '1.5.0', supports: { site_schema: true, media_alt: true } } }));
+    assert.equal((await oditoSeoBridgeService.getBridgeStatus(fakeConnection)).mediaAltSupported, true);
+    mockWpRequest(async () => ({ status: 200, data: { provider: 'rank_math', providers: ['rank_math'], version: '1.4.0', supports: { site_schema: true } } }));
+    assert.equal((await oditoSeoBridgeService.getBridgeStatus(fakeConnection)).mediaAltSupported, false);
   });
 });

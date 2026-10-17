@@ -162,6 +162,9 @@ class RecommendationContextBuilder {
       technicalContext,
       aiVisibilityContext,
       missingElementContext,
+      // Verified facts about the page's Organization / breadcrumb trail / article (schema-evidence/).
+      // Null for every issue type that does not emit those schemas.
+      schemaEvidence: issueContext.schemaEvidence || null,
       recommendationObjective: objective,
       builderMeta: {
         version:                CONTEXT_VERSION,
@@ -406,6 +409,8 @@ class RecommendationContextBuilder {
       cs.displayType                  || '',
       typeof rawVal === 'string' ? rawVal.slice(0, 200) : JSON.stringify(rawVal).slice(0, 200),
       issueContext.metadata?.readinessScore ?? '',
+      // A different verified logo / canonical / hierarchy must never be served a context built without it.
+      issueContext.schemaEvidence?.fingerprintKey ?? '',
     ];
     return crypto.createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 32);
   }

@@ -129,7 +129,7 @@ export class CoverPageService {
       const rows = await db
         .collection('seo_page_issues')
         .aggregate([
-          { $match: { projectId: projectIdObj } },
+          { $match: { projectId: projectIdObj, status: { $ne: 'excluded' } } },
           {
             $group: {
               _id: null,
@@ -171,7 +171,7 @@ export class CoverPageService {
       // Use correct aggregation pipeline matching executive summary
       const issueCounts = await db.collection('seo_page_issues')
         .aggregate([
-          { $match: { projectId: projectIdObj } },
+          { $match: { projectId: projectIdObj, status: { $ne: 'excluded' } } },
           {
             $group: {
               _id: null,

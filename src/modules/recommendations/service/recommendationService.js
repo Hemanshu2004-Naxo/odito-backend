@@ -10,6 +10,20 @@ import RecommendationContextBuilder from '../context/RecommendationContextBuilde
 import ValidatorRegistry     from '../validators/ValidatorRegistry.js';
 import ConfidenceCalculator  from '../normalizers/ConfidenceCalculator.js';
 import IssueContextEngine    from '../../issue-context/service/IssueContextEngine.js';
+import schemaEvidenceService from '../../schema-evidence/schemaEvidenceService.js';
+import { applyGuardToSections } from '../../schema-evidence/schemaOutputGuard.js';
+import { summarizeSchemaEvidence } from '../../schema-evidence/schemaEvidence.js';
+import { markBreadcrumbEvidenceRegenerated } from '../../schema-evidence/breadcrumbEvidenceStore.js';
+import schemaValidator from '../validators/SchemaValidator.js';
+import {
+  BreadcrumbRecommendationError,
+  breadcrumbFingerprint,
+  buildBreadcrumbSections,
+} from './breadcrumbRecommendation.js';
+import {
+  OrganizationRecommendationError, ORGANIZATION_INTENT_ISSUES, organizationFingerprint, buildOrganizationSections,
+} from './organizationRecommendation.js';
+import { buildOrganizationAddressContract } from './organizationAddressContract.js';
 import { isKnownIssue }      from '../../issue-context/service/ResolverRegistry.js';
 import {
   RatingRecommendationError,
@@ -24,6 +38,9 @@ import {
   buildFaqSchemaSections,
   faqSchemaFingerprint,
 } from './faqSchemaRecommendation.js';
+import { assertAltFindingActionable } from './imageAltScope.js';
+import { assertSameAsEntityUsable, sameAsFingerprint, buildSameAsSections, SAMEAS_RECOMMENDATION_VERSION } from './sameAsRecommendation.js';
+import { discoverSameAsProfiles } from '../../schema-evidence/sameAs/sameAsDiscovery.js';
 import {
   AccessibilityRecommendationError,
   accessibilityFingerprint,
@@ -81,7 +98,24 @@ class RecommendationService {
    * @param {Object} [params.ruleMetadata] - { title, description, recommendation, category, severity }
    * @returns {Promise<Object>} { recommendation, source, cached }
    */
-  async getOrGenerate({ projectId, issueId, pageUrl = null, issueSource = null, ruleMetadata = {}, issueContext = null, auditId = null }) {
+  async getOrGenerate(params) {
+    const holder = { evidence: null };
+    const result = await this._getOrGenerate({ ...params, _holder: holder });
+    // Additive: a small, serialisable slice of the verified schema evidence (e.g. which breadcrumb state to show).
+    if (holder.evidence && result && typeof result === 'object') {
+      result.schemaEvidence = summarizeSchemaEvidence(holder.evidence);
+      // The typed, validated address contract (what is missing, the evidence, the exact proposal, the diff and the action to
+      // offer). Derived from the same evidence on every response — also for a cached recommendation — never from model text.
+      const org = result.schemaEvidence.organization;
+      if (org?.intent?.addressDemand) {
+        org.addressFix = buildOrganizationAddressContract({ evidence: holder.evidence, projectId: params.projectId, issueId: params.issueId });
+      }
+    }
+    return result;
+  }
+
+  /** @private — see getOrGenerate() */
+  async _getOrGenerate({ projectId, issueId, pageUrl = null, issueSource = null, ruleMetadata = {}, issueContext = null, auditId = null, _holder = null }) {
     const startTime = Date.now();
     const isDev = process.env.NODE_ENV !== 'production';
 
@@ -162,6 +196,16 @@ class RecommendationService {
       });
     }
 
+    // ── sameas_array: deterministic from DISCOVERED profile links, never LLM-guessed ─────────────────────────────
+    // The model has nothing in its context that can confirm a profile URL, so it used to answer "not provided in context". The
+    // profile links come from the site's own markup and pages (schema-evidence/sameAs/); the recommended structured data is the
+    // Organization the site already publishes with only sameAs added. Kill switch: ODITO_SAMEAS_DETERMINISTIC=0.
+    if (issueId === 'sameas_array' && process.env.ODITO_SAMEAS_DETERMINISTIC !== '0' && pageUrl) {
+      return this._generateSameAsRecommendation({
+        projectId, pageUrl, context, sampleUrls, resolvedSource, ruleMetadata, startTime,
+      });
+    }
+
     // ── Step 1b: Resolve IssueContext if not provided by caller ──────────────
     // When the frontend doesn't send issueContext (the common case), we resolve
     // it server-side using IssueContextEngine.  This gives ConfidenceCalculator
@@ -186,6 +230,11 @@ class RecommendationService {
       }
     }
 
+    // ── images_missing_alt_text whose only flagged "image" was an analytics tracker: nothing to describe ──────────────
+    // Refused deterministically (nothing generated, nothing stored, no model call): the model would otherwise invent image
+    // names and alt texts for a picture that does not exist.
+    if (issueId === 'images_missing_alt_text') assertAltFindingActionable(resolvedIssueContext);
+
     // Guard: patch empty identity.issueId from the service-level issueId.
     // Happens when the frontend sends the API response wrapper { success, data, meta }
     // instead of just the data payload, or sends a stale/partial IssueContext object.
@@ -199,6 +248,51 @@ class RecommendationService {
         ...resolvedIssueContext,
         identity: { ...(resolvedIssueContext.identity || {}), issueId },
       };
+    }
+
+    // ── Step 1b-2: Verified schema evidence ─────────────────────────────────────
+    // Organization / Article / BreadcrumbList recommendations are built from facts ODITO can
+    // prove (the site's existing entity, a logo that was actually fetched and measured, the
+    // canonical URL, the real breadcrumb hierarchy) instead of asking the model to supply a
+    // logo URL it cannot know. Applies to legacy rule ids and V2 hub ids alike. Non-fatal: with
+    // no evidence the prompt says so and the generator omits what it cannot prove.
+    if (resolvedIssueContext && pageUrl && schemaEvidenceService.appliesTo(issueId)) {
+      try {
+        const schemaEvidence = await schemaEvidenceService.collectSchemaEvidence({ projectId, issueId, pageUrl });
+        if (schemaEvidence) {
+          resolvedIssueContext = { ...resolvedIssueContext, schemaEvidence };
+          if (_holder) _holder.evidence = schemaEvidence;
+          console.log(`[RECOMMENDATION] Schema evidence | kinds=${schemaEvidence.kinds.join(',')} | orgPresent=${schemaEvidence.organization.present} | logo=${schemaEvidence.organization.logo.status} | breadcrumb=${schemaEvidence.breadcrumb.hierarchy.status} | article=${schemaEvidence.article.applicable}`);
+        }
+      } catch (evErr) {
+        console.warn(`[RECOMMENDATION] Schema evidence failed (non-fatal): ${evErr.message}`);
+      }
+    }
+
+    // ── breadcrumblist_schema with an owner-confirmed hierarchy: deterministic, never LLM-generated ──
+    // The trail is fully determined by the names/URLs the owner confirmed (and the canonical ODITO verified), so
+    // the model is not involved at all. A page that ALREADY outputs a BreadcrumbList is a "conflict" and is
+    // deliberately not handled here: generating a second entity would duplicate it, so it falls through to the
+    // normal path, where the output guard drops any BreadcrumbList and the UI explains the conflict.
+    if (issueId === 'breadcrumblist_schema' && resolvedIssueContext?.schemaEvidence?.breadcrumb?.hierarchy?.status === 'user_provided') {
+      return this._generateBreadcrumbFromUserEvidence({
+        projectId, pageUrl, context, sampleUrls, resolvedSource, ruleMetadata, startTime,
+        evidence: resolvedIssueContext.schemaEvidence,
+      });
+    }
+
+    // ── organization_schema / primary_organization_schema: deterministic from the SCHEMA INTENT ──────────
+    // Which entity to recommend (Organization / LocalBusiness / Hospital / reuse the existing one / ask for a missing
+    // fact) is decided from verified evidence — the page's markup, the site's entity and a Business Profile that matches
+    // this website — not by the model and not by a constant. Without an intent (no evidence could be collected) the
+    // normal path below still runs, with the original objective.
+    // Kill switch: ODITO_ORG_SCHEMA_DETERMINISTIC=0 sends these issues back through the model path (the guard and the
+    // validator still enforce the schema intent there).
+    if (process.env.ODITO_ORG_SCHEMA_DETERMINISTIC !== '0' && ORGANIZATION_INTENT_ISSUES.has(issueId) && pageUrl && resolvedIssueContext?.schemaEvidence?.organization?.intent) {
+      return this._generateOrganizationFromIntent({
+        projectId, issueId, pageUrl, context, sampleUrls, resolvedSource, ruleMetadata, startTime,
+        evidence: resolvedIssueContext.schemaEvidence,
+      });
     }
 
     // ── Step 1c: Build RecommendationContext (context layer, Phase 2) ──────────
@@ -332,6 +426,132 @@ class RecommendationService {
       projectId, fingerprint, recommendationHash, issueId,
       context, sampleUrls, ruleMetadata, resolvedSource, startTime, pageUrl,
     });
+  }
+
+  /**
+   * breadcrumblist_schema built from the hierarchy the site owner confirmed. Everything goes through the same
+   * safety pipeline as any generated schema — the output guard, then SchemaValidator against the evidence — and
+   * a failure stores nothing. Re-requesting the same hierarchy is served from the existing record (same
+   * fingerprint); it never creates a second one. Does not touch any Task: generating code is not implementing it.
+   * @private
+   */
+  async _generateBreadcrumbFromUserEvidence({ projectId, pageUrl, context, sampleUrls, resolvedSource, ruleMetadata, startTime, evidence }) {
+    const fingerprint = breadcrumbFingerprint(projectId, pageUrl, evidence);
+    const recommendationHash = fingerprintService.computeRecommendationHash(fingerprint, 1, RECOMMENDATION_VERSION, null);
+
+    const cached = await Recommendation.findValid(projectId, fingerprint, RECOMMENDATION_VERSION);
+    if (cached && fingerprintService.isValid(cached, recommendationHash)) {
+      return {
+        recommendation: this._formatOutput(cached),
+        source: GENERATION_SOURCE.TEMPLATE,
+        cached: true,
+        generationTimeMs: Date.now() - startTime,
+      };
+    }
+
+    const built = buildBreadcrumbSections(evidence);
+    const { sections } = applyGuardToSections(built, evidence);
+    const validation = schemaValidator.validate(sections, {
+      identity: { issueId: 'breadcrumblist_schema' },
+      pageContext: { pageUrl: evidence.url.display },
+      schemaEvidence: evidence,
+    });
+    if (!validation.valid || !validation.satisfiesConstraint) {
+      throw new BreadcrumbRecommendationError(
+        'BREADCRUMB_OUTPUT_INVALID',
+        `The generated BreadcrumbList did not pass validation, so it was not saved: ${validation.errors.join(' ')}`
+      );
+    }
+
+    const stored = await this._store({
+      projectId, fingerprint, recommendationHash, issueId: 'breadcrumblist_schema', context,
+      sampleUrls, sections, generatedBy: GENERATION_SOURCE.TEMPLATE,
+      templateVersion: 1, ruleMetadata, resolvedSource, pageUrl,
+    });
+    await markBreadcrumbEvidenceRegenerated(projectId, pageUrl);
+
+    console.log(`[RECOMMENDATION] ✓ BreadcrumbList built deterministically from owner-confirmed hierarchy | items=${evidence.breadcrumb.hierarchy.items.length} | page=${pageUrl}`);
+    return {
+      recommendation: this._formatOutput(stored),
+      source: GENERATION_SOURCE.TEMPLATE,
+      cached: false,
+      generationTimeMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * organization_schema built from the schema intent. Same safety pipeline as every generated schema — output guard,
+   * then SchemaValidator against the evidence — and a failure stores nothing. The cache key includes the intent, so a
+   * recommendation made under a different intent (or before a fact appeared on the site) is never served; older
+   * entries are simply bypassed, never deleted. Does not touch any Task.
+   * @private
+   */
+  async _generateOrganizationFromIntent({ projectId, issueId, pageUrl, context, sampleUrls, resolvedSource, ruleMetadata, startTime, evidence }) {
+    const fingerprint = organizationFingerprint(projectId, pageUrl, evidence);
+    const recommendationHash = fingerprintService.computeRecommendationHash(fingerprint, 1, RECOMMENDATION_VERSION, null);
+
+    const cached = await Recommendation.findValid(projectId, fingerprint, RECOMMENDATION_VERSION);
+    if (cached && fingerprintService.isValid(cached, recommendationHash)) {
+      return { recommendation: this._formatOutput(cached), source: GENERATION_SOURCE.TEMPLATE, cached: true, generationTimeMs: Date.now() - startTime };
+    }
+
+    const built = buildOrganizationSections(evidence);
+    let sections = built;
+    // An address finding is validated by its own strict contract inside buildOrganizationSections (the proposal must be
+    // traceable to evidence and the entity must differ only by its address). The generic validator below is for whole
+    // generated entities and would judge, and strip, properties the site already has: the opposite of a minimal change.
+    if (evidence.organization.intent.action === 'generate' && !evidence.organization.intent.addressDemand) {
+      sections = applyGuardToSections(built, evidence).sections;
+      const validation = schemaValidator.validate(sections, {
+        identity: { issueId },
+        pageContext: { pageUrl: evidence.url.display },
+        schemaEvidence: evidence,
+      });
+      if (!validation.valid || !validation.satisfiesConstraint) {
+        throw new OrganizationRecommendationError(
+          'ORGANIZATION_OUTPUT_INVALID',
+          `The generated ${evidence.organization.intent.type} markup did not pass validation, so it was not saved: ${validation.errors.join(' ')}`
+        );
+      }
+    }
+
+    const stored = await this._store({
+      projectId, fingerprint, recommendationHash, issueId, context,
+      sampleUrls, sections, generatedBy: GENERATION_SOURCE.TEMPLATE,
+      templateVersion: 1, ruleMetadata, resolvedSource, pageUrl,
+    });
+
+    const i = evidence.organization.intent;
+    console.log(`[RECOMMENDATION] ✓ ${i.type} recommendation built deterministically | intent=${i.intent} | action=${i.action} | scope=${i.scope} | page=${pageUrl}`);
+    return { recommendation: this._formatOutput(stored), source: GENERATION_SOURCE.TEMPLATE, cached: false, generationTimeMs: Date.now() - startTime };
+  }
+
+  /**
+   * sameas_array recommendation built from discovered, evidence-backed profile links (see sameAsRecommendation.js). Throws
+   * SameAsRecommendationError (nothing stored) when there is no single Organization entity to attach them to.
+   * @private
+   */
+  async _generateSameAsRecommendation({ projectId, pageUrl, context, sampleUrls, resolvedSource, ruleMetadata, startTime }) {
+    const discovery = await discoverSameAsProfiles({ projectId, pageUrl });
+    assertSameAsEntityUsable(discovery);
+
+    const fingerprint = sameAsFingerprint(projectId, pageUrl, discovery);
+    const recommendationHash = fingerprintService.computeRecommendationHash(fingerprint, 1, RECOMMENDATION_VERSION, null);
+
+    const cached = await Recommendation.findValid(projectId, fingerprint, RECOMMENDATION_VERSION);
+    if (cached && fingerprintService.isValid(cached, recommendationHash)) {
+      return { recommendation: this._formatOutput(cached), source: GENERATION_SOURCE.TEMPLATE, cached: true, generationTimeMs: Date.now() - startTime };
+    }
+
+    const sections = buildSameAsSections(discovery);
+    const stored = await this._store({
+      projectId, fingerprint, recommendationHash, issueId: 'sameas_array', context,
+      sampleUrls, sections, generatedBy: GENERATION_SOURCE.TEMPLATE,
+      templateVersion: SAMEAS_RECOMMENDATION_VERSION, ruleMetadata, resolvedSource, pageUrl,
+    });
+
+    console.log(`[RECOMMENDATION] ✓ sameAs recommendation built deterministically | state=${discovery.state} | candidates=${discovery.candidates.length} | page=${pageUrl}`);
+    return { recommendation: this._formatOutput(stored), source: GENERATION_SOURCE.TEMPLATE, cached: false, generationTimeMs: Date.now() - startTime };
   }
 
   /**
@@ -490,9 +710,21 @@ class RecommendationService {
         }
 
         // ── Step 2: Normalize output → sections ────────────────────────────
-        const sections = recommendationNormalizer.normalize(
+        let sections = recommendationNormalizer.normalize(
           claudeResult.rawOutput, context, ruleMetadata, recommendationContext
         );
+
+        // ── Step 2b: Schema output guard ───────────────────────────────────
+        // Anything the model wrote that is not backed by the site's own markup or a verified
+        // asset (an unfetchable logo, an invented phone/address/profile, an unverified date,
+        // a breadcrumb parent that does not exist) is removed and reported, never published.
+        if (recommendationContext?.schemaEvidence) {
+          const guarded = applyGuardToSections(sections, recommendationContext.schemaEvidence);
+          sections = guarded.sections;
+          if (guarded.report?.removed?.length) {
+            console.log(`[SCHEMA_GUARD] rule=${issueId} | removed=${guarded.report.removed.map((r) => `${r.node}.${r.field}`).join(', ')}`);
+          }
+        }
 
         // ── Step 3: Structural section integrity check ─────────────────────
         const structuralValidation = recommendationValidator.validate(sections);
@@ -760,6 +992,12 @@ class RecommendationService {
    * @private
    */
   _isLowQualityCacheEntry(cached) {
+    // An alt-text recommendation made before per-image proposals existed cannot feed the WordPress image fix: regenerate it
+    // (once; the new one always carries the field, even when empty).
+    if (cached.ruleId === 'images_missing_alt_text' && cached.sections?.imageAltProposals === undefined) {
+      return true;
+    }
+
     // Explicit fallback source
     if (cached.generatedBy === GENERATION_SOURCE.FALLBACK || cached.generatedBy === 'fallback') {
       return true;
@@ -846,6 +1084,8 @@ class RecommendationService {
         recommendedVersion:    s.recommendedVersion    || null,
         contentRewrite:        s.contentRewrite        || null,
       },
+      // images_missing_alt_text: structured per-image proposals (null for every other recommendation and for older alt ones).
+      imageAltProposals: s.imageAltProposals || null,
       // Phase 3 extended fields (surface at top level for frontend convenience)
       beforeState:       s.beforeState       || null,
       afterState:        s.afterState        || null,

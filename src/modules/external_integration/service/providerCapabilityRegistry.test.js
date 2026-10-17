@@ -25,15 +25,30 @@ describe('providerCapabilityRegistry — supported fields', () => {
     }
   });
 
-  test('listSupportedFields() returns exactly the 9 supported fields', () => {
+  test('listSupportedFields() returns exactly the 10 supported fields', () => {
     assert.deepEqual(
       listSupportedFields().sort(),
-      ['aggregate_rating', 'breadcrumb_schema', 'canonical', 'faq_schema', 'h1', 'meta_description', 'robots', 'same_as', 'title']
+      ['aggregate_rating', 'breadcrumb_schema', 'canonical', 'faq_schema', 'h1', 'meta_description', 'organization_schema', 'robots', 'same_as', 'title']
     );
   });
 
-  test('every supported field declares a normalizeRecommendation and valuesMatch function', () => {
-    for (const field of listSupportedFields()) {
+  test('organization_schema is a TYPED multi-field fix: Rank Math only, site-scoped, gated on a Bridge capability, verified at both levels', () => {
+    const c = CAPABILITY_REGISTRY.organization_schema;
+    assert.equal(c.supported, true);
+    assert.equal(c.typedFix, true);
+    assert.equal(c.scope, 'site');
+    assert.equal(c.provider, 'rank_math');
+    assert.equal(c.minBridgeCapability, 'organization_type');
+    assert.deepEqual(c.issueCodes, ['organization_schema']);
+    assert.deepEqual(c.bridgeField.fields, ['name', 'logo', 'type', 'address']);
+    assert.deepEqual(c.fieldMinBridgeCapability, { address: 'organization_address' });
+    assert.equal(c.immediateVerificationSupported, true);
+    assert.equal(c.crawlerVerificationSupported, true);
+    assert.equal(typeof c.normalizeRecommendation, 'undefined', 'its value is planned from evidence, never parsed from recommendation text');
+  });
+
+  test('every single-value supported field declares a normalizeRecommendation and valuesMatch function', () => {
+    for (const field of listSupportedFields().filter((f) => !CAPABILITY_REGISTRY[f].typedFix)) {
       const capability = CAPABILITY_REGISTRY[field];
       assert.equal(typeof capability.normalizeRecommendation, 'function', `${field} missing normalizeRecommendation`);
       assert.equal(typeof capability.valuesMatch, 'function', `${field} missing valuesMatch`);
@@ -115,7 +130,7 @@ describe('providerCapabilityRegistry — aggregate_rating', () => {
 });
 
 describe('providerCapabilityRegistry — remaining schema gaps are honestly unsupported, not fabricated', () => {
-  const unsupportedFields = ['organization_schema', 'person_schema'];
+  const unsupportedFields = ['person_schema'];
 
   test('every remaining unsupported field has a real, non-empty reason', () => {
     for (const field of unsupportedFields) {
@@ -125,10 +140,6 @@ describe('providerCapabilityRegistry — remaining schema gaps are honestly unsu
       assert.equal(typeof capability.unsupportedReason, 'string');
       assert.ok(capability.unsupportedReason.length > 20, `${field}'s unsupportedReason should be a real explanation, not a stub`);
     }
-  });
-
-  test('organization_schema has no issue codes — nothing routes a real issue to it', () => {
-    assert.deepEqual(CAPABILITY_REGISTRY.organization_schema.issueCodes, []);
   });
 
   test('person_schema documents its real issue code (author_info_missing) for reference even while unsupported', () => {

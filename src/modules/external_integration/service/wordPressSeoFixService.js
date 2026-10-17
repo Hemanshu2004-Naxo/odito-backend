@@ -261,23 +261,10 @@ async function resolvePageOrThrow(connection, pageUrl) {
 }
 
 /**
- * Resolves everything about a Task needed to attempt a WordPress fix,
- * WITHOUT reading or writing any live WordPress value yet. Throws a typed
- * WordPressConnectionError for every reason a fix can't proceed — the
- * controller relays `.code`/`.statusCode` directly, never a generic 500.
+ * A Task may only be applied via WordPress from a status that can move to 'implemented' — the same gate the manual
+ * "Mark as implemented" flow uses (see the comment where validateFix calls it).
  */
-async function validateFix(task) {
-  // Bug fix (production-readiness audit): this path previously called
-  // TaskHistoryService.applyImplementedTransition() unconditionally,
-  // bypassing the SAME Task.isValidTransition() gate updateTaskStatus()
-  // already enforces for the manual "Mark as Implemented" flow. Without
-  // this check, applying via WordPress could resurrect a terminal
-  // 'verified_fixed' task straight back to 'implemented' (skipping
-  // 'reopened' entirely — an invalid transition per Task.js's own state
-  // machine) whenever the frontend's cached task status is stale relative
-  // to a background TaskVerificationService pass that already moved it to
-  // 'verified_fixed' or re-'implemented' it. Reusing the existing static
-  // rather than inventing new state logic.
+function assertTransitionAllowed(task) {
   if (!Task.isValidTransition(task.status, 'implemented')) {
     throw new WordPressConnectionError(
       'CONFLICT',
@@ -285,25 +272,13 @@ async function validateFix(task) {
       409
     );
   }
+}
 
-  const type = inferSnapshotType(task.issueKey);
-  const config = type && FIELD_CONFIG[type];
-  if (!config) {
-    throw new WordPressConnectionError(
-      'FIELD_NOT_WRITABLE',
-      'This issue type cannot be applied via WordPress yet.',
-      422
-    );
-  }
-
-  if (config.contentIssueCodes && !config.contentIssueCodes.includes(task.issueKey)) {
-    throw new WordPressConnectionError(
-      'FIELD_NOT_WRITABLE',
-      'This issue cannot be changed automatically: only a missing H1 is applied via WordPress. Multiple H1s need a human decision about which to change.',
-      422
-    );
-  }
-
+/**
+ * The task must link a Recommendation that belongs to its OWN project: this is the first flow that writes a
+ * recommendation-derived value to a live external system, so a missing or cross-project link is refused.
+ */
+async function assertRecommendationLinked(task) {
   if (!task.recommendationId) {
     // Distinct from the generic WRITE_FAILED below — this is never a
     // transient/retryable failure (a WordPress outage, a stale value) but a
@@ -340,6 +315,47 @@ async function validateFix(task) {
       422
     );
   }
+}
+
+/**
+ * Resolves everything about a Task needed to attempt a WordPress fix,
+ * WITHOUT reading or writing any live WordPress value yet. Throws a typed
+ * WordPressConnectionError for every reason a fix can't proceed — the
+ * controller relays `.code`/`.statusCode` directly, never a generic 500.
+ */
+async function validateFix(task) {
+  // Bug fix (production-readiness audit): this path previously called
+  // TaskHistoryService.applyImplementedTransition() unconditionally,
+  // bypassing the SAME Task.isValidTransition() gate updateTaskStatus()
+  // already enforces for the manual "Mark as Implemented" flow. Without
+  // this check, applying via WordPress could resurrect a terminal
+  // 'verified_fixed' task straight back to 'implemented' (skipping
+  // 'reopened' entirely — an invalid transition per Task.js's own state
+  // machine) whenever the frontend's cached task status is stale relative
+  // to a background TaskVerificationService pass that already moved it to
+  // 'verified_fixed' or re-'implemented' it. Reusing the existing static
+  // rather than inventing new state logic.
+  assertTransitionAllowed(task);
+
+  const type = inferSnapshotType(task.issueKey);
+  const config = type && FIELD_CONFIG[type];
+  if (!config) {
+    throw new WordPressConnectionError(
+      'FIELD_NOT_WRITABLE',
+      'This issue type cannot be applied via WordPress yet.',
+      422
+    );
+  }
+
+  if (config.contentIssueCodes && !config.contentIssueCodes.includes(task.issueKey)) {
+    throw new WordPressConnectionError(
+      'FIELD_NOT_WRITABLE',
+      'This issue cannot be changed automatically: only a missing H1 is applied via WordPress. Multiple H1s need a human decision about which to change.',
+      422
+    );
+  }
+
+  await assertRecommendationLinked(task);
 
   const connection = await wordPressService.getHydratedConnectionOrThrow(task.projectId);
 
@@ -1174,4 +1190,5 @@ async function applyFix(task, { expectedCurrentValue, approved, additionalProfil
   };
 }
 
+export { assertTransitionAllowed, assertRecommendationLinked, logFixEvent, saveTaskRecordingWrite };
 export default { validateFix, readCurrentValue, resolveDesiredValue, applyFix, readH1Context };

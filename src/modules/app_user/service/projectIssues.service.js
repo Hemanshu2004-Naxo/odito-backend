@@ -71,7 +71,7 @@ export class ProjectIssuesService {
         { projection: { title: 1, meta_tags: 1, http_status_code: 1, content: 1, _id: 0 } }
       ),
       db.collection('seo_page_issues')
-        .find({ projectId: projectIdObj, page_url: decodedPageUrl })
+        .find({ projectId: projectIdObj, page_url: decodedPageUrl, status: { $ne: 'excluded' } })
         .sort({ severity: -1, created_at: -1 })
         .toArray()
     ]);
@@ -146,7 +146,7 @@ export class ProjectIssuesService {
     const projectIdObj = new ObjectId(projectId);
 
     // Build query
-    const query = { projectId: projectIdObj };
+    const query = { projectId: projectIdObj, status: { $ne: 'excluded' } };
     if (category) query.category = category;
     if (severity) query.severity = severity;
     if (page_url) query.page_url = decodeURIComponent(page_url);
@@ -240,7 +240,7 @@ export class ProjectIssuesService {
 
     // Aggregate issues by category
     const categoryStats = await db.collection('seo_page_issues').aggregate([
-      { $match: { projectId: projectIdObj } },
+      { $match: { projectId: projectIdObj, status: { $ne: 'excluded' } } },
       {
         $group: {
           _id: '$category',

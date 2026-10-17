@@ -4,6 +4,9 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 
 dotenv.config();
+// These tests exercise the MODEL path of organization_schema (normalizer, validator, output guard against model
+// fabrications). The default path is deterministic from the schema intent; the kill switch selects the model path.
+process.env.ODITO_ORG_SCHEMA_DETERMINISTIC = '0';
 
 import recommendationService from './recommendationService.js';
 import claudeService from './claudeService.js';

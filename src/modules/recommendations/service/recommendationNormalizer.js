@@ -1,4 +1,5 @@
 import { CONTENT_LIMITS, IMPLEMENTATION_TYPES, DIFFICULTY } from '../constants/recommendationTypes.js';
+import { altImagesFromContext, normalizeImageAltProposals } from './imageAltProposals.js';
 import BeforeAfterBuilder   from '../normalizers/BeforeAfterBuilder.js';
 import ChangeSummaryBuilder from '../normalizers/ChangeSummaryBuilder.js';
 
@@ -20,6 +21,41 @@ import ChangeSummaryBuilder from '../normalizers/ChangeSummaryBuilder.js';
  * Normalizer builds: full sections object matching the Recommendation schema.
  */
 
+/**
+ * The schema prompts ask for "the actual JSON-LD object", so a model quite naturally returns
+ * `recommendedVersion` / `implementationCode` as a JSON OBJECT instead of a string — and `implementationNotes` as a
+ * list of steps. Every consumer here assumes strings: _sanitizeText() turns a non-string into '' (the recommendation
+ * silently lost its content and failed validation with no reason given) and BeforeAfterBuilder crashed on
+ * `content.trim`. Structured values are converted ONCE, up front, to the text they stand for.
+ * Returns a copy; the input is never mutated.
+ */
+export function coerceStructuredFields(raw) {
+  if (!raw || typeof raw !== 'object') return raw;
+  const toText = (v, joiner = '\n') => {
+    if (v == null || typeof v === 'string') return v;
+    if (Array.isArray(v)) return v.map((x) => (typeof x === 'string' ? x : toText(x))).filter((x) => x != null && x !== '').join(joiner);
+    if (typeof v === 'object') return JSON.stringify(v, null, 2);
+    return String(v);
+  };
+  const out = { ...raw };
+  for (const key of ['recommendedVersion', 'implementationCode', 'optimizedText']) {
+    const v = out[key];
+    if (v == null || typeof v === 'string') continue;
+    // A list of JSON-LD objects is ONE JSON array (valid JSON-LD); only a list of strings is joined as lines.
+    out[key] = Array.isArray(v) && v.some((x) => x && typeof x === 'object') ? JSON.stringify(v, null, 2) : toText(v, '\n');
+  }
+  for (const key of ['implementationNotes', 'issueAnalysis', 'whyThisMatters', 'recommendedFix']) {
+    if (out[key] != null && typeof out[key] !== 'string') out[key] = toText(out[key], '\n');
+  }
+  if (out.beforeAfter && typeof out.beforeAfter === 'object') {
+    out.beforeAfter = { ...out.beforeAfter };
+    for (const key of ['before', 'after']) {
+      if (out.beforeAfter[key] != null && typeof out.beforeAfter[key] !== 'string') out.beforeAfter[key] = toText(out.beforeAfter[key]);
+    }
+  }
+  return out;
+}
+
 class RecommendationNormalizer {
 
   /**
@@ -31,6 +67,7 @@ class RecommendationNormalizer {
    * @returns {Object} Normalized sections ready for DB storage
    */
   normalize(rawAIOutput, context = {}, ruleMetadata = {}, recommendationContext = null) {
+    rawAIOutput = coerceStructuredFields(rawAIOutput);
     // ── Phase 3 context-aware output path ─────────────────────────────────────
     // The context-aware PromptBuilder returns these fields:
     //   issueAnalysis, recommendedVersion, beforeAfter, implementationNotes,
@@ -87,6 +124,13 @@ class RecommendationNormalizer {
         // that's far too small for a full rewritten paragraph/page).
         sections.recommendedVersion = this._sanitizeText(rawAIOutput.recommendedVersion, CONTENT_LIMITS.FULL_CONTENT);
       }
+    }
+
+    // ── images_missing_alt_text: structured per-image proposals ───────────────
+    // Kept only for the exact images the prompt listed; see imageAltProposals.js. Always present (possibly empty) for this
+    // issue once a context exists, so a recommendation made before this field existed can be told apart from one with no proposals.
+    if (recommendationContext?.identity?.issueId === 'images_missing_alt_text') {
+      sections.imageAltProposals = normalizeImageAltProposals(rawAIOutput.imageAlts, altImagesFromContext(recommendationContext));
     }
 
     // ── BeforeState / AfterState / ChangeSummary (deterministic — not from Claude) ──

@@ -85,3 +85,18 @@ describe('every Accessibility rule resolves end to end', () => {
     assert.equal(resolveGroup('form_labels'), resolveGroup('form_inputs_labels'));
   });
 });
+
+describe('a registry entry must have a live rule behind it (logo_url_returns_200 was registered but emitted by nothing)', () => {
+  test('logo_url_returns_200 is emitted by a real python rule and registered as an on-page issue', () => {
+    assert.ok(emittedRuleIds().has('logo_url_returns_200'), 'no python rule emits logo_url_returns_200');
+    assert.equal(isKnownIssue('logo_url_returns_200'), true);
+    const entry = getRegistryEntry('logo_url_returns_200');
+    assert.equal(entry.issueType, 'on_page');
+    assert.deepEqual(entry.dataSources, ['page_data']);
+  });
+
+  test('that rule is registered with the engine that actually runs (not just defined in a file)', () => {
+    const file = fs.readFileSync(path.join(RULES_DIR, 'schema_rules.py'), 'utf8');
+    assert.match(file, /registry\.register\(LogoUrlReturns200Rule\(\)\)/);
+  });
+});

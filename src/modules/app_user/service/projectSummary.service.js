@@ -76,7 +76,7 @@ export class ProjectSummaryService {
       db.collection('seo_internal_links').countDocuments({ projectId: projectIdObj }),
       db.collection('seo_social_links').countDocuments({ projectId: projectIdObj }),
       db.collection('seo_page_data').countDocuments({ projectId: projectIdObj }),
-      db.collection('seo_page_issues').countDocuments({ projectId: projectIdObj })
+      db.collection('seo_page_issues').countDocuments({ projectId: projectIdObj, status: { $ne: 'excluded' } })
     ]);
     const externalLinksCount = 0;  // External links disabled
 

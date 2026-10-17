@@ -22,6 +22,9 @@ export const MAIL_TYPES = {
   CUSTOM_PLAN_REQUEST_RECEIVED: 'custom_plan_request_received',
   CUSTOM_PLAN_REQUEST_ADMIN_NOTIFICATION: 'custom_plan_request_admin_notification',
 
+  // AuditIQ service requests (issue detail page, AuditIQ tab) — staff notification only
+  AUDITIQ_REQUEST_ADMIN_NOTIFICATION: 'auditiq_request_admin_notification',
+
   // Account deletion (Profile module, Delete Account) — OAuth-only accounts
   // (no password) verify via this OTP instead.
   DELETE_ACCOUNT_OTP: 'delete_account_otp',

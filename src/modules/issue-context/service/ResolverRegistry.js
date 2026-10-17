@@ -154,7 +154,9 @@ const REGISTRY = {
   context_exactly_schema_org:     { resolver: RESOLVER.SCHEMA,  dataSources: [DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.CODE,   issueType: 'ai_visibility' },
   name_field_matches_brand:       { resolver: RESOLVER.SCHEMA,  dataSources: [DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.TEXT,   issueType: 'ai_visibility' },
   url_points_to_canonical_homepage:{ resolver: RESOLVER.SCHEMA, dataSources: [DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.TEXT,   issueType: 'ai_visibility' },
-  logo_url_returns_200:           { resolver: RESOLVER.SCHEMA,  dataSources: [DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.TEXT,   issueType: 'ai_visibility' },
+  // Emitted by python page_analysis LogoUrlReturns200Rule (schema_rules.py) - an on-page finding with the
+  // broken logo URL as its detected value. (It was registered as an AI-visibility id that no rule emitted.)
+  logo_url_returns_200:           { resolver: RESOLVER.SCHEMA,  dataSources: [DATA_SOURCE.PAGE_DATA],  displayType: DISPLAY_TYPE.TEXT,   issueType: 'on_page' },
   xml_sitemap_exists_valid:       { resolver: RESOLVER.TECHNICAL, dataSources: [DATA_SOURCE.TECHNICAL, DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.ABSENT, issueType: 'ai_visibility' },
   robots_txt_non_blocking:        { resolver: RESOLVER.TECHNICAL, dataSources: [DATA_SOURCE.TECHNICAL, DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.CODE,   issueType: 'ai_visibility' },
   no_plugin_duplicate_schemas:    { resolver: RESOLVER.SCHEMA,  dataSources: [DATA_SOURCE.AI_VISIBILITY], displayType: DISPLAY_TYPE.LIST,   issueType: 'ai_visibility' },

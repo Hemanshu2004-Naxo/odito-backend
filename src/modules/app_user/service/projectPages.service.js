@@ -87,7 +87,7 @@ export class ProjectPagesService {
     // Get issues count for each page (EXACT same logic)
     const pageUrls = pages.map(p => p.url);
     const issuesByPage = await db.collection('seo_page_issues').aggregate([
-      { $match: { projectId: projectIdObj, page_url: { $in: pageUrls } } },
+      { $match: { projectId: projectIdObj, page_url: { $in: pageUrls }, status: { $ne: 'excluded' } } },
       {
         $group: {
           _id: '$page_url',

@@ -74,6 +74,26 @@ describe('IssueAggregationService — canonical issue counting', () => {
     assert.equal(summary.resolved, 1);
   });
 
+  test('a finding WITHDRAWN as not applicable (status excluded) is neither an open issue nor resolved progress, on every surface', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+
+    await mongoose.connection.db.collection('seo_page_issues').insertMany([
+      { projectId, issue_code: 'images_missing_alt_text', page_url: 'https://example.com/a', data_path: 'images.real.alt', severity: 'high', category: 'Images', status: 'open', dedup_key: `x1-${projectId}` },
+      { projectId, issue_code: 'images_missing_alt_text', page_url: 'https://example.com/b', data_path: 'images.pixel.alt', severity: 'high', category: 'Images', status: 'excluded', excluded_reason: 'tracking_endpoint', dedup_key: `x2-${projectId}` },
+      { projectId, issue_code: 'TITLE_MISSING', page_url: 'https://example.com/c', severity: 'high', category: 'Content', status: 'resolved', dedup_key: `x3-${projectId}` },
+    ]);
+
+    const summary = await IssueAggregationService.getIssueSummary(projectId);
+    assert.equal(summary.totalIssues, 1, 'only the real open finding is outstanding');
+    assert.equal(summary.resolved, 1, 'a withdrawn finding is NOT counted as a fix');
+
+    const project = { _id: projectId, user_id: new mongoose.Types.ObjectId() };
+    const byPage = await ProjectIssuesService.getProjectIssuesByPage(project);
+    assert.equal(byPage.data.summary.totalIssues, 1);
+    const listed = await ProjectIssuesService.getProjectIssues(project, {});
+    assert.ok(!JSON.stringify(listed).includes('example.com/b'), 'the withdrawn finding is not listed against its page');
+  });
+
   test('excludeCategories scopes the total (On-Page excludes Accessibility)', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
 

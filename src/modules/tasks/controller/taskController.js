@@ -6,6 +6,7 @@ import { assertTaskOwnership } from './taskAuthz.js';
 import { captureIssueContext } from '../service/taskIssueContext.js';
 import wordPressSeoFixService from '../../external_integration/service/wordPressSeoFixService.js';
 import { WordPressConnectionError } from '../../external_integration/service/wordPressService.js';
+import { applySchemaFixResponse, isTypedSchemaFixApply } from './taskWordPressSchemaFix.js';
 
 function toObjectId(id) {
   try { return new mongoose.Types.ObjectId(id); } catch { return null; }
@@ -643,6 +644,9 @@ export async function applyWordPressFix(req, res) {
       return res.status(404).json({ success: false, message: 'Task not found' });
     }
     if (!(await assertTaskOwnership(req, res, task))) return;
+
+    // Typed multi-field schema fixes (Organization) have their own preview -> approve -> apply contract.
+    if (isTypedSchemaFixApply(task, req.body)) return applySchemaFixResponse(req, res, task);
 
     // wordPressSeoFixService.applyFix() emits the full structured
     // wordpress_fix_* event lifecycle itself (started/applied/skipped/

@@ -8,6 +8,7 @@ import {
   isVersionAtLeast,
 } from './seoBridgeVersion.js';
 import { getDownloadableBridgeVersion } from './seoBridgePackage.js';
+import { describeDiviImageAltCapability } from '../content/diviImageAlt.js';
 
 /**
  * WordPressSeoDataService (Phase 4, Step 1-2 of the locked architecture)
@@ -110,6 +111,11 @@ function bridgeVersionInfo(bridgeInstalled, installedVersion) {
  * }>}
  */
 async function getCapabilities(projectId) {
+  // The Divi page-module alt-text capability is a property of Odito, reported next to the connection's own capabilities.
+  return { ...(await getConnectionCapabilities(projectId)), diviImageAlt: describeDiviImageAltCapability() };
+}
+
+async function getConnectionCapabilities(projectId) {
   const status = await wordPressService.getConnectionStatus(projectId);
   if (!status.connected) {
     return {

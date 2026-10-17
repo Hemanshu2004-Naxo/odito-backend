@@ -31,6 +31,16 @@ const VALIDATOR_MAP = {
   [GROUP.AEO_VOICE]:            aiVisibilityValidator,
 };
 
+const mergeResults = (a, b) => {
+  const errors = [...new Set([...a.errors, ...b.errors])];
+  return {
+    valid: errors.length === 0 && a.valid && b.valid,
+    errors,
+    warnings: [...new Set([...a.warnings, ...b.warnings])],
+    satisfiesConstraint: a.satisfiesConstraint && b.satisfiesConstraint && errors.length === 0,
+  };
+};
+
 class ValidatorRegistry {
 
   /**
@@ -58,7 +68,21 @@ class ValidatorRegistry {
     }
 
     try {
-      const result = validator.validate(sections, recommendationContext);
+      let result = validator.validate(sections, recommendationContext);
+
+      // A missing schema (isAbsent) used to be validated ONLY by MissingElementValidator, which
+      // checks for placeholder text and never parses the JSON-LD - so an absent-Organization
+      // recommendation with a fabricated logo URL, a duplicate @id or a malformed breadcrumb
+      // passed. Schema-group output always gets the schema validator as well.
+      if (isAbsent && group === GROUP.SCHEMA) {
+        result = mergeResults(result, schemaValidator.validate(sections, recommendationContext));
+      } else if (recommendationContext?.schemaEvidence && validator !== schemaValidator) {
+        // Entity/E-E-A-T and AI-visibility recommendations for an Organization / Article (AISO-A1,
+        // GEO-S5, GEO-S2, ...) may carry JSON-LD too: whatever it contains is checked against the
+        // verified evidence. Prose-only output has nothing to check and passes through unchanged.
+        const ev = schemaValidator.validateEvidence(sections, recommendationContext);
+        result = mergeResults(result, { valid: ev.errors.length === 0, errors: ev.errors, warnings: ev.warnings, satisfiesConstraint: ev.errors.length === 0 });
+      }
 
       if (result.errors.length > 0) {
         console.warn(`[VALIDATOR] GROUP ${group} | ${result.errors.length} error(s) | satisfies=${result.satisfiesConstraint}`);

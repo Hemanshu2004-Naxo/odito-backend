@@ -1,6 +1,7 @@
 import wordPressService, { WordPressConnectionError } from './wordPressService.js';
 import { parseFaqPageJsonLd } from '../../tasks/service/faqSchema.js';
 import { parseAggregateRatingJsonLd } from '../../tasks/service/aggregateRatingSchema.js';
+import { wireAddress } from '../../schema-evidence/organizationAddress.js';
 
 /**
  * OditoSeoBridgeService
@@ -115,6 +116,19 @@ function classifyBridgeResponse(status, data) {
   if (status === 404) {
     return new WordPressConnectionError('FIELD_NOT_WRITABLE', message || 'This page could not be resolved to a WordPress post or page.', 422);
   }
+  if (status === 409 && data?.code === 'odito_conflict') {
+    // The Bridge's compare-and-set refused the write: the stored value is no longer the one that was read. `reason` says why
+    // (expected_mismatch | target_changed | ambiguous_meta | contention) so callers can tell "someone edited it" from "the image was replaced".
+    const reason = typeof data?.data?.reason === 'string' && /^[a-z_]{1,40}$/.test(data.data.reason) ? data.data.reason : 'expected_mismatch';
+    const text = {
+      target_changed: 'The image is no longer the one that was reviewed, so nothing was written. Refresh and try again.',
+      ambiguous_meta: 'WordPress holds more than one alt-text record for this image, so it cannot be changed safely.',
+      contention: 'This setting is being changed by someone else right now, so nothing was written. Try again in a moment.',
+    }[reason] || 'The live value on WordPress changed since this fix was reviewed. Refresh and try again.';
+    const conflict = new WordPressConnectionError('CONFLICT', text, 409);
+    conflict.reason = reason;
+    return conflict;
+  }
   if (status === 409) {
     return new WordPressConnectionError('PLUGIN_NOT_SUPPORTED', message || 'Multiple SEO plugins are active on this WordPress site. Resolve the ambiguity before applying fixes.', 409);
   }
@@ -145,7 +159,7 @@ async function bridgeRequest(connection, options) {
  * thrown as an error, just reported as `installed: false` so callers can
  * fall back to the legacy direct-adapter path.
  *
- * @returns {Promise<{installed: boolean, provider: string, providers: string[], bridgeVersion: string|null, siteSchemaSupported: boolean, faqSchemaSupported: boolean, ratingSchemaSupported: boolean}>}
+ * @returns {Promise<{installed: boolean, provider: string, providers: string[], bridgeVersion: string|null, siteSchemaSupported: boolean, faqSchemaSupported: boolean, ratingSchemaSupported: boolean, organizationTypeSupported: boolean, organizationAddressSupported: boolean, mediaAltSupported: boolean, conditionalWritesSupported: boolean}>}
  */
 async function getBridgeStatus(connection) {
   const result = await wordPressService.wpRequest(connection, {
@@ -155,7 +169,7 @@ async function getBridgeStatus(connection) {
   });
 
   if (result.status === 404) {
-    return { installed: false, provider: 'none', providers: [], bridgeVersion: null, siteSchemaSupported: false, faqSchemaSupported: false, ratingSchemaSupported: false };
+    return { installed: false, provider: 'none', providers: [], bridgeVersion: null, siteSchemaSupported: false, faqSchemaSupported: false, ratingSchemaSupported: false, organizationTypeSupported: false, organizationAddressSupported: false, mediaAltSupported: false, conditionalWritesSupported: false };
   }
   if (result.status === 401) {
     throw new WordPressConnectionError('INVALID_CREDENTIALS', 'Invalid WordPress username or Application Password.', 401);
@@ -181,6 +195,14 @@ async function getBridgeStatus(connection) {
     faqSchemaSupported: Boolean(data.supports?.faq_schema),
     // Likewise independent of the SEO provider; absent on Bridges older than 1.3.0.
     ratingSchemaSupported: Boolean(data.supports?.rating_schema),
+    // Organization type + compare-and-set/clear writes; absent on Bridges older than 1.4.0.
+    organizationTypeSupported: Boolean(data.supports?.organization_type),
+    // Bridge 1.6.0+: the structured Local SEO address can be read and written (compare-and-set, clear for rollback).
+    organizationAddressSupported: Boolean(data.supports?.organization_address),
+    // Bridge 1.5.0+: conditional (compare-and-set) alt-text write for one attachment.
+    mediaAltSupported: Boolean(data.supports?.media_alt),
+    // Bridge 1.5.0+: Organization writes are one conditional UPDATE, not a read followed by a write.
+    conditionalWritesSupported: Boolean(data.supports?.conditional_writes),
   };
 }
 
@@ -347,14 +369,39 @@ const SITE_SCHEMA_PATH = '/wp-json/odito/v1/seo/site';
  *
  * @returns {Promise<{provider: string, organization: {name: string, description: string, url: string, logo: string, sameAs: string[], protectedSameAs: string[], additionalSameAs: string[]}, breadcrumbs: {enabled: boolean}}>}
  */
+function shapeOperation(op) {
+  if (!op || typeof op !== 'object') return null;
+  return {
+    id: typeof op.id === 'string' ? op.id.slice(0, 64) : null,
+    atomic: op.atomic === true,
+    alreadyApplied: op.alreadyApplied === true,
+    created: op.created === true,
+    attempts: Number.isInteger(op.attempts) ? op.attempts : null,
+  };
+}
+
+// The five PostalAddress keys, trimmed, in a fixed order — the one form every comparison and write uses (see wireAddress).
+const shapeAddress = wireAddress;
+
 function shapeSiteSchemaResponse(data) {
   return {
     provider: data.provider || 'none',
+    // Audit data from the Bridge: { id, atomic, attempts, field } for conditional writes, null otherwise (reads, older Bridges).
+    operation: shapeOperation(data.operation),
     organization: {
       name: data.organization?.name || '',
       description: data.organization?.description || '',
       url: data.organization?.url || '',
       logo: data.organization?.logo || '',
+      // Rank Math's Local SEO business type ("Hospital"), '' when unset or on a Bridge older than 1.4.0.
+      type: data.organization?.type || '',
+      // 'company' | 'person' | '' — only a company publishes an Organization entity.
+      kind: data.organization?.kind || '',
+      hasAddress: Boolean(data.organization?.hasAddress),
+      // The structured Local SEO address exactly as Rank Math would publish it ({} when unset or on a Bridge older than 1.6.0).
+      address: shapeAddress(data.organization?.address),
+      // Whether Rank Math's Local SEO module is on — without it the business type is stored but never rendered.
+      localSeoActive: Boolean(data.organization?.localSeoActive),
       sameAs: Array.isArray(data.organization?.sameAs) ? data.organization.sameAs : [],
       // Facebook/Twitter-derived — the frontend renders these as
       // protected/read-only (see Section 11) since update_same_as() can
@@ -384,17 +431,54 @@ async function getSiteSchema(connection) {
  * @param {'add'|'remove'|null} [op] required for organization.sameAs, ignored otherwise
  * @returns {Promise<{provider: string, organization: object, breadcrumbs: object}>} the full, freshly-read site schema after the write
  */
-async function updateSiteSchemaField(connection, entity, field, value, op = null) {
+async function updateSiteSchemaField(connection, entity, field, value, op = null, { expected } = {}) {
+  // `expected` (a string) makes the Bridge refuse the write with 409 unless the stored value still equals it.
   const data = await bridgeRequest(connection, {
     method: 'PUT',
     path: SITE_SCHEMA_PATH,
-    data: { entity, field, value, op },
+    data: { entity, field, value, op, ...(expected !== undefined ? { expected } : {}) },
   });
   return shapeSiteSchemaResponse(data);
 }
 
+const MEDIA_ALT_PATH = (id) => `/wp-json/odito/v1/media/${Number(id)}/alt`;
+
+function assertAttachmentId(id) {
+  if (!Number.isInteger(Number(id)) || Number(id) <= 0) throw new WordPressConnectionError('WRITE_FAILED', 'A valid attachment id is required.', 422);
+}
+
+/** Reads one attachment's alt text and file path through the Bridge (1.5.0+). @returns {Promise<{id:number, alt:string, file:string}>} */
+async function readMediaAlt(connection, attachmentId) {
+  assertAttachmentId(attachmentId);
+  const data = await bridgeRequest(connection, { method: 'GET', path: MEDIA_ALT_PATH(attachmentId) });
+  return { id: Number(data.id), alt: typeof data.alt === 'string' ? data.alt : '', file: typeof data.file === 'string' ? data.file : '' };
+}
+
+/**
+ * Conditionally writes ONE attachment's alt text. The Bridge re-validates the attachment (image, editable by this user, same
+ * file as approved) and compares `expected` inside a single conditional UPDATE. Sends no field name and no meta key.
+ * Throws WordPressConnectionError('CONFLICT', reason) when anything differs from what was reviewed — nothing was written then.
+ * @returns {Promise<{id:number, alt:string, file:string, operation:object}>}
+ */
+async function swapMediaAlt(connection, attachmentId, { value, expected, expectedFile }) {
+  assertAttachmentId(attachmentId);
+  const data = await bridgeRequest(connection, {
+    method: 'PUT',
+    path: MEDIA_ALT_PATH(attachmentId),
+    data: { value, expected, expectedFile },
+  });
+  return {
+    id: Number(data.id),
+    alt: typeof data.alt === 'string' ? data.alt : '',
+    file: typeof data.file === 'string' ? data.file : '',
+    operation: shapeOperation(data.operation),
+  };
+}
+
 export default {
   getBridgeStatus,
+  readMediaAlt,
+  swapMediaAlt,
   getBridgeCapabilities,
   readSeoData,
   writeSeoField,

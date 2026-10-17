@@ -39,6 +39,7 @@ import pagePurchaseRoutes from '../modules/page_purchase/routes/pagePurchaseRout
 import creditPurchaseRoutes from '../modules/credit_purchase/routes/creditPurchaseRoutes.js';
 import systemAdminRoutes from '../modules/system_admin/routes/systemAdminRoutes.js';
 import leadRoutes from '../modules/lead/routes/leadRoutes.js';
+import auditIqRoutes from '../modules/auditiq_requests/routes/auditIqRoutes.js';
 import wordPressRoutes from '../modules/external_integration/routes/wordPressRoutes.js';
 import wordPressPluginRoutes from '../modules/external_integration/routes/wordPressPluginRoutes.js';
 import metaRoutes from '../modules/social_meta/routes/metaRoutes.js';
@@ -143,6 +144,9 @@ router.use('/', systemAdminRoutes);
 // Lead backend foundation (Phase 1 — authenticated CRUD only, no public
 // capture endpoint yet; see modules/lead/)
 router.use('/leads', leadRoutes);
+// AuditIQ tab of the issue detail page: Express Fix / Technical Audit + Fix / Expert Fix
+// requests and the availability of the strategy-call booking (see modules/auditiq_requests/)
+router.use('/auditiq', auditIqRoutes);
 // WordPress plugin pairing/heartbeat/form-sync (Phase 3A — structure and
 // form discovery only, no submission capture yet). MUST be registered
 // before the '/wordpress' mount below: wordPressRoutes applies a blanket

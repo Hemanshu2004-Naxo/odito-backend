@@ -30,10 +30,10 @@ export class Page08Service {
       // Task 1: Total Issues and Pages
       const [totalIssues, totalPages] = await Promise.all([
         // Total Issues: count all documents for projectId
-        db.collection('seo_page_issues').countDocuments({ projectId: projectIdObj }),
+        db.collection('seo_page_issues').countDocuments({ projectId: projectIdObj, status: { $ne: 'excluded' } }),
         
         // Total Pages: distinct page_url count
-        db.collection('seo_page_issues').distinct('page_url', { projectId: projectIdObj })
+        db.collection('seo_page_issues').distinct('page_url', { projectId: projectIdObj, status: { $ne: 'excluded' } })
           .then(urls => urls.length)
       ]);
       
@@ -91,7 +91,7 @@ export class Page08Service {
   static async getSeverityBreakdown(db, projectIdObj) {
     try {
       const pipeline = [
-        { $match: { projectId: projectIdObj } },
+        { $match: { projectId: projectIdObj, status: { $ne: 'excluded' } } },
         {
           $group: {
             _id: null,
@@ -168,7 +168,7 @@ export class Page08Service {
       
       const pipeline = [
         // Step 1: Match by projectId
-        { $match: { projectId: projectIdObj } },
+        { $match: { projectId: projectIdObj, status: { $ne: 'excluded' } } },
         
         // Step 2: Group by issue_code/rule_id
         {

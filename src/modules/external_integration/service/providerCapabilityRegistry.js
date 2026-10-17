@@ -69,20 +69,14 @@ import { extractH1TextValue } from '../../tasks/service/h1Value.js';
  *
  * Remaining `supported: false` entries and why:
  *
- *   - organization_schema (name/url/logo/description as INDIVIDUAL fixable
- *     fields): the write mechanism itself IS implemented and unit-tested
- *     (RankMathProvider::update_site_schema_field handles all four), but no
- *     current Odito issue exposes a safely automatable SINGLE-VALUE fix for
- *     it — the `organization_schema` issue's own recommendation format is a
- *     full multi-field description ("Organization schema with name, url,
- *     logo, address, telephone, sameAs, @id" — see SchemaResolver.js),
- *     not a single string. Applying it safely would mean either splitting
- *     that issue into one-field-per-issue codes (a Python-side audit rule
- *     change, out of scope here) or restructuring the Recommendation model
- *     to carry multiple fields at once (explicitly out of scope: "do not
- *     create another Task/Recommendation model"). sameas_array is the one
- *     Organization-schema-adjacent issue with a genuinely single-value,
- *     safely automatable shape, and IS supported.
+ * organization_schema IS supported since Bridge 1.4.0, but NOT as a single-value field: the issue describes
+ * a multi-field entity, so it has its own typed channel (../schemaFix/ — `typedFix: true`). A planner turns the verified
+ * schema INTENT plus Rank Math's live Knowledge Graph / Local SEO settings into the minimal list of field changes
+ * (name, logo, business type — never an existing value, never an unproven or address-less physical type); the
+ * user previews and approves exactly that plan; each field is written with compare-and-set and read back; a failure
+ * restores what was already written; the rendered page is verified separately by the crawler. The Bridge field
+ * `type` (Rank Math `local_business_type`) only renders while Rank Math's Local SEO module is on — the planner
+ * blocks the type change otherwise. sameas_array remains its own single-value capability.
  *   - person_schema: rendered from the POST'S AUTHOR'S WordPress user
  *     account (@id is the author archive URL, e.g.
  *     https://naxonify.com/author/<slug>/) — i.e. PER-USER data (a `name`
@@ -113,18 +107,15 @@ import { extractH1TextValue } from '../../tasks/service/h1Value.js';
  * removing the schema is a matter of removing that key.
  */
 
-const ORGANIZATION_UNSUPPORTED_REASON =
-  'The write mechanism for Organization fields (name/url/logo/description) is implemented and tested — see ' +
-  'RankMathProvider::update_site_schema_field — but no current Odito issue provides a single-value recommendation ' +
-  'for it: the organization_schema issue describes a complete multi-field schema, not one field to change. sameAs ' +
-  '(sameas_array) is the one Organization-adjacent issue that IS single-valued and is supported.';
-
 const PERSON_UNSUPPORTED_REASON =
-  'Confirmed against Rank Math\'s own source (includes/modules/schema/snippets/class-author.php): author/Person ' +
-  'schema (name/description/image/sameAs) is rendered from the POST\'S AUTHOR\'S WordPress user account — i.e. ' +
-  'per-user data (wp_users.display_name, user meta), not post meta or a site option. Automating this safely needs ' +
-  'a new permission model (WordPress\'s edit_users capability, not edit_post or manage_options) that has not been ' +
-  'built yet — deferred deliberately, not guessed at.';
+  "Person/Author schema is not applied automatically. Checked against Rank Math 1.0.278's own source " +
+  "(includes/modules/schema/snippets/class-author.php): the author entity is rendered from the post author's WordPress USER " +
+  '(display name, bio, profile URLs, avatar) — per-user data that needs a new edit_user permission model and an ' +
+  'owner-supplied value for every field (Odito never invents a bio or a profile). More importantly, the audit issues that ' +
+  'point here do not map to what those fields can change: author_info_missing only checks that an author byline is VISIBLE ' +
+  'in the page text, and person_schema_linked expects a jobTitle that Rank Math does not publish from any user field. ' +
+  'Writing user data would therefore not resolve them. Edit the author profile in WordPress (Users → Profile) and the ' +
+  'author byline in the template.';
 
 /**
  * @typedef {Object} FieldCapability
@@ -194,6 +185,12 @@ export const CAPABILITY_REGISTRY = {
   same_as: {
     supported: true,
     scope: 'site',
+    // Two paths share this capability. The older owner-typed apply (wordPressSeoFixService.applySameAsFix, body without a plan
+    // fingerprint) is unchanged. The preview -> approve -> apply path (schemaFix/ — `typedFix: true`, ledger, per-URL compare, rollback,
+    // immediate rendered-JSON-LD check) plans the SAME Bridge add/remove operations from links that were discovered on the site or
+    // typed by the owner and then explicitly approved (schema-evidence/sameAs/); no URL ever comes from model text.
+    typedFix: true,
+    provider: 'rank_math',
     issueCodes: ['sameas_array'],
     bridgeField: { entity: 'organization', field: 'sameAs' },
     snapshotType: 'same_as',
@@ -212,6 +209,12 @@ export const CAPABILITY_REGISTRY = {
   breadcrumb_schema: {
     supported: true,
     scope: 'site',
+    // Two paths share this capability. The older generic apply (wordPressSeoFixService, body without a plan fingerprint) is unchanged. The
+    // preview -> approve -> apply path (schemaFix/ - `typedFix: true`, ledger, rollback, per-page rendered verification) switches the SAME Rank
+    // Math setting on, but only for a trail the owner confirmed AND only when the trail Rank Math would build for the page equals it
+    // (schemaFix/breadcrumbFixPlan.js). Otherwise: the JSON-LD and manual steps, never an Apply button.
+    typedFix: true,
+    provider: 'rank_math',
     issueCodes: ['breadcrumblist_schema'],
     bridgeField: { entity: 'breadcrumbs', field: 'enabled' },
     snapshotType: 'breadcrumb',
@@ -272,14 +275,26 @@ export const CAPABILITY_REGISTRY = {
   // backed by real inspection of Rank Math's own PHP source and a live
   // installation's rendered JSON-LD, not a guess (see the file-level
   // docblock above for the full research summary).
+  // Typed multi-field fix (see the docblock): the value is NOT parsed from the recommendation text — it is planned from
+  // verified evidence + live Rank Math state (schemaFix/organizationFixPlan.js), so there is no normalizeRecommendation /
+  // valuesMatch pair to declare. Verification: saved state read back immediately (Level 1); rendered entity checked by
+  // TaskVerificationService's schema gate and the fix's own re-verify (Level 2).
   organization_schema: {
-    supported: false,
-    issueCodes: [],
-    bridgeField: { entity: 'organization', field: null },
+    supported: true,
+    typedFix: true,
+    scope: 'site',
+    channel: 'schema_fix',
+    provider: 'rank_math',
+    minBridgeCapability: 'organization_type',
+    // The structured business address (the "missing address" finding) needs a newer Bridge than name/logo/type: Bridge 1.6.0
+    // (supports.organization_address), AND Rank Math's Local SEO module, which is what publishes it. The planner holds the address
+    // back — never the other fields — when either is missing.
+    fieldMinBridgeCapability: { address: 'organization_address' },
+    issueCodes: ['organization_schema'],
+    bridgeField: { entity: 'organization', fields: ['name', 'logo', 'type', 'address'] },
     snapshotType: null,
-    unsupportedReason: ORGANIZATION_UNSUPPORTED_REASON,
-    immediateVerificationSupported: false,
-    crawlerVerificationSupported: false,
+    immediateVerificationSupported: true,
+    crawlerVerificationSupported: true,
   },
   person_schema: {
     supported: false,

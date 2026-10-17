@@ -602,7 +602,12 @@ describe('TaskVerificationService — value_diff normalization (WordPress round-
     const pageUrl = 'https://example.com/normalization-breadcrumb-fixed';
     await mongoose.connection.db.collection('seo_page_data').insertOne({
       projectId, url: pageUrl,
-      structured_data: [ { '@type': 'BreadcrumbList', itemListElement: [] } ],
+      // A real, valid trail ending at this page. (This fixture used to be an EMPTY BreadcrumbList,
+      // which "verified" a fix that renders nothing — schema tasks are now judged on the markup itself.)
+      structured_data: [ { '@type': 'BreadcrumbList', itemListElement: [
+        { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://example.com/' },
+        { '@type': 'ListItem', position: 2, name: 'Fixed', item: pageUrl },
+      ] } ],
     });
 
     const task = await Task.create({
@@ -627,6 +632,39 @@ describe('TaskVerificationService — value_diff normalization (WordPress round-
     const latest = saved.fixHistory[saved.fixHistory.length - 1];
     assert.equal(latest.verification.method, 'value_diff');
     assert.equal(latest.verification.matched, true);
+  });
+
+  test('breadcrumb: a rendered but EMPTY BreadcrumbList is not a fix -> reopened with the reason recorded', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+
+    const pageUrl = 'https://example.com/normalization-breadcrumb-empty';
+    await mongoose.connection.db.collection('seo_page_data').insertOne({
+      projectId, url: pageUrl,
+      structured_data: [ { '@type': 'BreadcrumbList', itemListElement: [] } ],
+    });
+
+    const task = await Task.create({
+      projectId, issueKey: 'breadcrumblist_schema', pageUrl, status: 'implemented', origin: 'wordpress_auto',
+      fixHistory: [{
+        attemptNumber: 1, attemptKind: 'fix_attempt', origin: 'wordpress_auto', status: 'pending_verification',
+        before: { capturedAt: new Date(), source: 'unavailable', dataPath: null, value: null },
+        fixApplied: {
+          capturedAt: new Date(), recommendationId: null, recommendationVersion: null, snapshot: null,
+          expectedAfterValue: { type: 'breadcrumb', enabled: true },
+        },
+        implementedAt: new Date(),
+        verification: { verifiedAt: null, method: null, result: null, matched: null, after: { source: 'unavailable', value: null }, triggerJobId: null },
+      }],
+    });
+
+    const result = await taskVerificationService.verifyImplementedTasks(projectId, 'NORM-BREADCRUMB-EMPTY');
+    assert.equal(result.verified, 0);
+    assert.equal(result.reopened, 1);
+    const saved = await Task.findById(task._id);
+    assert.equal(saved.status, 'reopened');
+    const latest = saved.fixHistory[saved.fixHistory.length - 1];
+    assert.equal(latest.verification.matched, false);
+    assert.match(latest.verification.after.value.reasons.join(' '), /empty_list|at least|1 item|0 item/);
   });
 
   test('breadcrumb: still absent from rendered schema, reopened with matched:false', async (t) => {

@@ -50,6 +50,10 @@ export const BRIDGE_CAPABILITY_MIN_VERSIONS = Object.freeze({
   site_schema: '1.1.0',
   faq_schema: '1.2.0',
   rating_schema: '1.3.0',
+  organization_type: '1.4.0',
+  media_alt: '1.5.0',
+  conditional_writes: '1.5.0',
+  organization_address: '1.6.0',
 });
 
 // odito_backend/src/modules/external_integration/service/ -> repo root is 5 levels up.

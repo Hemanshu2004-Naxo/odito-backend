@@ -18,6 +18,7 @@ import { AuditCompleted } from '../templates/audit/AuditCompleted.js';
 import { NewWordPressLead } from '../templates/leads/NewWordPressLead.js';
 import { CustomPlanRequestReceived } from '../templates/sales/CustomPlanRequestReceived.js';
 import { CustomPlanRequestAdminNotification } from '../templates/sales/CustomPlanRequestAdminNotification.js';
+import { AuditIqRequestAdminNotification } from '../templates/sales/AuditIqRequestAdminNotification.js';
 import { MAIL_TYPES } from '../constants/emailTypes.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 
@@ -62,6 +63,9 @@ const TEMPLATE_REGISTRY = {
   // Custom Plan requests (Upgrade unification, Phase 4)
   [MAIL_TYPES.CUSTOM_PLAN_REQUEST_RECEIVED]: { subject: 'We received your custom plan request — Odito', Component: CustomPlanRequestReceived },
   [MAIL_TYPES.CUSTOM_PLAN_REQUEST_ADMIN_NOTIFICATION]: { subject: 'New Custom Plan Request', Component: CustomPlanRequestAdminNotification },
+
+  // AuditIQ service requests
+  [MAIL_TYPES.AUDITIQ_REQUEST_ADMIN_NOTIFICATION]: { subject: 'New AuditIQ service request', Component: AuditIqRequestAdminNotification },
 
   // Account deletion
   [MAIL_TYPES.DELETE_ACCOUNT_OTP]: { subject: 'Confirm account deletion — Odito', Component: DeleteAccount },

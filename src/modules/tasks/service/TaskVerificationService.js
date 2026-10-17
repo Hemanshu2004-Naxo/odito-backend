@@ -4,7 +4,16 @@ import { isAiVisibilityIssueKey } from './aiVisibilityIssueIdentity.js';
 import { normalizeTextValue, canonicalValuesMatch, parseRobotsDirectives, robotsValuesMatch } from './valueNormalization.js';
 import { extractAggregateRatings, flattenSchemaNodes, ratingsEqual } from './aggregateRatingSchema.js';
 import { sameAsComparisonKey } from './socialProfileUrls.js';
-import { extractFaqPairsFromStructuredData, faqPairsMatch, faqPairsAreSubset, sanitizeFaqPairs } from './faqSchema.js';
+import { extractFaqPairsFromStructuredData, faqPairsMatch, faqPairsAreSubset, findFaqPageSchemas, sanitizeFaqPairs } from './faqSchema.js';
+import { appliesToVerification as schemaInspectionApplies, verifySchemaFix } from '../../schema-evidence/schemaVerification.js';
+import { getUserBreadcrumbEvidence } from '../../schema-evidence/breadcrumbEvidenceStore.js';
+import { loadIntendedOrganization } from '../../schema-evidence/organizationIntentStore.js';
+import { matchRenderedImages } from '../../external_integration/mediaFix/imageIdentity.js';
+import { collectSiteEntity } from '../../schema-evidence/siteEntity.js';
+
+// Issue types for which the crawler can WITHDRAW a finding as not applicable (status 'excluded') — see
+// python_workers/.../rules/issue_reclassification.py. A withdrawn finding is not a fix.
+const RECLASSIFIABLE_ISSUE_CODES = ['images_missing_alt_text'];
 
 /**
  * TaskVerificationService
@@ -81,12 +90,18 @@ class TaskVerificationService {
     // 2. Load the latest crawl results for comparison
     const db = mongoose.connection.db;
     const currentIssues = await this._loadCurrentIssues(db, pid, requestId);
+    const withdrawnOnlyIssues = await this._loadWithdrawnOnlyIssues(db, pid, requestId);
 
     console.log(`[VERIFY:${requestId}] Loaded ${currentIssues.size} current issue+url pairs from crawl data | projectId=${pid}`);
 
     // 3. Batch-load raw seo_page_data for any URL whose latest attempt has a
     // real expected-after value — only these need value-diff resolution.
     const pageDataByUrl = await this._loadPageDataForValueDiff(db, pid, tasksToVerify, requestId);
+
+    // 3a. Organization / Article / BreadcrumbList tasks are verified by inspecting the deployed
+    // markup itself (see the schema gate below), so their pages are loaded here regardless of
+    // whether an expected-after value was captured.
+    const schemaPageDataByUrl = await this._loadSchemaPageData(db, pid, tasksToVerify, requestId);
 
     // 3b. Batch-load ai_scores/ai_issues for any AI-visibility-sourced task
     // (Phase 5) — see _loadAiVisibilityState's own docstring for why this is
@@ -123,9 +138,32 @@ class TaskVerificationService {
           }
           ({ result, method, matched, afterSnapshot } = outcome);
         } else {
-          // Existing on-page SEO path — unchanged.
+          // Typed WordPress fixes (image alt, Organization, Organization sameAs) carry a ledger record of exactly what was written. Their verdict must come from a
+          // crawl that happened AFTER that write: an older crawl still shows the old finding (reopening on it would be wrong) or no finding
+          // at all because the page was not part of it (verifying on it would be wrong). With no post-write crawl they stay pending.
+          const typedWrite = latestAttempt?.fixApplied?.externalWrite;
+          if (typedWrite?.system === 'wordpress' && ['image_alt', 'organization_schema', 'organization_same_as', 'breadcrumb_setting'].includes(typedWrite.field)) {
+            const doc = pageDataByUrl.get(task.pageUrl) || schemaPageDataByUrl.get(task.pageUrl) || null;
+            const crawledAt = doc?.scraped_at ? new Date(doc.scraped_at) : null;
+            const writtenAt = new Date(typedWrite.writtenAt || latestAttempt?.implementedAt || task.implementedAt || 0);
+            if (!crawledAt || Number.isNaN(crawledAt.getTime()) || crawledAt < writtenAt) {
+              const reason = crawledAt ? 'The page has not been re-crawled since the WordPress change.' : 'The page was not found in the latest crawl.';
+              console.log(`[VERIFY:${requestId}] PENDING (no crawl after the typed WordPress write) | projectId=${pid} | taskId=${task._id} | issueKey=${task.issueKey} | url=${task.pageUrl}`);
+              this._emitEvent(pid.toString(), 'task:verification_pending', { taskId: task._id, issueKey: task.issueKey, pageUrl: task.pageUrl, status: task.status, reasons: [reason] });
+              skipped++;
+              continue;
+            }
+          }
+
+          // Existing on-page SEO path — unchanged, except for one honesty rule: a finding that was WITHDRAWN as not applicable is not a fix.
           const issueKey = this._buildIssueKey(task.issueKey, task.pageUrl);
           const issueStillExists = currentIssues.has(issueKey);
+          if (!issueStillExists && !typedWrite?.system && withdrawnOnlyIssues.has(issueKey)) {
+            console.log(`[VERIFY:${requestId}] PENDING (finding withdrawn as not applicable, nothing fixed) | projectId=${pid} | taskId=${task._id} | issueKey=${task.issueKey} | url=${task.pageUrl}`);
+            this._emitEvent(pid.toString(), 'task:verification_pending', { taskId: task._id, issueKey: task.issueKey, pageUrl: task.pageUrl, status: task.status, reasons: ['The audit no longer reports this finding because it was reclassified as not applicable (for example a tracking pixel, not a content image). Nothing was fixed, so it is not marked as verified.'] });
+            skipped++;
+            continue;
+          }
           result = issueStillExists ? 'reopened' : 'verified_fixed';
           method = 'presence_fallback';
           matched = null;
@@ -154,11 +192,63 @@ class TaskVerificationService {
               // the Organization has ANY sameAs entry (a Facebook-derived one
               // counts), so the URLs the site owner added must actually be in
               // the rendered JSON-LD — "WordPress saved it" is not enough.
-              if ((expected.type === 'faq_schema' || expected.type === 'aggregate_rating' || expected.type === 'same_as' || expected.type === 'keyboard_accessibility') && !issueStillExists && matched === false) {
+              // image_alt joins them ONLY for a typed per-image fix (it records the exact images it changed): the finding disappearing
+              // is not enough — each changed image must show its approved alt on the recrawled page.
+              const typedImageAlt = expected.type === 'image_alt' && Array.isArray(expected.images) && expected.images.length > 0;
+              if ((expected.type === 'faq_schema' || expected.type === 'aggregate_rating' || expected.type === 'same_as' || expected.type === 'keyboard_accessibility' || typedImageAlt) && !issueStillExists && matched === false) {
                 result = 'reopened';
               }
             }
           }
+        }
+
+        // Schema gate. "The audit finding is gone" is not proof a schema fix is live and correct:
+        // the Organization rule stops firing as soon as ANY entity with a name and url exists,
+        // so markup with a 404 logo, a duplicate entity or a broken breadcrumb trail used to be
+        // reported verified_fixed. For schema issues a would-be success is only accepted after
+        // the deployed JSON-LD itself passes inspection; a failure reopens the task with the
+        // reasons recorded, and anything that cannot be judged right now (page not re-crawled
+        // since the fix, an asset that could not be fetched) leaves the task pending - never
+        // success, never a false failure.
+        if (result === 'verified_fixed' && schemaInspectionApplies(task.issueKey)) {
+          // For a breadcrumb task the owner may have confirmed the hierarchy (see recommendationController
+          // .regenerateBreadcrumbHierarchy): the deployed trail is then verified against THAT, not just for being valid.
+          let intendedBreadcrumb = null;
+          if (task.issueKey === 'breadcrumblist_schema') {
+            try { intendedBreadcrumb = (await getUserBreadcrumbEvidence(pid, task.pageUrl))?.items || null; } catch (err) {
+              console.warn(`[VERIFY:${requestId}] saved breadcrumb hierarchy unavailable | taskId=${task._id}: ${err.message}`);
+            }
+          }
+          // Organization tasks: the deployed entity is checked against the TYPE that was recommended (and a page that needs
+          // no entity of its own against the site's entity), not only against "an Organization exists".
+          let intendedOrganization = null; let site = null;
+          if (task.issueKey === 'organization_schema' || task.issueKey === 'primary_organization_schema') {
+            try { intendedOrganization = await loadIntendedOrganization(pid, task.issueKey, task.pageUrl); } catch { intendedOrganization = null; }
+            try { site = await collectSiteEntity(pid); } catch { site = null; }
+          }
+          const inspection = await verifySchemaFix({
+            issueKey: task.issueKey,
+            pageDoc: schemaPageDataByUrl.get(task.pageUrl) || null,
+            implementedAt: latestAttempt?.implementedAt || task.implementedAt,
+            intendedBreadcrumb,
+            intendedOrganization,
+            site,
+          });
+          if (inspection.status === 'unverifiable') {
+            console.log(`[VERIFY:${requestId}] PENDING (schema not verifiable yet) | projectId=${pid} | taskId=${task._id} | issueKey=${task.issueKey} | url=${task.pageUrl} | reasons=${inspection.reasons.join(' / ')}`);
+            this._emitEvent(pid.toString(), 'task:verification_pending', {
+              taskId: task._id, issueKey: task.issueKey, pageUrl: task.pageUrl, status: task.status, reasons: inspection.reasons,
+            });
+            skipped++;
+            continue;
+          }
+          result = inspection.status === 'verified' ? 'verified_fixed' : 'reopened';
+          method = 'value_diff';
+          matched = inspection.status === 'verified';
+          afterSnapshot = {
+            source: 'structured_snapshot',
+            value: { type: 'schema_inspection', kinds: inspection.kinds, passed: matched, reasons: inspection.reasons, checks: inspection.checks },
+          };
         }
 
         // Presence always wins for "still reopened" — value-diff only
@@ -414,7 +504,7 @@ class TaskVerificationService {
     try {
       const pages = await db.collection('seo_page_data').find(
         { projectId, url: { $in: Array.from(urls) } },
-        { projection: { url: 1, title: 1, meta_tags: 1, headings: 1, canonical: 1, images: 1, structured_data: 1, 'faq_howto_signals.faq_pairs': 1 } }
+        { projection: { url: 1, scraped_at: 1, title: 1, meta_tags: 1, headings: 1, canonical: 1, images: 1, structured_data: 1, 'faq_howto_signals.faq_pairs': 1 } }
       ).toArray();
       for (const page of pages) {
         pageDataByUrl.set(page.url, page);
@@ -437,6 +527,27 @@ class TaskVerificationService {
       console.error(`[VERIFY:${requestId}] Error loading seo_page_data for value-diff | projectId=${projectId}: ${err.message}`);
     }
     return pageDataByUrl;
+  }
+
+  /**
+   * Batch-load the post-crawl seo_page_data of every page that has a schema task, for
+   * verifySchemaFix. One query for the whole pass; skipped entirely when there are none.
+   */
+  async _loadSchemaPageData(db, projectId, tasks, requestId = 'VERIFY') {
+    const urls = new Set();
+    for (const task of tasks) if (schemaInspectionApplies(task.issueKey)) urls.add(task.pageUrl);
+    const byUrl = new Map();
+    if (urls.size === 0) return byUrl;
+    try {
+      const pages = await db.collection('seo_page_data').find(
+        { projectId, url: { $in: Array.from(urls) } },
+        { projection: { url: 1, canonical: 1, meta_tags: 1, structured_data: 1, word_count: 1, page_type: 1, title: 1, 'content.headings': 1, scraped_at: 1 } }
+      ).toArray();
+      for (const page of pages) byUrl.set(page.url, page);
+    } catch (err) {
+      console.error(`[VERIFY:${requestId}] Error loading seo_page_data for schema inspection | projectId=${projectId}: ${err.message}`);
+    }
+    return byUrl;
   }
 
   /**
@@ -476,7 +587,15 @@ class TaskVerificationService {
       case 'image_alt': {
         // Alt-text fixes don't change src, so the target image is matched by
         // its (unchanged) src rather than by array position.
-        return { type, images: (pageDoc.images || []).map(img => ({ src: img.src, alt: img.alt || null })) };
+        // The identity facts (lazy URL, srcset, wp-image id) let a typed per-image fix be matched to the SAME rendered image
+        // later (see _valuesMatch); the legacy src/alt pair is unchanged.
+        return {
+          type,
+          images: (pageDoc.images || []).map(img => ({
+            src: img.src, alt: img.alt || null,
+            lazy_src: img.lazy_src ?? null, srcset_urls: img.srcset_urls || [], wp_attachment_id: img.wp_attachment_id ?? null,
+          })),
+        };
       }
       case 'same_as': {
         // pageDoc.structured_data is the crawler's array of parsed JSON-LD
@@ -507,6 +626,9 @@ class TaskVerificationService {
         return {
           type,
           pairs: extractFaqPairsFromStructuredData(pageDoc.structured_data),
+          // How many FAQPage ENTITIES the page renders. Two (a theme or plugin plus the Bridge) is duplicate FAQPage
+          // markup: the pairs still "match", but the page is wrong, so it is never reported as fixed.
+          faqEntityCount: findFaqPageSchemas(pageDoc.structured_data).length,
           visiblePairs: sanitizeFaqPairs(pageDoc.faq_howto_signals?.faq_pairs),
         };
       }
@@ -594,6 +716,24 @@ class TaskVerificationService {
         return expected.h1Count == null || actualTexts.length === expected.h1Count;
       }
       case 'image_alt': {
+        // A typed per-image fix (the WordPress media-library alt fix) records EVERY image it changed. Each must be found on the
+        // rendered page by stable evidence (the wp-image id or an exact upload path of its attachment — never file-name similarity)
+        // and show the approved alt; an image that cannot be matched, or shows another alt, means not fixed.
+        if (Array.isArray(expected.images) && expected.images.length) {
+          return expected.images.every((target) => {
+            const want = norm(target.alt);
+            const { matched } = matchRenderedImages(actual.images, { attachmentId: target.attachmentId, exactPaths: target.exactPaths });
+            if (!want || matched.length === 0) return false;
+            // A Divi page-module fix changes ONE use of the attachment; its other uses legitimately keep their own alt (a footer logo, say).
+            // The approved text must be shown by at least one use, and every use must show it or one of the alts the others had when the fix was made —
+            // an empty use is never accepted.
+            if (target.occurrence?.mode === 'one_use') {
+              const others = new Set((target.occurrence.otherAlts || []).map(norm).filter(Boolean));
+              return matched.some((img) => norm(img.alt) === want) && matched.every((img) => norm(img.alt) === want || others.has(norm(img.alt)));
+            }
+            return matched.every((img) => norm(img.alt) === want);
+          });
+        }
         const expectedAlt = norm(expected.alt);
         const match = (actual.images || []).find(img => (img.alt || null) != null && norm(img.alt) === expectedAlt);
         return !!expectedAlt && !!match;
@@ -644,7 +784,7 @@ class TaskVerificationService {
         // those pairs are still what the page visibly shows, so a schema that
         // matches the recommendation but no longer matches the page (content
         // edited since) is not reported as fixed either.
-        return faqPairsMatch(expected.pairs, actual.pairs) && faqPairsAreSubset(actual.pairs, actual.visiblePairs);
+        return (actual.faqEntityCount ?? 1) <= 1 && faqPairsMatch(expected.pairs, actual.pairs) && faqPairsAreSubset(actual.pairs, actual.visiblePairs);
       }
       case 'aggregate_rating': {
         // Fixed only if a VALID AggregateRating (real ratingValue inside its scale
@@ -706,6 +846,30 @@ class TaskVerificationService {
     }
 
     return issueSet;
+  }
+
+  /**
+   * Issue+page pairs whose ONLY remaining findings were WITHDRAWN as not applicable (status 'excluded': e.g. a tracking pixel the crawler
+   * once reported as an image missing alt text). Nothing was fixed there, so absence from the open issues proves nothing — such a task
+   * must not be told "verified fixed". A pair that also has a genuinely RESOLVED finding (a real image that was fixed) is not in this
+   * set: that disappearance is a real fix.
+   */
+  async _loadWithdrawnOnlyIssues(db, projectId, requestId = 'VERIFY') {
+    const withdrawn = new Set();
+    try {
+      const rows = await db.collection('seo_page_issues').aggregate([
+        { $match: { projectId, issue_code: { $in: RECLASSIFIABLE_ISSUE_CODES }, status: { $in: ['excluded', 'resolved', 'open'] } } },
+        { $group: { _id: { code: '$issue_code', url: { $ifNull: ['$page_url', '$url'] } }, statuses: { $addToSet: '$status' } } },
+      ]).toArray();
+      for (const r of rows) {
+        if (r.statuses.includes('excluded') && !r.statuses.includes('resolved') && !r.statuses.includes('open') && r._id.url) {
+          withdrawn.add(this._buildIssueKey(r._id.code, r._id.url));
+        }
+      }
+    } catch (err) {
+      console.error(`[VERIFY:${requestId}] Error loading withdrawn issues | projectId=${projectId}: ${err.message}`);
+    }
+    return withdrawn;
   }
 
   /**

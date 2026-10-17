@@ -122,7 +122,7 @@ export class Page11Service {
    */
   static async getBlockedReasons(db, projectIdObj) {
     const blockedReasons = await db.collection('seo_page_issues').aggregate([
-      { $match: { projectId: projectIdObj } },
+      { $match: { projectId: projectIdObj, status: { $ne: 'excluded' } } },
       
       // Filter for crawlability-related issues
       {

@@ -43,7 +43,7 @@ export function inspectHtml(html) {
  * @param {string} pageUrl
  * @param {{ siteUrl: string, cacheBust?: boolean }} options
  */
-export async function fetchRenderedPage(pageUrl, { siteUrl, cacheBust = false } = {}) {
+export async function fetchRenderedHtml(pageUrl, { siteUrl, cacheBust = false } = {}) {
   let target;
   try {
     target = new URL(pageUrl);
@@ -82,7 +82,13 @@ export async function fetchRenderedPage(pageUrl, { siteUrl, cacheBust = false } 
   if (response.status < 200 || response.status >= 300) {
     throw new RenderedHtmlError('BAD_STATUS', `The public page returned HTTP ${response.status}.`);
   }
-  return { status: response.status, ...inspectHtml(String(response.data || '')) };
+  return { status: response.status, html: String(response.data || '') };
 }
 
-export default { fetchRenderedPage, inspectHtml, RenderedHtmlError };
+/** The H1 facts of a page's rendered HTML (same safe fetch). */
+export async function fetchRenderedPage(pageUrl, options = {}) {
+  const { status, html } = await fetchRenderedHtml(pageUrl, options);
+  return { status, ...inspectHtml(html) };
+}
+
+export default { fetchRenderedPage, fetchRenderedHtml, inspectHtml, RenderedHtmlError };

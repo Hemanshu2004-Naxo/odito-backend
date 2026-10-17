@@ -15,7 +15,7 @@
  *                               list_fix
  *   4    Schema                 element_add             2500
  *                               structural_fix
- *   5    Accessibility          element_add             1200
+ *   5    Accessibility          element_add             2500
  *                               structural_fix
  *   6    AI Visibility Core     content_rewrite         2000
  *                               structural_fix
@@ -56,7 +56,7 @@ export const GROUP_MAX_TOKENS = {
   [GROUP.CONTENT_OPTIMIZATION]: 3200,  // live-verified: a real thin_content response needed 3093 output tokens and still truncated at 2800 — 3200 covers it with headroom; the retry-with-boosted-budget path (claudeService.js/recommendationService.js) is the remaining safety net beyond this
   [GROUP.TECHNICAL_SEO]:        1500,
   [GROUP.SCHEMA]:               3000,  // FAQ/Schema JSON-LD appears in both recommendedVersion AND implementationCode
-  [GROUP.ACCESSIBILITY]:        1200,
+  [GROUP.ACCESSIBILITY]:        2500,  // images_missing_alt_text was observed truncating at 100% on both 1200 and the 1.5x retry (1800); the full 9-field JSON with example <img> markup needs more than that
   [GROUP.AI_VISIBILITY]:        2000,
   [GROUP.ENTITY_EEAT]:          1500,
   [GROUP.AEO_VOICE]:            1800,

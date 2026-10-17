@@ -208,7 +208,7 @@ export class BeforeAfterBuilder {
         const content = recommendedVersion || implCode;
         base.rawText  = content ? _truncate(content, FULL_MAX) : null;
         base.isAbsent = !content;
-        base.satisfiesConstraint = Boolean(content && content.trim().length > 10);
+        base.satisfiesConstraint = Boolean(typeof content === 'string' && content.trim().length > 10);
 
         // Build a richer summary using the element label and a preview
         const elementLabel = cs.checkedFor || obj.target || 'element';

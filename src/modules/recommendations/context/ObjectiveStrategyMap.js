@@ -47,6 +47,56 @@ export function resolveObjective(issueId, normalizedCurrentState, normalizedExpe
   return _defaultStrategy(issueId, cs, es, range);
 }
 
+// ── Organization / LocalBusiness objective ───────────────────────────────────
+// The target schema type is NOT a constant: it comes from the schema intent that ODITO resolved from verified
+// evidence (see schema-evidence/schemaIntent.js). Without an intent (no crawl data) the original wording is kept.
+
+const _ORG_FACT_RULES = 'plus ONLY the logo, contact details and profiles listed as VERIFIED in the evidence (omit everything else)';
+const _ORG_PRESERVE = 'reuse the existing organization @id and properties; never invent a logo URL, phone number, address or social profile';
+
+function _organizationObjective(issueContext) {
+  const intent = issueContext?.schemaEvidence?.organization?.intent;
+  if (!intent) {
+    return {
+      action:          OBJECTIVE_ACTION.ADD,
+      target:          'Organization schema',
+      constraint:      `valid Organization JSON-LD with name and url, ${_ORG_FACT_RULES}`,
+      preserveContext: _ORG_PRESERVE,
+      successCriteria: 'Organization schema is valid, describes the organization once, and contains only verified values',
+      promptMode:      PROMPT_MODE.ELEMENT_ADD,
+    };
+  }
+  const typeLabel = intent.type;
+  if (intent.action === 'reuse' || intent.action === 'reference') {
+    return {
+      action:          OBJECTIVE_ACTION.ALIGN,
+      target:          `existing ${typeLabel} entity`,
+      constraint:      'do NOT generate a new entity; explain how the existing one is reused',
+      preserveContext: `${_ORG_PRESERVE}; keep the existing type ${typeLabel}`,
+      successCriteria: 'No duplicate entity is created; the site keeps exactly one business entity',
+      promptMode:      PROMPT_MODE.ELEMENT_ADD,
+    };
+  }
+  if (intent.action === 'needs_input') {
+    return {
+      action:          OBJECTIVE_ACTION.ADD,
+      target:          `${typeLabel} schema`,
+      constraint:      `no JSON-LD until the owner supplies: ${(intent.missing || []).map((m) => m.label).join(', ')}`,
+      preserveContext: _ORG_PRESERVE,
+      successCriteria: 'The missing facts are requested; nothing is guessed',
+      promptMode:      PROMPT_MODE.ELEMENT_ADD,
+    };
+  }
+  return {
+    action:          OBJECTIVE_ACTION.ADD,
+    target:          `${typeLabel} schema`,
+    constraint:      `valid ${typeLabel} JSON-LD with name and url${intent.type !== 'Organization' ? ' and the verified address' : ''}, ${_ORG_FACT_RULES}`,
+    preserveContext: `${_ORG_PRESERVE}${intent.id ? `; reuse @id ${intent.id}` : ''}`,
+    successCriteria: `${typeLabel} schema is valid, describes the business once, uses @type ${typeLabel}, and contains only verified values`,
+    promptMode:      PROMPT_MODE.ELEMENT_ADD,
+  };
+}
+
 // ── Strategy Map ─────────────────────────────────────────────────────────────
 
 const STRATEGY_MAP = {
@@ -379,14 +429,10 @@ const STRATEGY_MAP = {
     promptMode:      PROMPT_MODE.ELEMENT_ADD,
   },
 
-  organization_schema: {
-    action:          OBJECTIVE_ACTION.ADD,
-    target:          'Organization schema',
-    constraint:      'valid Organization JSON-LD with name, url, logo, contactPoint',
-    preserveContext: 'use real brand name, domain, and contact details',
-    successCriteria: 'Organization schema is present, valid, and complete',
-    promptMode:      PROMPT_MODE.ELEMENT_ADD,
-  },
+  organization_schema: (cs, es, range, issueContext) => _organizationObjective(issueContext),
+  primary_organization_schema: (cs, es, range, issueContext) => _organizationObjective(issueContext),
+  'aiso-a1': (cs, es, range, issueContext) => _organizationObjective(issueContext),
+  'geo-s5': (cs, es, range, issueContext) => _organizationObjective(issueContext),
 
   product_schema: (cs) => ({
     action:          cs.isAbsent ? OBJECTIVE_ACTION.ADD : OBJECTIVE_ACTION.FIX,
