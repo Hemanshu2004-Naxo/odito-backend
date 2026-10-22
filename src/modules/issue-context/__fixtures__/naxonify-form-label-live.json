@@ -1,0 +1,103 @@
+{
+ "https://naxonify.com/": [
+  {
+   "id": "select-name",
+   "impact": "critical",
+   "description": "Ensures select element has an accessible name",
+   "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/select-name?application=axeAPI",
+   "nodes": 1,
+   "tags": [
+    "cat.forms",
+    "wcag2a",
+    "wcag412",
+    "section508",
+    "section508.22.n",
+    "TTv5",
+    "TT5.c",
+    "EN-301-549",
+    "EN-9.4.1.2",
+    "ACT"
+   ],
+   "nodeDetails": [
+    {
+     "target": [
+      "#et_pb_contact_budget_range_0"
+     ],
+     "html": "<select id=\"et_pb_contact_budget_range_0\" class=\"et_pb_contact_select input\" name=\"et_pb_contact_budget_range_0\" data-required_mark=\"required\" data-field_type=\"select\" data-original_id=\"budget_range\">"
+    }
+   ]
+  }
+ ],
+ "https://naxonify.com/blog/ai-visibility/chatgpt-seo": [
+  {
+   "id": "label-title-only",
+   "impact": "serious",
+   "description": "Ensures that every form element has a visible label and is not solely labeled using hidden labels, or the title or aria-describedby attributes",
+   "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label-title-only?application=axeAPI",
+   "nodes": 1,
+   "tags": [
+    "cat.forms",
+    "best-practice"
+   ],
+   "nodeDetails": [
+    {
+     "target": [
+      "#email"
+     ],
+     "html": "<input id=\"email\" name=\"email\" type=\"text\" value=\"\" size=\"30\" maxlength=\"100\" aria-describedby=\"email-notes\" autocomplete=\"email\" required=\"required\">"
+    }
+   ]
+  },
+  {
+   "id": "label",
+   "impact": "critical",
+   "description": "Ensures every form element has a label",
+   "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label?application=axeAPI",
+   "nodes": 5,
+   "tags": [
+    "cat.forms",
+    "wcag2a",
+    "wcag412",
+    "section508",
+    "section508.22.n",
+    "TTv5",
+    "TT5.c",
+    "EN-301-549",
+    "EN-9.4.1.2",
+    "ACT"
+   ],
+   "nodeDetails": [
+    {
+     "target": [
+      "#comment"
+     ],
+     "html": "<textarea id=\"comment\" name=\"comment\" cols=\"45\" rows=\"8\" maxlength=\"65525\" required=\"required\"></textarea>"
+    },
+    {
+     "target": [
+      "#author"
+     ],
+     "html": "<input id=\"author\" name=\"author\" type=\"text\" value=\"\" size=\"30\" maxlength=\"245\" autocomplete=\"name\" required=\"required\">"
+    },
+    {
+     "target": [
+      "#email"
+     ],
+     "html": "<input id=\"email\" name=\"email\" type=\"text\" value=\"\" size=\"30\" maxlength=\"100\" aria-describedby=\"email-notes\" autocomplete=\"email\" required=\"required\">"
+    },
+    {
+     "target": [
+      "#url"
+     ],
+     "html": "<input id=\"url\" name=\"url\" type=\"text\" value=\"\" size=\"30\" maxlength=\"200\" autocomplete=\"url\">"
+    },
+    {
+     "target": [
+      "#wp-block-search__input-1"
+     ],
+     "html": "<input class=\"wp-block-search__input\" id=\"wp-block-search__input-1\" placeholder=\"\" value=\"\" type=\"search\" name=\"s\" required=\"\">"
+    }
+   ]
+  }
+ ]
+}

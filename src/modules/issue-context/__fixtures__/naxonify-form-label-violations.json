@@ -1,0 +1,123 @@
+{
+ "home": {
+  "url": "https://naxonify.com/",
+  "label": [
+   {
+    "id": "select-name",
+    "impact": "critical",
+    "description": "Ensures select element has an accessible name",
+    "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/select-name?application=axeAPI",
+    "nodes": 1,
+    "hasNodeDetails": false
+   }
+  ]
+ },
+ "sample": [
+  {
+   "url": "https://naxonify.com/blog/seo-reselling/seo-reseller",
+   "label": [
+    {
+     "id": "label-title-only",
+     "impact": "serious",
+     "description": "Ensures that every form element has a visible label and is not solely labeled using hidden labels, or the title or aria-describedby attributes",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label-title-only?application=axeAPI",
+     "nodes": 1,
+     "hasNodeDetails": false
+    },
+    {
+     "id": "label",
+     "impact": "critical",
+     "description": "Ensures every form element has a label",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label?application=axeAPI",
+     "nodes": 5,
+     "hasNodeDetails": false
+    }
+   ]
+  },
+  {
+   "url": "https://naxonify.com/blog/ai-visibility/chatgpt-seo",
+   "label": [
+    {
+     "id": "label-title-only",
+     "impact": "serious",
+     "description": "Ensures that every form element has a visible label and is not solely labeled using hidden labels, or the title or aria-describedby attributes",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label-title-only?application=axeAPI",
+     "nodes": 1,
+     "hasNodeDetails": false
+    },
+    {
+     "id": "label",
+     "impact": "critical",
+     "description": "Ensures every form element has a label",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label?application=axeAPI",
+     "nodes": 5,
+     "hasNodeDetails": false
+    }
+   ]
+  },
+  {
+   "url": "https://naxonify.com/blog/website-design/responsive-design",
+   "label": [
+    {
+     "id": "label-title-only",
+     "impact": "serious",
+     "description": "Ensures that every form element has a visible label and is not solely labeled using hidden labels, or the title or aria-describedby attributes",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label-title-only?application=axeAPI",
+     "nodes": 1,
+     "hasNodeDetails": false
+    },
+    {
+     "id": "label",
+     "impact": "critical",
+     "description": "Ensures every form element has a label",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label?application=axeAPI",
+     "nodes": 5,
+     "hasNodeDetails": false
+    }
+   ]
+  },
+  {
+   "url": "https://naxonify.com/blog/seo-reselling/seo-reseller-3",
+   "label": [
+    {
+     "id": "label-title-only",
+     "impact": "serious",
+     "description": "Ensures that every form element has a visible label and is not solely labeled using hidden labels, or the title or aria-describedby attributes",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label-title-only?application=axeAPI",
+     "nodes": 1,
+     "hasNodeDetails": false
+    },
+    {
+     "id": "label",
+     "impact": "critical",
+     "description": "Ensures every form element has a label",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/label?application=axeAPI",
+     "nodes": 5,
+     "hasNodeDetails": false
+    }
+   ]
+  },
+  {
+   "url": "https://naxonify.com/",
+   "label": [
+    {
+     "id": "select-name",
+     "impact": "critical",
+     "description": "Ensures select element has an accessible name",
+     "helpUrl": "https://dequeuniversity.com/rules/axe/4.9/select-name?application=axeAPI",
+     "nodes": 1,
+     "hasNodeDetails": false
+    }
+   ]
+  }
+ ],
+ "storedIssue": [
+  {
+   "_id": "6ab755e6bf8e312ec8cb9ee9",
+   "data_path": "axeViolations.select-name",
+   "detected_value": "1 form element(s) missing accessible labels",
+   "expected_value": "Every input, select, and textarea must have an associated <label> or aria-label",
+   "issue_message": "Form input missing label: Ensures select element has an accessible name"
+  }
+ ]
+}
