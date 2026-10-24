@@ -13,6 +13,31 @@ import { isAuditInProgress } from '../service/projectAuditService.js';
 import { deleteProjectCascade } from '../service/projectCascadeDeleteService.js';
 import { hasCredits, deductCredits, refundCredits } from '../../../utils/creditService.js';
 import { canConsumeQuota } from '../../subscription/service/subscriptionLifecycle.js';
+import { isIndustryValue, LOCATION_SOURCES } from '../../../config/industries.js';
+
+/**
+ * Validate the business-profile fields of a create/update body. Only fields PRESENT in the body are returned, so an update never
+ * resets something the client did not send; an explicit null / '' clears it. Industry must be a taxonomy value: a generic
+ * business type ("Service-based") or free text is refused rather than stored as an industry.
+ * @returns {{ error: string|null, code?: string, values: object }}
+ */
+export function validateProfileFields(body = {}) {
+  const values = {};
+  const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : null);
+  if (body.industry !== undefined) {
+    const v = text(body.industry, 100);
+    if (v && !isIndustryValue(v)) return { error: 'Choose an industry from the list', code: 'INVALID_INDUSTRY', values };
+    values.industry = v || null;
+  }
+  if (body.sub_industry !== undefined) values.sub_industry = text(body.sub_industry, 100) || null;
+  if (body.target_city !== undefined) values.target_city = text(body.target_city, 100) || null;
+  if (body.location_source !== undefined) {
+    const v = body.location_source || null;
+    if (v !== null && !LOCATION_SOURCES.includes(v)) return { error: 'Invalid location source', code: 'INVALID_LOCATION_SOURCE', values };
+    values.location_source = v;
+  }
+  return { error: null, values };
+}
 
 // A retried create (double-click, or a client retry after a timed-out response)
 // for the SAME user + name + URL within this window returns the project that was
@@ -68,6 +93,11 @@ const createSeoProject = async (req, res) => {
         success: false,
         message: 'At least one keyword is required'
       });
+    }
+
+    const profileCheck = validateProfileFields(req.body);
+    if (profileCheck.error) {
+      return res.status(400).json({ success: false, code: profileCheck.code, message: profileCheck.error });
     }
 
     // Server-side URL validation. Syntax only (no fetch): http(s), no credentials,
@@ -171,9 +201,14 @@ const createSeoProject = async (req, res) => {
       main_url: main_url.trim().toLowerCase(),
       keywords: processedKeywords,
       business_type: business_type?.trim() || null,
-      industry: industry?.trim() || null,
+      industry: profileCheck.values.industry ?? null,
+      sub_industry: profileCheck.values.sub_industry ?? null,
+      target_city: profileCheck.values.target_city ?? null,
+      location_source: profileCheck.values.location_source ?? null,
       location: location?.trim() || null,
-      country: country?.toUpperCase() || null,
+      // An explicit country wins; otherwise use the verified business's country
+      // code so a Places-verified project is not left with country: null.
+      country: (country || verified_business?.countryCode)?.toUpperCase() || null,
       language: language.toLowerCase(),
       description: description?.trim() || '',
       scrape_frequency: scrape_frequency || 'manual',
@@ -558,12 +593,18 @@ const updateSeoProject = async (req, res) => {
       }
     }
 
+    const profileCheck = validateProfileFields(req.body);
+    if (profileCheck.error) {
+      return res.status(400).json({ success: false, code: profileCheck.code, message: profileCheck.error });
+    }
+
     // Update project fields with new schema
     if (project_name) project.project_name = project_name.trim();
     if (main_url) project.main_url = main_url.trim().toLowerCase();
     if (keywords) project.keywords = keywords.map(k => k.trim()).filter(k => k.length >= 2);
     if (business_type !== undefined) project.business_type = business_type?.trim() || null;
-    if (industry !== undefined) project.industry = industry?.trim() || null;
+    // Only fields present in the body change (an omitted field is never reset).
+    for (const [field, value] of Object.entries(profileCheck.values)) project[field] = value;
     if (location !== undefined) project.location = location?.trim() || null;
     if (country) project.country = country.toUpperCase();
     if (language) project.language = language.toLowerCase();

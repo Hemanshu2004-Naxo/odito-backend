@@ -10,6 +10,7 @@ import { hasRecrawls, deductRecrawls, refundRecrawls, summarizeQuota } from '../
 import { canConsumeQuota } from '../../subscription/service/subscriptionLifecycle.js';
 import { RUN_SOURCES, consumesRecrawlCredit } from '../../jobs/runSources.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
+import { scheduleChatGptVisibilityForAudit } from '../../ai_visibility/chatgpt_visibility/services/auditTriggerService.js';
 
 // Get MongoDB connection to access collections directly
 const getDb = () => mongoose.connection.db;
@@ -532,6 +533,16 @@ export async function startProjectAudit(projectId, options = {}) {
     main_url: project.main_url,
     user_id: project.user_id
   });
+
+  // ChatGPT Visibility: an independent, durable, policy-gated run recorded in its own collection. Fire-and-forget and
+  // never throws (it logs and returns), so a visibility problem can never change this audit's outcome. It is deliberately
+  // NOT part of pipelineConfig / the chaining engine, and nothing in the SEO pipeline waits for it.
+  scheduleChatGptVisibilityForAudit({
+    projectId,
+    userId: project.user_id,
+    auditRunId: runId,
+    runSource: source,
+  }).catch(() => {});
 
   return {
     success: true,

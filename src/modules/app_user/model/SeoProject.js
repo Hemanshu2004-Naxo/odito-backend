@@ -43,11 +43,53 @@ const seoProjectSchema = new mongoose.Schema({
     default: null
   },
 
+  // A value from config/industries.js on new writes (validated by the controller). Older projects may hold free text,
+  // which is kept as-is and never rewritten automatically.
   industry: {
     type: String,
     trim: true,
     maxlength: [100, 'Industry cannot exceed 100 characters'],
     default: null
+  },
+
+  // The specific kind of business in the customer's words ("eye hospital"). Additive; null on older projects.
+  sub_industry: {
+    type: String,
+    trim: true,
+    maxlength: [100, 'Sub-industry cannot exceed 100 characters'],
+    default: null
+  },
+
+  // The CONFIRMED local target city, kept apart from `location` (free text) and from verified_business (the Google Places
+  // listing, i.e. the physical address). A business may be listed in one city and target another.
+  target_city: {
+    type: String,
+    trim: true,
+    maxlength: [100, 'Target city cannot exceed 100 characters'],
+    default: null
+  },
+  // How target_city / location were obtained. Only user_entered and google_places count as confirmed.
+  location_source: {
+    type: String,
+    enum: ['user_entered', 'google_places', 'website_inferred', null],
+    default: null
+  },
+
+  // Business details the customer CONFIRMED for AI-visibility questions (canonical store; question sets snapshot it).
+  // Additive and optional: absent on older projects.
+  visibility_profile: {
+    type: new mongoose.Schema({
+      services: { type: [String], default: undefined },
+      target_cities: { type: [String], default: undefined },
+      service_areas: { type: [String], default: undefined },
+      customer_types: { type: [String], default: undefined },
+      customer_problems: { type: [String], default: undefined },
+      requirements: { type: [String], default: undefined },
+      buying_requirements: { type: [String], default: undefined },
+      language: { type: String, default: undefined },
+      updated_at: { type: Date, default: undefined },
+    }, { _id: false }),
+    default: undefined
   },
 
   // Business name exactly as the customer typed it during onboarding (the

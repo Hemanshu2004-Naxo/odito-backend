@@ -111,6 +111,13 @@ const CASCADE_REGISTRY = [
   // The usage ledger: the PROJECT's own monthly counters (scope_id is the project id). The account's ledger is the owner's, not the project's, and stays.
   { category: 'social', collection: 'social_ai_usage', field: 'scope_id' },
 
+  // 8d. ChatGPT Visibility (own history, deliberately NOT cleared by the SEO recrawl reset): runs and the versioned prompt sets.
+  { category: 'ai', collection: 'chatgpt_visibility_runs', field: 'projectId' },
+  { category: 'ai', collection: 'ai_visibility_prompt_sets', field: 'projectId' },
+  // Approved question sets (the reusable definitions) and the evidence (answers + citations) collected for them.
+  { category: 'ai', collection: 'ai_visibility_question_sets', field: 'projectId' },
+  { category: 'ai', collection: 'ai_visibility_evidence', field: 'projectId' },
+
   // 9. Jobs (8 = screenshot metadata, handled separately below — it needs
   // file cleanup before its documents can be deleted)
   { category: 'jobs', collection: 'jobs', field: 'project_id' },

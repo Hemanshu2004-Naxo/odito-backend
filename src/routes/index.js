@@ -55,6 +55,8 @@ import socialAIStrategyRoutes from '../modules/social_meta/routes/socialAIStrate
 import socialContentCalendarRoutes from '../modules/social_meta/routes/socialContentCalendarRoutes.js';
 import socialAIContentRoutes from '../modules/social_meta/routes/socialAIContentRoutes.js';
 import socialAIDesignRoutes from '../modules/social_meta/routes/socialAIDesignRoutes.js';
+import chatgptVisibilityRoutes from '../modules/ai_visibility/chatgpt_visibility/routes/chatgptVisibilityRoutes.js';
+import aiVisibilityQuestionRoutes from '../modules/ai_visibility/shared/questions/routes/questionSetRoutes.js';
 const router = express.Router();
 
 router.use('/auth', authRoutes);
@@ -67,6 +69,10 @@ router.use('/app_user', businessRoutes);
 router.use('/seo', scrapingRoutes);
 // SEO onboarding routes (keyword generation + ranking check)
 router.use('/seo', seoOnboardingRoutes);
+// ChatGPT Visibility: sampled ChatGPT answers/citations (NOT on-page AI readiness, which lives under /app_user/projects/:id/ai-visibility)
+router.use('/ai-visibility/chatgpt', chatgptVisibilityRoutes);
+// Provider-independent AI Visibility question bank: generate -> review -> approve a versioned question set (registered after /chatgpt)
+router.use('/ai-visibility', aiVisibilityQuestionRoutes);
 // URL Verification history (read-only)
 router.use('/seo', verificationHistoryRoutes);
 // Search Console routes (matches frontend API calls)

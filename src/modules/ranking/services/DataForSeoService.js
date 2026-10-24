@@ -12,6 +12,8 @@ const ENDPOINTS = {
   // type === 'organic' count toward a ranking (RankingParserService.parseOrganic).
   SERP_ORGANIC:        `${BASE_URL}/serp/google/organic/live/advanced`,
   MAPS:                `${BASE_URL}/serp/google/maps/live/advanced`,
+  // AI Optimization: ChatGPT LLM Responses (live). Used by modules/ai_visibility/chatgpt_visibility.
+  CHATGPT_LLM_RESPONSES: `${BASE_URL}/ai_optimization/chat_gpt/llm_responses/live`,
 };
 
 function getAuthHeader() {
@@ -53,6 +55,51 @@ function sleep(ms) {
 }
 
 /**
+ * ONE authenticated POST plus the response-envelope checks, no retry. Shared by post() below (flat retry, unchanged
+ * behaviour) and by callers that run their own retry policy (e.g. the ChatGPT LLM Responses provider).
+ *
+ * Throws on DataForSEO API-level errors (status_code !== 20000) and on task-level errors (tasks[0].status_code !== 20000),
+ * attaching the provider codes (apiStatusCode / taskStatusCode) so callers can classify without parsing messages.
+ * Network/HTTP errors are axios errors: err.response.status, err.response.headers, err.code are intact.
+ */
+async function postOnce(url, payload, { timeoutMs = 60_000 } = {}) {
+  const response = await axios.post(url, payload, {
+    headers: makeHeaders(),
+    timeout: timeoutMs,
+  });
+
+  const data = response.data;
+
+  if (data?.status_code !== 20000) {
+    throw Object.assign(
+      new Error(`DataForSEO API error: ${data?.status_message ?? 'unknown'} (code ${data?.status_code})`),
+      { isApiError: true, apiStatusCode: data?.status_code }
+    );
+  }
+
+  // The envelope's own status_code can be 20000 ("Ok.") while the
+  // individual task still failed — every caller in this codebase sends
+  // exactly one task per request, so tasks[0] is checked directly
+  // (matches actual usage; no need to iterate). A task-level failure
+  // (e.g. 40201 "temporarily paused for unusual activity" on the
+  // account) carries result: null. Without this check, that null was
+  // silently treated as a successful-but-empty response — downstream,
+  // RankingParserService._collectAllItems() turns a non-array `result`
+  // into `[]`, which is indistinguishable from "the keyword was
+  // searched and the target domain genuinely wasn't found". Caught
+  // here instead, before any parsing happens.
+  const task = data?.tasks?.[0];
+  if (task && task.status_code !== 20000) {
+    throw Object.assign(
+      new Error(`DataForSEO task error: ${task.status_message ?? 'unknown'} (code ${task.status_code})`),
+      { isApiError: true, isTaskError: true, taskStatusCode: task.status_code }
+    );
+  }
+
+  return data;
+}
+
+/**
  * POST with flat retry and configurable delay.
  *
  * Retries on network/timeout errors only.
@@ -65,40 +112,7 @@ async function post(url, payload, { timeoutMs = 60_000, maxRetries = 3, retryDel
     try {
       console.log(`[DATAFORSEO] POST attempt ${attempt}/${maxRetries} | ${url.split('/v3/')[1]}`);
 
-      const response = await axios.post(url, payload, {
-        headers: makeHeaders(),
-        timeout: timeoutMs,
-      });
-
-      const data = response.data;
-
-      if (data?.status_code !== 20000) {
-        throw Object.assign(
-          new Error(`DataForSEO API error: ${data?.status_message ?? 'unknown'} (code ${data?.status_code})`),
-          { isApiError: true }
-        );
-      }
-
-      // The envelope's own status_code can be 20000 ("Ok.") while the
-      // individual task still failed — every caller in this codebase sends
-      // exactly one task per request, so tasks[0] is checked directly
-      // (matches actual usage; no need to iterate). A task-level failure
-      // (e.g. 40201 "temporarily paused for unusual activity" on the
-      // account) carries result: null. Without this check, that null was
-      // silently treated as a successful-but-empty response — downstream,
-      // RankingParserService._collectAllItems() turns a non-array `result`
-      // into `[]`, which is indistinguishable from "the keyword was
-      // searched and the target domain genuinely wasn't found". Caught
-      // here instead, before any parsing happens.
-      const task = data?.tasks?.[0];
-      if (task && task.status_code !== 20000) {
-        throw Object.assign(
-          new Error(`DataForSEO task error: ${task.status_message ?? 'unknown'} (code ${task.status_code})`),
-          { isApiError: true, isTaskError: true }
-        );
-      }
-
-      return data;
+      return await postOnce(url, payload, { timeoutMs });
 
     } catch (err) {
       lastError = err;
@@ -253,5 +267,16 @@ export const DataForSeoService = {
       depth:         100,
     }];
     return post(ENDPOINTS.MAPS, payload, { timeoutMs: 60_000, maxRetries: 3, retryDelayMs: 5_000 });
+  },
+
+  /**
+   * ChatGPT LLM Responses (live): ONE attempt, no retry here. The caller owns the retry policy because it must tell
+   * transient failures (429, 5xx, timeouts) from permanent ones (401, 402, 4xx, 40xxx task codes) and pace the retries.
+   * `body` is the single task object ({user_prompt, model_name, web_search, ...}); it is wrapped in the array the API expects.
+   * Errors keep err.response (HTTP status / headers), err.code, err.apiStatusCode and err.taskStatusCode. Neither the request
+   * (it carries the prompt) nor credentials are logged here.
+   */
+  postChatGptLlmResponse(body, { timeoutMs = 120_000 } = {}) {
+    return postOnce(ENDPOINTS.CHATGPT_LLM_RESPONSES, [body], { timeoutMs });
   },
 };
