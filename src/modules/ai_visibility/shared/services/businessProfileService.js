@@ -19,7 +19,8 @@ import { isIndustryValue, industryLabel } from '../../../../config/industries.js
  *   SocialBusinessProfile user-entered services and competitors (Social AI's profile). It is the only place Odito stores
  *                         them; it is optional, so both lists are often empty.
  *
- * Brand aliases are NOT supported anywhere in the data model: `aliases` is always [] and `aliasesSupported` is false.
+ * Brand aliases: Google listing names are often branch names ("ASG Eye Hospital LASIK & FEMTO Laser Center jodhpur") while answers say
+ * "ASG Eye Hospital". deriveBrandAliases() adds the core brand (and the customer-typed business_name) so mentions are matched.
  *
  * Name precedence: verified_business.name -> business_name (customer-typed) -> project_name (unverified fallback).
  * Category precedence: sub_industry -> legacy free-text industry -> industry label. business_type (how the business operates) is
@@ -92,6 +93,31 @@ export function computeProfileHash(profile) {
  * Pure normalization of already-loaded documents (plain objects). Exported for tests and for callers that already
  * hold the documents.
  */
+const KIND_WORD = /^(hospitals?|clinics?|centres?|centers?|institutes?|agency|agencies|studios?|schools?|academy|college|labs?|laboratories|pharmacy|salon|spa|restaurant|cafe|hotel|store|shop|solutions|technologies|group|associates|dental|care|services)$/i;
+const escapeRe = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Shorter names the same business is commonly called by, derived ONLY from names on record (never invented): the listing name with a
+ * trailing city and anything after a separator removed, and its shortest prefix that ends in a business-kind word ("... Hospital").
+ */
+export function deriveBrandAliases(name, { cities = [], extraNames = [] } = {}) {
+  if (!name) return [];
+  const out = [];
+  const add = (v) => {
+    const t = (v || '').replace(/[\s,&|\-–—]+$/, '').trim();
+    if (t.split(/\s+/).length >= 2 && t.length >= 4 && normalizeKey(t) !== normalizeKey(name) && !out.some((o) => normalizeKey(o) === normalizeKey(t))) out.push(t);
+  };
+  let n = name;
+  for (const c of cities.filter(Boolean)) n = n.replace(new RegExp(`[\\s,\\-|]*\\b${escapeRe(c)}\\s*$`, 'i'), '');
+  n = n.split(/\s[-|–—]\s|,|\(/)[0].trim();
+  add(n);
+  const words = n.split(/\s+/);
+  const kind = words.findIndex((w, i) => i >= 1 && KIND_WORD.test(w.replace(/[^A-Za-z]/g, '')));
+  if (kind >= 1) add(words.slice(0, kind + 1).join(' '));
+  for (const e of extraNames) add(e);
+  return out.slice(0, 5);
+}
+
 export function normalizeBusinessProfile({ project, socialProfile = null }) {
   const warnings = [];
   const flag = (field) => warnings.push(`${field}_dropped_unsafe_value`);
@@ -199,7 +225,8 @@ export function normalizeBusinessProfile({ project, socialProfile = null }) {
     warnings.push('location_conflict');
   }
   if (placesVerified && verifiedCity && city && normalizeKey(verifiedCity) !== normalizeKey(city)) warnings.push('physical_location_differs_from_target');
-  const state = take(verified.state, 'state', 100);
+  // The listing's state only belongs with the listing's own city (e.g. not "Rajasthan" next to a Nashik target).
+  const state = citySource === 'verified_business.city' ? take(verified.state, 'state', 100) : null;
   const effectiveScope = scope === 'local' && city ? 'local' : 'national';
   const targetCities = effectiveScope === 'local' ? dedupe([city, ...confirmed.targetCities].filter(Boolean)).slice(0, MAX_LIST) : [...confirmed.targetCities];
   if (scope === 'local' && !city) warnings.push('local_scope_without_city_treated_as_national');
@@ -226,8 +253,8 @@ export function normalizeBusinessProfile({ project, socialProfile = null }) {
       nameSource,
       nameVerified,
       nameReliability: name ? assessNameReliability(name, [industry, indLabel, ...services].filter(Boolean)) : { reliable: false, reason: 'empty' },
-      aliases: [],
-      aliasesSupported: false,
+      aliases: deriveBrandAliases(name, { cities: [verified.city, project.target_city, locationCity], extraNames: [take(project.business_name, 'business_name', 150, NAME_OPTS)].filter((v) => v && normalizeKey(v) !== normalizeKey(name)) }),
+      aliasesSupported: true,
       industry,
       industrySource,
       industryKey,

@@ -5,3 +5,6 @@ node_modules/
 *.log
 .DS_Store
 dist/
+
+# AI-visibility research test output (scripts/ai-visibility-openai)
+test-results/ai-visibility/

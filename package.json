@@ -19,6 +19,8 @@
     "migrate:split-google-visibility": "node src/modules/app_user/scripts/splitGoogleVisibilityConnections.js",
     "migrate:backfill-recrawl-quota": "node src/modules/app_user/scripts/backfillRecrawlQuota.js",
     "report:project-profiles": "node src/modules/app_user/scripts/reportProjectProfileIssues.js",
+    "visibility:reanalyze": "node src/modules/ai_visibility/scripts/reanalyzeEvidence.js",
+    "visibility:evaluate": "node src/modules/ai_visibility/scripts/evaluateModels.js",
     "inspect:social-indexes": "node src/modules/social_meta/scripts/inspectSocialAiIndexes.js",
     "package:seo-bridge-plugin": "node src/modules/external_integration/scripts/packageSeoBridgePlugin.js",
     "load:smoke": "node load-tests/index.js --level=smoke",

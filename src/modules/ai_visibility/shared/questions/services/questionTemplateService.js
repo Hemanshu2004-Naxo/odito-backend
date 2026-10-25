@@ -119,7 +119,9 @@ export function buildTemplateQuestions(inputs) {
 }
 
 /** @returns {object[]} brand diagnostic questions (name the business) - empty when the business has no usable name */
-export function buildBrandQuestions(profile, inputs) {
+export function buildBrandQuestions(profile, inputs, { enabled = false } = {}) {
+  // Brand-name (diagnostic) questions are switched off: only discovery questions that never name the business are generated.
+  if (!enabled) return [];
   const brand = profile.business.name;
   if (!brand) return [];
   const category = inputs.categories[0] || null;

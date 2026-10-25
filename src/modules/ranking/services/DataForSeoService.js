@@ -14,6 +14,7 @@ const ENDPOINTS = {
   MAPS:                `${BASE_URL}/serp/google/maps/live/advanced`,
   // AI Optimization: ChatGPT LLM Responses (live). Used by modules/ai_visibility/chatgpt_visibility.
   CHATGPT_LLM_RESPONSES: `${BASE_URL}/ai_optimization/chat_gpt/llm_responses/live`,
+  CHATGPT_LLM_MODELS:    `${BASE_URL}/ai_optimization/chat_gpt/llm_responses/models`,
 };
 
 function getAuthHeader() {
@@ -278,5 +279,13 @@ export const DataForSeoService = {
    */
   postChatGptLlmResponse(body, { timeoutMs = 120_000 } = {}) {
     return postOnce(ENDPOINTS.CHATGPT_LLM_RESPONSES, [body], { timeoutMs });
+  },
+
+  /** The ChatGPT models the account can use (free listing endpoint): [{ model_name, reasoning, web_search_supported, ... }]. */
+  async getChatGptModels({ timeoutMs = 20_000 } = {}) {
+    const response = await axios.get(ENDPOINTS.CHATGPT_LLM_MODELS, { headers: makeHeaders(), timeout: timeoutMs });
+    const task = response.data?.tasks?.[0];
+    if (response.data?.status_code !== 20000 || task?.status_code !== 20000) throw new Error('DataForSEO model listing failed');
+    return Array.isArray(task.result) ? task.result : [];
   },
 };

@@ -71,12 +71,8 @@ export const QUESTION_TEMPLATES = Object.freeze([
  * Brand diagnostic questions: the ONLY questions that name the business. They check what ChatGPT knows about it and whether that is
  * accurate; they are kept in their own group and never count toward discovery visibility.
  */
-export const BRAND_TEMPLATES = Object.freeze([
-  { id: 'brand_services_loc', topic: 'brand', text: 'What services does {brand} provide in {location}? If you do not have reliable information about {brand}, say so.' },
-  { id: 'brand_services', topic: 'brand', text: 'What services does {brand} provide? If you do not have reliable information about {brand}, say so.' },
-  { id: 'brand_known_for', topic: 'brand', text: 'What is {brand} known for? If you do not have reliable information about {brand}, say so instead of guessing.' },
-  { id: 'brand_reliable', topic: 'brand', text: 'Is {brand} a good choice as a {category}? If you do not have reliable information about {brand}, say so.' },
-]);
+// Brand-name questions ("What is <business> known for?") were removed from the product: no template names the business.
+export const BRAND_TEMPLATES = Object.freeze([]);
 
 export const TEMPLATE_IDS = Object.freeze(new Set([...QUESTION_TEMPLATES, ...BRAND_TEMPLATES].map((t) => t.id)));
 

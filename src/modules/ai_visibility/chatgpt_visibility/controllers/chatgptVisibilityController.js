@@ -26,6 +26,8 @@ const QUESTION_SET_REFUSALS = {
   QUESTION_SET_NOT_FOUND: { status: 404, message: 'Question set not found' },
   QUESTION_SET_EMPTY: { status: 422, message: 'The approved question set has no enabled questions' },
   INVALID_MODE: { status: 400, message: 'Unsupported run mode' },
+  MODEL_NOT_SUPPORTED: { status: 422, message: 'The configured ChatGPT model is not supported by the data provider account. Check CHATGPT_VISIBILITY_MODEL.' },
+  MODEL_WEB_SEARCH_UNSUPPORTED: { status: 422, message: 'The configured ChatGPT model does not support web search. Choose another model or disable web search.' },
 };
 
 const LIMIT_STATUS = { PROJECT_COOLDOWN: 429, PROJECT_DAILY_LIMIT: 429, USER_DAILY_LIMIT: 429 };

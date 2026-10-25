@@ -8,6 +8,7 @@ import { getChatGptConfig } from '../config/chatgptConfig.js';
 import * as runs from './runService.js';
 import { emitVisibilityEvent } from './visibilityEvents.js';
 import { kick } from '../workers/runWorker.js';
+import { checkModel as defaultCheckModel } from '../providers/modelCatalog.js';
 
 /**
  * Starting visibility runs: from an accepted full audit (automatic), from the repair sweep (crash safety), or by a user (manual).
@@ -32,6 +33,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * No subscription allowance exists in a reliable form in this codebase, so these are flat, configurable, conservative limits.
  */
 export async function checkRunLimits({ projectId, userId, now = new Date(), config = getChatGptConfig(), Model = ChatGptVisibilityRun }) {
+  if (!config.limitsEnabled) return null; // limits switched off (CHATGPT_VISIBILITY_LIMITS_ENABLED)
   const counted = { status: { $ne: 'skipped' } };
   const last = await Model.findOne({ projectId, ...counted }).sort({ createdAt: -1 }).select('createdAt').lean();
   if (config.cooldownMs > 0 && last && now.getTime() - new Date(last.createdAt).getTime() < config.cooldownMs) {
@@ -124,7 +126,7 @@ export function buildQuestionSnapshot(set, config = getChatGptConfig()) {
   const rank = (q) => PRIORITY_RANK[q.priority] ?? 1;
   const ordered = [
     ...enabled.filter((q) => q.group === GROUPS.VISIBILITY).map((q, i) => ({ q, i })).sort((a, b) => rank(a.q) - rank(b.q) || a.i - b.i).map((x) => x.q),
-    ...enabled.filter((q) => q.group !== GROUPS.VISIBILITY),
+    // Brand-name questions are no longer asked, even when an older approved set still contains them.
   ];
   const kept = ordered.slice(0, config.maxQuestionsPerRun);
   const snapshot = kept.map((q) => ({
@@ -159,6 +161,10 @@ export async function startManualRun({ projectId, userId, mode = 'legacy_prompts
     if (!resolved.ok) return { scheduled: false, reason: resolved.reason };
     const { snapshot, truncated } = buildQuestionSnapshot(resolved.set, config);
     if (!snapshot.length) return { scheduled: false, reason: 'QUESTION_SET_EMPTY' };
+    // The configured model must be one the provider account actually supports; it is never silently swapped for another.
+    const model = await (deps.checkModel || defaultCheckModel)(config.model, { webSearch: config.webSearch });
+    if (model.supported === false) return { scheduled: false, reason: model.reason, model: config.model };
+    LoggerUtil.info('ChatGPT visibility: approved-question run requested', { projectId: String(projectId), model: config.model, webSearch: config.webSearch, modelVerified: model.supported === true });
     extra = {
       executionMode: 'approved_questions',
       provider: 'chatgpt',

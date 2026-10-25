@@ -101,3 +101,52 @@ export function extractCitations(annotations, targetHost) {
 }
 
 export default { normalizeUrl, normalizeHost, deriveTargetHost, isTargetHost, isTrackingParam, toCitation, extractCitations };
+
+/**
+ * Deterministic citation classification for one answer. Signals are kept SEPARATE and every one is derived from evidence:
+ *   officialCited          >= 1 actual citation (provider annotation URL) whose HOST is the verified official domain or a subdomain
+ *                          of it. Parsed hostnames only: a Google Maps search, a directory page or a URL that merely contains the
+ *                          brand in its path/query never qualifies, nor does a look-alike host ("asgeyehospital.com.example.org").
+ *   thirdPartyCited        >= 1 valid citation to any OTHER host (maps, directories, reviews, news ...)
+ *   officialDomainInText   the official domain is WRITTEN in the answer text ("visit asgeyehospital.com") - reported apart because
+ *                          it is not a clickable citation
+ *   citations[].position   1-based order in which the answer cites sources (provider annotation order) - not the search order
+ *   brandListPosition      1-based position of the business among the answer's list items, null when it is not in a list
+ * @returns {{citations:object[], officialCited:boolean, officialPages:string[], thirdPartyCited:boolean, thirdPartyHosts:string[],
+ *            officialDomainInText:boolean, brandListPosition:number|null}}
+ */
+export function classifyCitations({ answerText, annotations, targetHost, brandNames = [] }) {
+  const citations = extractCitations(annotations, targetHost).map((c, i) => ({ ...c, position: i + 1 }));
+  const official = citations.filter((c) => c.valid && c.isTarget);
+  const third = citations.filter((c) => c.valid && !c.isTarget);
+  const text = typeof answerText === 'string' ? answerText : '';
+
+  // Domain written in prose: a hostname token equal to (or a subdomain of) the target, not glued to a longer host.
+  let officialDomainInText = false;
+  const t = normalizeHost(targetHost);
+  if (t) {
+    const hostLike = /(?:^|[^a-z0-9.-])((?:[a-z0-9-]+\.)+[a-z]{2,})(?![a-z0-9-]|\.[a-z0-9])/gi;
+    for (const m of text.matchAll(hostLike)) {
+      if (isTargetHost(m[1], t)) { officialDomainInText = true; break; }
+    }
+  }
+
+  // Position of the business among list items ("1. **X**", "- X", "### X").
+  let brandListPosition = null;
+  const names = brandNames.filter(Boolean).map((n) => n.toLowerCase());
+  if (names.length) {
+    const items = text.split(/\n+/).filter((l) => /^\s*(?:\d{1,2}[.)]|[-*•]|#{1,4}|\*\*\[?)/.test(l));
+    const idx = items.findIndex((l) => names.some((n) => l.toLowerCase().includes(n)));
+    if (idx >= 0) brandListPosition = idx + 1;
+  }
+
+  return {
+    citations,
+    officialCited: official.length > 0,
+    officialPages: [...new Set(official.map((c) => c.normalizedUrl))],
+    thirdPartyCited: third.length > 0,
+    thirdPartyHosts: [...new Set(third.map((c) => c.host))],
+    officialDomainInText,
+    brandListPosition,
+  };
+}

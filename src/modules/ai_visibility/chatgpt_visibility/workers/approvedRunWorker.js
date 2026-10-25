@@ -6,7 +6,7 @@ import { emitVisibilityEvent } from '../services/visibilityEvents.js';
 import * as evidence from '../../shared/evidence/services/evidenceService.js';
 import { buildBusinessProfile } from '../../shared/services/businessProfileService.js';
 import { analyzeAnswer } from '../../shared/services/visibilityMetricsService.js';
-import { extractCitations } from '../../shared/services/citationNormalizationService.js';
+import { classifyCitations } from '../../shared/services/citationNormalizationService.js';
 import { detectRecommendation } from '../../shared/services/recommendationDetection.js';
 import { computeApprovedQuestionMetrics } from '../../shared/services/approvedQuestionMetrics.js';
 import { GROUPS } from '../../shared/questions/config/questionConfig.js';
@@ -182,7 +182,8 @@ export async function processApprovedRun(claimed, deps = {}) {
         // The EXACT approved text is what is sent; the model, search and token settings come from server config only.
         const result = await d.execute({ prompt: question.text, market: m, tag: `odito-cgv:${runId}:${questionId}` }, { config });
         if (typeof result.cost === 'number') spent += result.cost;
-        const citations = extractCitations(result.annotations, target.targetHost);
+        const cls = classifyCitations({ answerText: result.answerText, annotations: result.annotations, targetHost: target.targetHost, brandNames: target.brandNames });
+        const citations = cls.citations;
         const analysis = analyzeAnswer(result, target);
         const rec = question.group === GROUPS.VISIBILITY ? detectRecommendation(result.answerText, target.brandNames) : null;
         patch = {
@@ -196,7 +197,10 @@ export async function processApprovedRun(claimed, deps = {}) {
           citations,
           firstPartyPages: analysis.targetPages,
           externalDomains: [...new Set(citations.filter((c) => c.valid && !c.isTarget).map((c) => c.host))],
-          analysis: { brandMentioned: analysis.brandMentioned, brandMentionCount: analysis.brandMentionCount, recommended: rec ? rec.recommended : null, recommendationMethod: rec ? rec.method : null, competitorMentions: analysis.competitorMentions },
+          analysis: {
+            brandMentioned: analysis.brandMentioned, brandMentionCount: analysis.brandMentionCount, recommended: rec ? rec.recommended : null, recommendationMethod: rec ? rec.method : null, competitorMentions: analysis.competitorMentions,
+            officialCited: cls.officialCited, thirdPartyCited: cls.thirdPartyCited, officialDomainInText: cls.officialDomainInText, brandListPosition: cls.brandListPosition, officialDomain: target.targetHost || null,
+          },
           cost: typeof result.cost === 'number' ? result.cost : null,
           costStatus: typeof result.cost === 'number' ? 'reported' : 'unknown',
           costUnit: typeof result.cost === 'number' ? config.costUnit : null,

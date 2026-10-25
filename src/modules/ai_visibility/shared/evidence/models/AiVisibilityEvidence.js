@@ -29,6 +29,7 @@ const citationSchema = new mongoose.Schema({
   host: { type: String, default: null },
   title: { type: String, default: null },
   isTarget: { type: Boolean, default: false },
+  position: { type: Number, default: null }, // 1-based order the answer cites it in
   valid: { type: Boolean, default: true },
 }, { _id: false });
 
@@ -77,6 +78,12 @@ const evidenceSchema = new mongoose.Schema({
     recommended: { type: Boolean, default: null },
     recommendationMethod: { type: String, default: null },
     competitorMentions: { type: mongoose.Schema.Types.Mixed, default: [] },
+    // Citation signals (classifyCitations): separate on purpose.
+    officialCited: { type: Boolean, default: null }, // an actual citation on the verified official domain
+    thirdPartyCited: { type: Boolean, default: null }, // an actual citation on any other site
+    officialDomainInText: { type: Boolean, default: null }, // the domain written in the text, not linked
+    brandListPosition: { type: Number, default: null }, // position among the answer list items
+    officialDomain: { type: String, default: null }, // the domain checked against (the run target host)
   },
 
   cost: { type: Number, default: null },

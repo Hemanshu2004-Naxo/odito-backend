@@ -30,7 +30,7 @@ export async function createDraft({ profile, userId = null }, deps = {}) {
 
   const since = new Date(now().getTime() - 24 * 60 * 60 * 1000);
   const recent = await Model.countDocuments({ projectId: profile.projectId, createdAt: { $gte: since } });
-  if (recent >= MAX_DRAFTS_PER_DAY) {
+  if (String(process.env.CHATGPT_VISIBILITY_LIMITS_ENABLED).toLowerCase() === "true" && recent >= MAX_DRAFTS_PER_DAY) {
     throw new VisibilityError(VISIBILITY_ERROR.QUESTION_SET_LIMIT, 'Too many question sets were generated for this project today. Review or approve an existing draft.', { limit: MAX_DRAFTS_PER_DAY });
   }
 
