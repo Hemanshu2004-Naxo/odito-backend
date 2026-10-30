@@ -90,7 +90,7 @@ import { startBulkImportRecoveryScheduler } from './src/modules/social_meta/serv
 import { startCalendarRecoveryScheduler } from './src/modules/social_meta/service/calendar/calendarRecoveryScheduler.js';
 import { startAutomationScheduler } from './src/modules/aiCampaign/service/automation/automationScheduler.js';
 import { startInvestigationRecoveryScheduler } from './src/modules/ai-investigation/service/recoveryScheduler.js';
-import { startChatGptVisibilityScheduler } from './src/modules/ai_visibility/chatgpt_visibility/workers/recoveryScheduler.js';
+import { startGoogleAioVisibilityScheduler } from './src/modules/ai_visibility/google_aio_visibility/workers/recoveryScheduler.js';
 import { startReviewSnapshotScheduler } from './src/services/businessProfileReviewSnapshotScheduler.js';
 import { handleStripeWebhook } from './src/modules/subscription/controller/subscriptionController.js';
 import auth from './src/modules/user/middleware/auth.js';
@@ -303,9 +303,8 @@ const startServer = async () => {
   // AI Investigation: fail investigations interrupted by a restart/crash so none stays "running" forever (and none blocks a page's next run).
   startInvestigationRecoveryScheduler();
 
-  // ChatGPT Visibility: every minute, start queued runs, take over runs whose worker died (lease expired) and repair any
-  // accepted full audit that has no visibility record. OFF unless CHATGPT_VISIBILITY_ENABLED=true; independent of the SEO pipeline.
-  startChatGptVisibilityScheduler();
+  // Google AI Overview Visibility: same recovery model (queued runs, expired leases). OFF unless GOOGLE_AIO_VISIBILITY_ENABLED=true.
+  startGoogleAioVisibilityScheduler();
   // AI Campaign Builder — Phase 8 automation: every 15 minutes, scans for
   // enabled automation policies whose scheduled window has arrived and runs
   // them (observe/recommend/execute per policy). Global kill switch:

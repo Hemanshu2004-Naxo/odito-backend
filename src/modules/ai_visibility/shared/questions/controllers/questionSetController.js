@@ -37,6 +37,7 @@ export function toQuestionSetDto(set, { currentProfileHash = null } = {}) {
     inputs: set.inputs ?? null,
     missingBusinessInformation: set.missingBusinessInformation || [],
     warnings: set.warnings || [],
+    generationReport: set.generationReport ?? null,
     // True when the business profile changed after this set was generated: the questions may no longer match the business.
     profileChanged: currentProfileHash ? currentProfileHash !== set.profileHash : null,
     questions: (set.questions || []).map((q) => ({
@@ -76,7 +77,10 @@ export async function generateQuestions(req, res) {
   try {
     const profile = await buildBusinessProfile(req.project._id);
     // Questions are generated ONLY from the stored, confirmed business profile (PUT .../profile); nothing in the body is used.
-    const draft = await sets.createDraft({ profile, userId: req.user?._id || null });
+    // The only body field read is an optional size cap for the set (5-50, whole numbers); the questions themselves are never client-supplied.
+    const raw = req.body && typeof req.body === 'object' ? req.body.maxQuestions : undefined;
+    if (raw !== undefined && (!Number.isInteger(raw) || raw < 5 || raw > 50)) return res.status(400).json(ResponseUtil.error('maxQuestions must be a whole number from 5 to 50', 400));
+    const draft = await sets.createDraft({ profile, userId: req.user?._id || null, maxVisibility: raw ?? null });
     return res.status(201).json(ResponseUtil.success(toQuestionSetDto(draft, { currentProfileHash: profile.profileHash }), 'Question draft generated. Review and approve it to use it.'));
   } catch (error) {
     return handleError(res, error, req, 'generate the question set');

@@ -1,3 +1,5 @@
+import { mentions } from './brandMatchingService.js';
+
 /**
  * Citation URL normalization and target-domain matching. Provider-independent, pure.
  *
@@ -133,10 +135,11 @@ export function classifyCitations({ answerText, annotations, targetHost, brandNa
 
   // Position of the business among list items ("1. **X**", "- X", "### X").
   let brandListPosition = null;
-  const names = brandNames.filter(Boolean).map((n) => n.toLowerCase());
+  const names = brandNames.filter(Boolean);
   if (names.length) {
     const items = text.split(/\n+/).filter((l) => /^\s*(?:\d{1,2}[.)]|[-*•]|#{1,4}|\*\*\[?)/.test(l));
-    const idx = items.findIndex((l) => names.some((n) => l.toLowerCase().includes(n)));
+    // Boundary-aware, never a substring test ("Apollo" must not match "Apollonia").
+    const idx = items.findIndex((l) => names.some((n) => mentions(l, n)));
     if (idx >= 0) brandListPosition = idx + 1;
   }
 

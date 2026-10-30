@@ -43,6 +43,7 @@ export function toProfileDto(project, social) {
   if (!isIndustryValue(project.industry)) missingProfile.push('industry');
   if (!profile.business.subIndustry) missingProfile.push('sub_industry');
   if (project.seo_scope === 'local' && !profile.market.city) missingProfile.push('target_city');
+  if (!profile.market.countryCode) missingProfile.push('country');
   return {
     project: {
       name: profile.business.name,
@@ -52,9 +53,10 @@ export function toProfileDto(project, social) {
       legacyIndustryText: project.industry && !isIndustryValue(project.industry) ? project.industry : null,
       subIndustry: project.sub_industry || null,
       targetCity: project.target_city || null,
+      targetState: project.target_state || null,
       locationSource: project.location_source || null,
       location: project.location || null,
-      country: project.country || null,
+      country: project.country || profile.market.countryCode || null,
       seoScope: project.seo_scope || null,
       physicalCity: profile.market.physicalCity,
     },
@@ -128,6 +130,13 @@ export function buildProfileUpdate(body = {}) {
   if ('targetCity' in body) {
     const v = text('targetCity', 100);
     if (v !== undefined) { set.target_city = v; set.location_source = v ? 'user_entered' : null; }
+  }
+  if ('targetState' in body) { const v = text('targetState', 100); if (v !== undefined) set.target_state = v; }
+  if ('country' in body) {
+    // ISO 3166-1 alpha-2, the form every location lookup uses; null clears it.
+    if (body.country === null || body.country === '') set.country = null;
+    else if (typeof body.country !== 'string' || !/^[A-Za-z]{2}$/.test(body.country.trim())) errors.country = 'Choose a country';
+    else set.country = body.country.trim().toUpperCase();
   }
   for (const [key, field] of Object.entries(LIST_FIELDS)) {
     if (!(key in body)) continue;

@@ -19,7 +19,7 @@ describe('business profile: complete profiles', () => {
     assert.equal(p.market.label, 'Ahmedabad, Gujarat, India');
     assert.equal(p.website.targetHost, 'asgeye.example');
     assert.deepEqual(p.business.aliases, []);
-    assert.equal(p.business.aliasesSupported, false);
+    assert.equal(p.business.aliasesSupported, true); // derived aliases are supported; this listing name yields none
     assert.match(p.profileHash, /^[a-f0-9]{64}$/);
   });
 

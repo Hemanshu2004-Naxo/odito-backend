@@ -113,9 +113,12 @@ describe('question sets (isolated MongoDB)', () => {
   test('draft generation is capped per project per day', async (t) => {
     if (!up) return t.skip('MongoDB not available');
     const p = oid();
-    for (let i = 0; i < MAX_DRAFTS_PER_DAY; i += 1) await draft(p);
-    await assert.rejects(() => draft(p), (e) => e.code === 'VISIBILITY_QUESTION_SET_LIMIT');
-    await draft(oid()); // a different project is unaffected
+    process.env.GOOGLE_AIO_VISIBILITY_LIMITS_ENABLED = 'true'; // the cap is opt-in, like the run limits
+    try {
+      for (let i = 0; i < MAX_DRAFTS_PER_DAY; i += 1) await draft(p);
+      await assert.rejects(() => draft(p), (e) => e.code === 'VISIBILITY_QUESTION_SET_LIMIT');
+      await draft(oid()); // a different project is unaffected
+    } finally { delete process.env.GOOGLE_AIO_VISIBILITY_LIMITS_ENABLED; }
     assert.ok(generateQuestionSet);
   });
 });

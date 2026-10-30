@@ -226,7 +226,9 @@ export function normalizeBusinessProfile({ project, socialProfile = null }) {
   }
   if (placesVerified && verifiedCity && city && normalizeKey(verifiedCity) !== normalizeKey(city)) warnings.push('physical_location_differs_from_target');
   // The listing's state only belongs with the listing's own city (e.g. not "Rajasthan" next to a Nashik target).
-  const state = citySource === 'verified_business.city' ? take(verified.state, 'state', 100) : null;
+  // A state the customer typed next to the target city wins; otherwise the listing's state, but only with the listing's own city.
+  const targetState = take(project.target_state, 'target_state', 100);
+  const state = citySource === 'verified_business.city' ? take(verified.state, 'state', 100) : (targetState || null);
   const effectiveScope = scope === 'local' && city ? 'local' : 'national';
   const targetCities = effectiveScope === 'local' ? dedupe([city, ...confirmed.targetCities].filter(Boolean)).slice(0, MAX_LIST) : [...confirmed.targetCities];
   if (scope === 'local' && !city) warnings.push('local_scope_without_city_treated_as_national');
@@ -253,7 +255,10 @@ export function normalizeBusinessProfile({ project, socialProfile = null }) {
       nameSource,
       nameVerified,
       nameReliability: name ? assessNameReliability(name, [industry, indLabel, ...services].filter(Boolean)) : { reliable: false, reason: 'empty' },
-      aliases: deriveBrandAliases(name, { cities: [verified.city, project.target_city, locationCity], extraNames: [take(project.business_name, 'business_name', 150, NAME_OPTS)].filter((v) => v && normalizeKey(v) !== normalizeKey(name)) }),
+      // A derived alias is only used when it can be matched reliably on its own: "Eye Hospital" (from "Eye Hospital of Mumbai") would
+      // "match" every answer that merely describes the category, so it is dropped rather than inflating mentions.
+      aliases: deriveBrandAliases(name, { cities: [verified.city, project.target_city, locationCity], extraNames: [take(project.business_name, 'business_name', 150, NAME_OPTS)].filter((v) => v && normalizeKey(v) !== normalizeKey(name)) })
+        .filter((a) => assessNameReliability(a, [industry, indLabel, ...services].filter(Boolean)).reliable),
       aliasesSupported: true,
       industry,
       industrySource,

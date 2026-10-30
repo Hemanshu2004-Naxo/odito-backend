@@ -68,6 +68,13 @@ const seoProjectSchema = new mongoose.Schema({
     maxlength: [100, 'Target city cannot exceed 100 characters'],
     default: null
   },
+  // The state / region of target_city. Optional: only needed to tell apart cities that share a name (e.g. Springfield).
+  target_state: {
+    type: String,
+    trim: true,
+    maxlength: [100, 'Target state cannot exceed 100 characters'],
+    default: null
+  },
   // How target_city / location were obtained. Only user_entered and google_places count as confirmed.
   location_source: {
     type: String,
@@ -494,6 +501,61 @@ const seoProjectSchema = new mongoose.Schema({
     favicon_url: { type: String, default: null },
     favicon_source: { type: String, default: null }, // 'link:apple-touch-icon' | 'link:icon' | 'link:shortcut-icon' | 'favicon.ico'
     resolved_at: { type: Date, default: null }
+  },
+
+  // 🏁 Competitors page settings (additive and optional: absent on every existing project, read as an empty list).
+  // Both are `select: false` so a project list never carries up to 1,000 domains; the competitor-settings service
+  // reads and writes them explicitly. Entries are clean domains (see normalizeDomainInput) and are written with
+  // $addToSet + a length guard, so the caps hold even with two tabs open. They go away with the project.
+  // tracked_competitors: domains pinned for the Compare section (max 10).
+  tracked_competitors: {
+    type: [String],
+    default: undefined,
+    select: false,
+    validate: { validator: (v) => !v || v.length <= 10, message: 'At most 10 competitors can be tracked' }
+  },
+  // excluded_competitors: the project's own exclude list, sent to DataForSEO as exclude_domains (max 1,000).
+  excluded_competitors: {
+    type: [String],
+    default: undefined,
+    select: false,
+    validate: { validator: (v) => !v || v.length <= 1000, message: 'At most 1,000 domains can be excluded' }
+  },
+
+  // 🏁 Anchors page settings (additive and optional: absent on every existing project = "never saved", the page then suggests defaults).
+  // All three are `select: false`; the anchor-settings service reads and writes them explicitly, in one atomic $set.
+  // anchor_brand_terms: lowercase terms that make an anchor "Branded" (max 20). anchor_target_keywords: the money keywords that make
+  // it "Exact match" / "Partial match" (max 100). anchor_settings_saved_at: when the user first saved them.
+  anchor_brand_terms: {
+    type: [String],
+    default: undefined,
+    select: false,
+    validate: { validator: (v) => !v || v.length <= 20, message: 'At most 20 brand terms can be saved' }
+  },
+  anchor_target_keywords: {
+    type: [String],
+    default: undefined,
+    select: false,
+    validate: { validator: (v) => !v || v.length <= 100, message: 'At most 100 target keywords can be saved' }
+  },
+  anchor_settings_saved_at: { type: Date, default: undefined, select: false },
+
+  // 🏁 Referring Domains page lists (additive and optional: absent on every existing project = empty lists). Both are `select: false`:
+  // the domain-list service reads and writes them explicitly (.select('+disavowed_domains +reviewed_domains')); a bare project read never
+  // carries them. Entries are clean domains (see normalizeDomainInput), changed only by one atomic pipeline update with a size guard.
+  // disavowed_domains: domains the user marked to disavow (the Google disavow file is built from them). reviewed_domains: marked "OK / keep".
+  // The two never share a domain. They go away with the project.
+  disavowed_domains: {
+    type: [String],
+    default: undefined,
+    select: false,
+    validate: { validator: (v) => !v || v.length <= 10000, message: 'At most 10,000 domains can be disavowed' }
+  },
+  reviewed_domains: {
+    type: [String],
+    default: undefined,
+    select: false,
+    validate: { validator: (v) => !v || v.length <= 10000, message: 'At most 10,000 domains can be marked as reviewed' }
   }
 
 }, {

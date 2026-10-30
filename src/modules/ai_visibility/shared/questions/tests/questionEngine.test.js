@@ -118,13 +118,9 @@ describe('template expansion', () => {
     assert.equal(buildTemplateQuestions(buildQuestionInputs(noProblems).inputs).filter((q) => q.intent === 'problem_solving').length, 0);
   });
 
-  test('brand diagnostic questions are a separate group, name the brand, and use the confirmed target city', () => {
+  test('brand-name (diagnostic) questions are switched off: none are generated, so no question can name the business', () => {
     const p = full();
-    const brand = buildBrandQuestions(p, buildQuestionInputs(p).inputs);
-    assert.ok(brand.length >= 2);
-    for (const q of brand) { assert.equal(q.group, GROUPS.BRAND_REPUTATION); assert.equal(q.brandNamed, true); assert.match(q.text, /ASG Eye Hospital/); }
-    assert.ok(brand.some((q) => q.text.startsWith('What services does ASG Eye Hospital provide in Mumbai?')));
-    assert.ok(!brand.some((q) => /Ahmedabad/.test(q.text)));
+    assert.deepEqual(buildBrandQuestions(p, buildQuestionInputs(p).inputs), []);
   });
 
   test('pluralization of the business kind', () => {
@@ -174,10 +170,10 @@ describe('question validation', () => {
 });
 
 describe('generateQuestionSet', () => {
-  test('without OpenAI: the validated template set plus a separate brand group, built from the stored profile', async () => {
+  test('without OpenAI: the validated template set (discovery only, no brand group), built from the stored profile', async () => {
     const set = await generateQuestionSet(full(), noAi);
     assert.equal(set.generatedBy, 'template');
-    assert.ok(set.questions.some((q) => q.group === GROUPS.BRAND_REPUTATION));
+    assert.ok(!set.questions.some((q) => q.group === GROUPS.BRAND_REPUTATION));
     assert.ok(set.questions.filter((q) => q.group === GROUPS.VISIBILITY).length >= 10);
     assert.equal(validateQuestionSet(set.questions, ctxFor(full())).valid, true);
     assert.deepEqual(set.inputs.cities, ['Mumbai', 'Pune']);

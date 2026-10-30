@@ -27,6 +27,7 @@ import issueContextRoutes from '../modules/issue-context/routes/issueContextRout
 import fixLogRoutes from '../modules/fix-logs/routes/fixLogRoutes.js';
 import taskRoutes from '../modules/tasks/routes/taskRoutes.js';
 import auditHistoryRoutes from '../modules/audit_history/routes/auditHistoryRoutes.js';
+import domainOverviewRoutes from '../modules/dataforseo-api/domain_overview/routes/domainOverviewRoutes.js';
 import verificationHistoryRoutes from '../modules/verification/routes/verificationHistoryRoutes.js';
 import pagespeedRoutes from '../modules/pagespeed/routes/pagespeedRoutes.js';
 import aiHubRoutes from '../modules/ai_hub/routes/aiHubRoutes.js';
@@ -55,7 +56,7 @@ import socialAIStrategyRoutes from '../modules/social_meta/routes/socialAIStrate
 import socialContentCalendarRoutes from '../modules/social_meta/routes/socialContentCalendarRoutes.js';
 import socialAIContentRoutes from '../modules/social_meta/routes/socialAIContentRoutes.js';
 import socialAIDesignRoutes from '../modules/social_meta/routes/socialAIDesignRoutes.js';
-import chatgptVisibilityRoutes from '../modules/ai_visibility/chatgpt_visibility/routes/chatgptVisibilityRoutes.js';
+import googleAioVisibilityRoutes from '../modules/ai_visibility/google_aio_visibility/routes/googleAioRoutes.js';
 import aiVisibilityQuestionRoutes from '../modules/ai_visibility/shared/questions/routes/questionSetRoutes.js';
 const router = express.Router();
 
@@ -69,9 +70,9 @@ router.use('/app_user', businessRoutes);
 router.use('/seo', scrapingRoutes);
 // SEO onboarding routes (keyword generation + ranking check)
 router.use('/seo', seoOnboardingRoutes);
-// ChatGPT Visibility: sampled ChatGPT answers/citations (NOT on-page AI readiness, which lives under /app_user/projects/:id/ai-visibility)
-router.use('/ai-visibility/chatgpt', chatgptVisibilityRoutes);
-// Provider-independent AI Visibility question bank: generate -> review -> approve a versioned question set (registered after /chatgpt)
+// Google AI Overview Visibility: DataForSEO Google Organic SERP (live/advanced), five questions per run. Separate collections from ChatGPT.
+router.use('/ai-visibility/google-aio', googleAioVisibilityRoutes);
+// Provider-independent AI Visibility question bank: generate -> review -> approve a versioned question set 
 router.use('/ai-visibility', aiVisibilityQuestionRoutes);
 // URL Verification history (read-only)
 router.use('/seo', verificationHistoryRoutes);
@@ -124,6 +125,10 @@ router.use('/fix-logs', fixLogRoutes);
 router.use('/tasks', taskRoutes);
 // Audit history and comparison routes
 router.use('/projects', auditHistoryRoutes);
+// Referring Domains is served by the shared Domain Overview router below (sections referring-domains, rd-rank-buckets, rd-toxic-count,
+// plus /referring-domains-export and /referring-domain-settings): one API 9 integration, one cache.
+// Domain Overview (DataForSEO Labs + Backlinks summary): /projects/:projectId/domain-overview/:section. Cached in MongoDB; see modules/dataforseo-api/domain_overview/.
+router.use('/projects', domainOverviewRoutes);
 // PageSpeed standalone rescan routes
 router.use('/pagespeed', pagespeedRoutes);
 // AISO Hub V2 routes

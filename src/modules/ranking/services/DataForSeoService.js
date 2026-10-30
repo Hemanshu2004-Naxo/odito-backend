@@ -12,9 +12,22 @@ const ENDPOINTS = {
   // type === 'organic' count toward a ranking (RankingParserService.parseOrganic).
   SERP_ORGANIC:        `${BASE_URL}/serp/google/organic/live/advanced`,
   MAPS:                `${BASE_URL}/serp/google/maps/live/advanced`,
-  // AI Optimization: ChatGPT LLM Responses (live). Used by modules/ai_visibility/chatgpt_visibility.
-  CHATGPT_LLM_RESPONSES: `${BASE_URL}/ai_optimization/chat_gpt/llm_responses/live`,
-  CHATGPT_LLM_MODELS:    `${BASE_URL}/ai_optimization/chat_gpt/llm_responses/models`,
+  // Backlinks: referring domains (live). Used by the Referring Domains page (modules/dataforseo-api/domain_overview, sections referring-domains / rd-*).
+  BACKLINKS_REFERRING_DOMAINS: `${BASE_URL}/backlinks/referring_domains/live`,
+  // Domain Overview page (modules/dataforseo-api/domain_overview): four Labs endpoints + the backlinks summary.
+  LABS_DOMAIN_RANK_OVERVIEW:       `${BASE_URL}/dataforseo_labs/google/domain_rank_overview/live`,
+  LABS_HISTORICAL_RANK_OVERVIEW:   `${BASE_URL}/dataforseo_labs/google/historical_rank_overview/live`,
+  LABS_RANKED_KEYWORDS:            `${BASE_URL}/dataforseo_labs/google/ranked_keywords/live`,
+  LABS_COMPETITORS_DOMAIN:         `${BASE_URL}/dataforseo_labs/google/competitors_domain/live`,
+  // Competitors page, Compare section.
+  LABS_BULK_TRAFFIC_ESTIMATION:    `${BASE_URL}/dataforseo_labs/google/bulk_traffic_estimation/live`,
+  BACKLINKS_SUMMARY:              `${BASE_URL}/backlinks/summary/live`,
+  // Backlinks page: the individual links.
+  BACKLINKS_LIST:                 `${BASE_URL}/backlinks/backlinks/live`,
+  // Top Pages page: one row per page of the domain, with its link summary.
+  BACKLINKS_DOMAIN_PAGES:         `${BASE_URL}/backlinks/domain_pages/live`,
+  // Anchors page: one row per anchor text.
+  BACKLINKS_ANCHORS:              `${BASE_URL}/backlinks/anchors/live`,
 };
 
 function getAuthHeader() {
@@ -74,7 +87,7 @@ async function postOnce(url, payload, { timeoutMs = 60_000 } = {}) {
   if (data?.status_code !== 20000) {
     throw Object.assign(
       new Error(`DataForSEO API error: ${data?.status_message ?? 'unknown'} (code ${data?.status_code})`),
-      { isApiError: true, apiStatusCode: data?.status_code }
+      { isApiError: true, apiStatusCode: data?.status_code, apiStatusMessage: typeof data?.status_message === 'string' ? data.status_message.slice(0, 300) : null }
     );
   }
 
@@ -93,7 +106,11 @@ async function postOnce(url, payload, { timeoutMs = 60_000 } = {}) {
   if (task && task.status_code !== 20000) {
     throw Object.assign(
       new Error(`DataForSEO task error: ${task.status_message ?? 'unknown'} (code ${task.status_code})`),
-      { isApiError: true, isTaskError: true, taskStatusCode: task.status_code }
+      {
+        isApiError: true, isTaskError: true, taskStatusCode: task.status_code,
+        taskStatusMessage: typeof task.status_message === 'string' ? task.status_message.slice(0, 300) : null,
+        taskId: typeof task.id === 'string' ? task.id : null,
+      }
     );
   }
 
@@ -271,21 +288,54 @@ export const DataForSeoService = {
   },
 
   /**
-   * ChatGPT LLM Responses (live): ONE attempt, no retry here. The caller owns the retry policy because it must tell
-   * transient failures (429, 5xx, timeouts) from permanent ones (401, 402, 4xx, 40xxx task codes) and pace the retries.
-   * `body` is the single task object ({user_prompt, model_name, web_search, ...}); it is wrapped in the array the API expects.
-   * Errors keep err.response (HTTP status / headers), err.code, err.apiStatusCode and err.taskStatusCode. Neither the request
-   * (it carries the prompt) nor credentials are logged here.
+   * Google Organic SERP Live Advanced for AI Overview Visibility: ONE attempt, no retry here (every request is billed; the caller owns
+   * the retry policy). `body` is the single task object; it is wrapped in the array the API expects. Neither the request (it carries
+   * the question) nor credentials are logged. Errors keep err.response, err.code, err.apiStatusCode and err.taskStatusCode.
    */
-  postChatGptLlmResponse(body, { timeoutMs = 120_000 } = {}) {
-    return postOnce(ENDPOINTS.CHATGPT_LLM_RESPONSES, [body], { timeoutMs });
+  postGoogleOrganicLiveAdvanced(body, { timeoutMs = 90_000 } = {}) {
+    return postOnce(ENDPOINTS.SERP_ORGANIC, [body], { timeoutMs });
   },
 
-  /** The ChatGPT models the account can use (free listing endpoint): [{ model_name, reasoning, web_search_supported, ... }]. */
-  async getChatGptModels({ timeoutMs = 20_000 } = {}) {
-    const response = await axios.get(ENDPOINTS.CHATGPT_LLM_MODELS, { headers: makeHeaders(), timeout: timeoutMs });
-    const task = response.data?.tasks?.[0];
-    if (response.data?.status_code !== 20000 || task?.status_code !== 20000) throw new Error('DataForSEO model listing failed');
-    return Array.isArray(task.result) ? task.result : [];
+  /**
+   * Backlinks Referring Domains (live): ONE attempt, no retry — every call is billed, and the user can rerun the check.
+   * `body` is the single task object ({ target, limit, offset, order_by }); it is wrapped in the array the API expects.
+   * Errors keep err.response (HTTP status / headers), err.code, err.apiStatusCode and err.taskStatusCode for classification.
+   */
+  postBacklinksReferringDomains(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.BACKLINKS_REFERRING_DOMAINS, [body], { timeoutMs });
   },
+
+  /**
+   * The Domain Overview calls (all "live", all billed): ONE attempt each, no retry here — the cache layer and the user's Retry
+   * button own that decision. `body` is the single task object; it is wrapped in the array the API expects. Errors keep
+   * err.response, err.code, err.apiStatusCode and err.taskStatusCode for classification.
+   */
+  postDomainRankOverview(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_DOMAIN_RANK_OVERVIEW, [body], { timeoutMs });
+  },
+  postHistoricalRankOverview(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_HISTORICAL_RANK_OVERVIEW, [body], { timeoutMs });
+  },
+  postRankedKeywords(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_RANKED_KEYWORDS, [body], { timeoutMs });
+  },
+  postCompetitorsDomain(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_COMPETITORS_DOMAIN, [body], { timeoutMs });
+  },
+  postBulkTrafficEstimation(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_BULK_TRAFFIC_ESTIMATION, [body], { timeoutMs });
+  },
+  postBacklinksList(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.BACKLINKS_LIST, [body], { timeoutMs });
+  },
+  postBacklinksDomainPages(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.BACKLINKS_DOMAIN_PAGES, [body], { timeoutMs });
+  },
+  postBacklinksAnchors(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.BACKLINKS_ANCHORS, [body], { timeoutMs });
+  },
+  postBacklinksSummary(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.BACKLINKS_SUMMARY, [body], { timeoutMs });
+  },
+
 };

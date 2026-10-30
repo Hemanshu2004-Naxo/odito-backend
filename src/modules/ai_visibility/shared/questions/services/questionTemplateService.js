@@ -2,6 +2,8 @@ import crypto from 'crypto';
 import { INTENTS, INTENT_NAMES, GROUPS, BRAND_INTENT, QUESTION_LIMITS } from '../config/questionConfig.js';
 import { QUESTION_TEMPLATES, BRAND_TEMPLATES, SLOT_TO_INPUT, slotsOf, fillTemplate } from '../templates/questionBank.js';
 import { normalizeKey } from '../../utils/text.js';
+// The same text normalization the set validator uses for DUPLICATE_QUESTION, so whatever survives here also passes there.
+import { normalizeForMatching } from '../../services/brandMatchingService.js';
 
 /**
  * Deterministic expansion of the question bank into questions. Same profile always gives the same questions in the same order
@@ -74,7 +76,7 @@ function toQuestion(template, values, language, key) {
  * Round-robin across an intent's templates for variety. Which template asks a given MEANING is decided up front: the first (most
  * specific) template that can express a semantic key owns it, so a fall-back wording can never claim a key ahead of a better one.
  */
-function expandIntent(intent, inputs, target, takenKeys) {
+function expandIntent(intent, inputs, target, takenKeys, stats) {
   const queues = QUESTION_TEMPLATES
     .filter((t) => t.intent === intent)
     .map((t) => ({ t, list: combos(slotsOf(t), inputs), used: 0 }))
@@ -97,22 +99,34 @@ function expandIntent(intent, inputs, target, takenKeys) {
       progressed = true;
       if (t.max && q.used >= t.max) continue;
       const key = semanticKey(intent, t.topic, list[round]);
-      if (owner.get(key) !== t.id || takenKeys.has(key)) continue;
+      // Same meaning already asked (by a more specific template, or earlier): a duplicate, removed and counted.
+      if (owner.get(key) !== t.id || takenKeys.has(key)) { stats.duplicatesRemoved += 1; continue; }
+      // Same WORDING from another intent: "Which eye hospitals in Nashik offer cataract surgery?" comes out of both the service and the
+      // requirement template when a requirement is also a confirmed service. The first (earlier intent) keeps it; the copy is dropped.
+      const question = toQuestion(t, list[round], inputs.language, key);
+      const textKey = `text:${normalizeForMatching(question.text)}`;
+      if (takenKeys.has(textKey)) { stats.duplicatesRemoved += 1; continue; }
       takenKeys.add(key);
+      takenKeys.add(textKey);
       q.used += 1;
-      out.push(toQuestion(t, list[round], inputs.language, key));
+      out.push(question);
     }
   }
   return out;
 }
 
-/** @returns {object[]} unbranded discovery questions, in intent order */
-export function buildTemplateQuestions(inputs) {
+/**
+ * @param {object} inputs
+ * @param {{duplicatesRemoved:number}} [stats] filled in: how many template expansions were dropped as duplicates of a question's meaning
+ * @returns {object[]} unbranded discovery questions, in intent order
+ */
+export function buildTemplateQuestions(inputs, stats = { duplicatesRemoved: 0 }) {
   const out = [];
   const taken = new Set();
+  if (typeof stats.duplicatesRemoved !== 'number') stats.duplicatesRemoved = 0;
   // Most-specific templates first within an intent: a key claimed by the first template is never reworded by a later one.
   for (const intent of INTENT_NAMES) {
-    out.push(...expandIntent(intent, inputs, INTENTS[intent], taken));
+    out.push(...expandIntent(intent, inputs, INTENTS[intent], taken, stats));
     if (out.length >= QUESTION_LIMITS.maxQuestions) break;
   }
   return out.slice(0, QUESTION_LIMITS.maxQuestions);

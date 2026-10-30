@@ -23,18 +23,18 @@ const isDuplicateKey = (e) => e && (e.code === 11000 || e.code === 11001);
 const stateError = (message, details) => new VisibilityError(VISIBILITY_ERROR.QUESTION_SET_STATE, message, details);
 const notFound = () => new VisibilityError(VISIBILITY_ERROR.QUESTION_SET_NOT_FOUND, 'Question set not found');
 
-export async function createDraft({ profile, userId = null }, deps = {}) {
+export async function createDraft({ profile, userId = null, maxVisibility = null }, deps = {}) {
   const Model = deps.Model || AiVisibilityQuestionSet;
   const now = deps.now || (() => new Date());
   const generate = deps.generate || generateQuestionSet;
 
   const since = new Date(now().getTime() - 24 * 60 * 60 * 1000);
   const recent = await Model.countDocuments({ projectId: profile.projectId, createdAt: { $gte: since } });
-  if (String(process.env.CHATGPT_VISIBILITY_LIMITS_ENABLED).toLowerCase() === "true" && recent >= MAX_DRAFTS_PER_DAY) {
+  if (String(process.env.GOOGLE_AIO_VISIBILITY_LIMITS_ENABLED).toLowerCase() === 'true' && recent >= MAX_DRAFTS_PER_DAY) {
     throw new VisibilityError(VISIBILITY_ERROR.QUESTION_SET_LIMIT, 'Too many question sets were generated for this project today. Review or approve an existing draft.', { limit: MAX_DRAFTS_PER_DAY });
   }
 
-  const generated = await generate(profile, deps.generateDeps);
+  const generated = await generate(profile, { ...(deps.generateDeps || {}), ...(maxVisibility ? { maxVisibility } : {}) });
 
   for (let attempt = 1; attempt <= MAX_VERSION_ATTEMPTS; attempt += 1) {
     const last = await Model.findOne({ projectId: profile.projectId }).sort({ version: -1 }).select('version').lean();
@@ -53,6 +53,7 @@ export async function createDraft({ profile, userId = null }, deps = {}) {
         questions: generated.questions,
         missingBusinessInformation: generated.missingBusinessInformation,
         warnings: generated.warnings,
+        generationReport: generated.generationReport || null,
         tokenUsage: generated.tokenUsage,
         createdBy: userId,
         createdAt: now(),

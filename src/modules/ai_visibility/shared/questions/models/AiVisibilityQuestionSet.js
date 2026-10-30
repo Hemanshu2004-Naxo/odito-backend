@@ -48,6 +48,8 @@ const questionSetSchema = new mongoose.Schema({
   questions: { type: [questionSchema], default: [] },
   missingBusinessInformation: { type: [String], default: [] },
   warnings: { type: [String], default: [] },
+  // generated / accepted / rejected (+ reason codes) / duplicatesRemoved / per-intent coverage (questionGenerationService.buildGenerationReport)
+  generationReport: { type: mongoose.Schema.Types.Mixed, default: null },
   tokenUsage: { inputTokens: { type: Number, default: 0 }, outputTokens: { type: Number, default: 0 } },
   createdBy: { type: mongoose.Schema.Types.ObjectId, default: null },
   approvedAt: { type: Date, default: null },
