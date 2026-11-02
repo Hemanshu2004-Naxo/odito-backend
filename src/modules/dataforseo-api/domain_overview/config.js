@@ -41,6 +41,9 @@ export const SECTIONS = Object.freeze({
   'tp-counts':         { endpoint: 'backlinks/domain_pages/counts',          ttlMs: 7 * DAY },
   'tp-fix-first':      { endpoint: 'backlinks/domain_pages/fix-first',       ttlMs: 7 * DAY },
   'top-pages-traffic': { endpoint: 'backlinks/domain_pages/traffic',         ttlMs: 7 * DAY },
+  // My Competitors enrichment: the keywords the project and ONE competitor both rank for (DataForSEO Labs domain_intersection, live-checked).
+  // The provider refreshes this data weekly, so a week is the cache lifetime. Keyed by the competitor (target) + the project (variant) + the market.
+  'head-to-head':    { endpoint: 'labs/domain_intersection',       ttlMs: 7 * DAY },
   // The Competitors page's Compare section (API 5). Not on the dashboard.
   'bulk-traffic':    { endpoint: 'labs/bulk_traffic_estimation',   ttlMs: 24 * HOUR },
   // The Domain Overview's "Referring domains - last 30 days": two count-only calls (new, lost). The window starts on a Monday, so the key is stable for 7 days.
@@ -147,6 +150,17 @@ export const COMPETITORS_QUERY = Object.freeze({
 
 /** Competitors requests that are not the default view (paging / sorting / filtering / toggles), per user per window. Cache hits count too. */
 export const COMPETITORS_QUERY_LIMIT = Object.freeze({ windowMs: 15 * 60 * 1000, max: 300 });
+
+/**
+ * Head-to-head (domain_intersection) request, fixed: the project is target1 and the competitor target2, organic results only, the keywords
+ * with the most searches first. `keywordLimit` keywords are stored for the details view; the shared COUNT is the provider's total_count,
+ * which is exact however many are stored. The endpoint has no device parameter (the provider chooses), so none is sent or claimed.
+ */
+export const HEAD_TO_HEAD = Object.freeze({
+  itemTypes: Object.freeze(['organic']),
+  keywordLimit: 100,
+  orderBy: 'keyword_data.keyword_info.search_volume,desc',
+});
 
 /** Compare section (API 5): up to this many domains besides the project itself, and what is asked about each. */
 export const BULK_TRAFFIC = Object.freeze({

@@ -28,6 +28,10 @@ import fixLogRoutes from '../modules/fix-logs/routes/fixLogRoutes.js';
 import taskRoutes from '../modules/tasks/routes/taskRoutes.js';
 import auditHistoryRoutes from '../modules/audit_history/routes/auditHistoryRoutes.js';
 import domainOverviewRoutes from '../modules/dataforseo-api/domain_overview/routes/domainOverviewRoutes.js';
+import myCompetitorsRoutes from '../modules/competitors/routes/myCompetitorsRoutes.js';
+import competitorAssessmentRoutes from '../modules/competitors/routes/assessmentRoutes.js';
+import localCompetitorRoutes from '../modules/competitors/routes/localRoutes.js';
+import businessInfoRoutes from '../modules/app_user/routes/businessInfoRoutes.js';
 import verificationHistoryRoutes from '../modules/verification/routes/verificationHistoryRoutes.js';
 import pagespeedRoutes from '../modules/pagespeed/routes/pagespeedRoutes.js';
 import aiHubRoutes from '../modules/ai_hub/routes/aiHubRoutes.js';
@@ -129,6 +133,14 @@ router.use('/projects', auditHistoryRoutes);
 // plus /referring-domains-export and /referring-domain-settings): one API 9 integration, one cache.
 // Domain Overview (DataForSEO Labs + Backlinks summary): /projects/:projectId/domain-overview/:section. Cached in MongoDB; see modules/dataforseo-api/domain_overview/.
 router.use('/projects', domainOverviewRoutes);
+// My Competitors (user-chosen competitors, a project_competitors collection): /projects/:projectId/my-competitors. See modules/competitors/.
+router.use('/projects', myCompetitorsRoutes);
+// Business relevance of websites (direct / indirect / informational / not relevant / needs review), with user overrides. See modules/competitors/.
+router.use('/projects', competitorAssessmentRoutes);
+// Local Competitors: real businesses around the project's own location (Google Places, server-side; explicit, budgeted searches). See modules/competitors/.
+router.use('/projects', localCompetitorRoutes);
+// Project Settings → Business Information (identity, confirmed business location, Places address search): /projects/:projectId/business-info.
+router.use('/projects', businessInfoRoutes);
 // PageSpeed standalone rescan routes
 router.use('/pagespeed', pagespeedRoutes);
 // AISO Hub V2 routes

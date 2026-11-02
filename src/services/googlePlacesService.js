@@ -40,10 +40,13 @@ export const PLACES_ERROR = Object.freeze({
  * are for server logs only - controllers must not forward them to the browser.
  */
 export class PlacesError extends Error {
-  constructor(code, message, { upstreamStatus = null, upstreamReason = null } = {}) {
+  constructor(code, message, { upstreamStatus = null, upstreamReason = null, hint = null } = {}) {
     super(message);
     this.name = 'PlacesError';
     this.code = code;
+    // A finer cause for ACCESS_DENIED, safe to show: 'key_restricted' (the key's API / referrer / IP restriction blocks Places)
+    // or 'api_not_enabled' (Places API (New) is not enabled for the key's Cloud project; Google answers a bare PERMISSION_DENIED).
+    this.hint = hint;
     this.upstreamStatus = upstreamStatus;
     this.upstreamReason = upstreamReason;
   }
@@ -87,7 +90,8 @@ export function classifyPlacesError(error) {
     }
     // SERVICE_DISABLED, API_KEY_*_BLOCKED, or the bare PERMISSION_DENIED
     // Google returns when Places API (New) is not usable by this key's project.
-    return new PlacesError(PLACES_ERROR.ACCESS_DENIED, 'Google Places API access denied. Check your API key.', meta);
+    const restricted = /^API_KEY_(SERVICE|HTTP_REFERRER|IP_ADDRESS|ANDROID_APP|IOS_APP)_BLOCKED$/.test(reason || '');
+    return new PlacesError(PLACES_ERROR.ACCESS_DENIED, 'Google Places API access denied. Check your API key.', { ...meta, hint: restricted ? 'key_restricted' : 'api_not_enabled' });
   }
   if (status === 400) {
     return new PlacesError(PLACES_ERROR.INVALID_REQUEST, `Invalid search request: ${g?.message || error.message}`, meta);
@@ -495,7 +499,167 @@ export async function getPlaceDetails(placeId) {
   }
 }
 
+/**
+ * Google allows a search area of at most 50 km, and these two calls return at most 20 places each (no paging in Nearby Search).
+ * Fields requested for Local Competitors: identity, address, coordinates, categories, status, and the website / phone / rating that
+ * Google bills at its higher (Enterprise) tier - they are what lets a nearby business become a competitor with a website to analyse.
+ */
+export const PLACES_MAX_RADIUS_M = 50_000;
+export const PLACES_PAGE_LIMIT = 20;
+const NEARBY_FIELD_MASK = [
+  'places.id', 'places.displayName', 'places.formattedAddress', 'places.location', 'places.types', 'places.primaryType', 'places.primaryTypeDisplayName',
+  'places.businessStatus', 'places.websiteUri', 'places.nationalPhoneNumber', 'places.rating', 'places.userRatingCount', 'places.googleMapsUri',
+].join(',');
+
+/** One Google place -> the fields Odito uses. Only what Google returned: nothing is made up or defaulted into a value. */
+export function normalizeNearbyPlace(place) {
+  const id = place?.id || (place?.name ? String(place.name).replace(/^places\//, '') : '');
+  const name = place?.displayName?.text || '';
+  if (!id || !name) return null;
+  const lat = place.location?.latitude; const lng = place.location?.longitude;
+  return {
+    placeId: id,
+    name,
+    address: place.formattedAddress || null,
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+    types: Array.isArray(place.types) ? place.types : [],
+    primaryType: place.primaryType || null,
+    primaryTypeLabel: place.primaryTypeDisplayName?.text || null,
+    businessStatus: place.businessStatus || null,
+    website: place.websiteUri || null,
+    phone: place.nationalPhoneNumber || null,
+    rating: Number.isFinite(place.rating) ? place.rating : null,
+    reviewCount: Number.isFinite(place.userRatingCount) ? place.userRatingCount : null,
+    mapsUrl: place.googleMapsUri || null,
+  };
+}
+
+const inFlight = new Map();
+
+/**
+ * Places around a point: ONE Google request per call, either Nearby Search (`types`, a hard circle) or Text Search (`query`, a circle
+ * the results are biased towards - the caller filters by distance). Resolves to { places, capped } where `capped` means Google returned
+ * its maximum (20), so more may exist. Throws PlacesError for every failure.
+ *
+ * Nothing is cached: Google's terms do not allow keeping Places content, so identical requests that are IN FLIGHT at the same moment share
+ * one call (that is all), and every later call asks Google again. `client` is injectable for tests.
+ */
+export async function searchPlacesAround({ lat, lng, radiusMeters, types = null, query = null, requestId = null, timeoutMs = 10_000, client = null }) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw new PlacesError(PLACES_ERROR.INVALID_REQUEST, 'Invalid search request: the location is not valid.');
+  if (!Number.isFinite(radiusMeters) || radiusMeters <= 0 || radiusMeters > PLACES_MAX_RADIUS_M) throw new PlacesError(PLACES_ERROR.INVALID_REQUEST, 'Invalid search request: the radius must be between 1 m and 50 km.');
+  if (!query && !(types?.length)) throw new PlacesError(PLACES_ERROR.INVALID_REQUEST, 'Invalid search request: a category is required.');
+  const circle = { center: { latitude: lat, longitude: lng }, radius: radiusMeters };
+  const key = JSON.stringify([lat, lng, radiusMeters, types, query]);
+  if (inFlight.has(key)) return inFlight.get(key);
+  const run = (async () => {
+    try {
+      const http = client ?? getPlacesHttpClient({ timeoutMs });
+      const response = await withRetry(() => (query
+        ? http.post('places:searchText', { textQuery: query, maxResultCount: PLACES_PAGE_LIMIT, languageCode: 'en', locationBias: { circle } }, { headers: { 'X-Goog-FieldMask': NEARBY_FIELD_MASK } })
+        : http.post('places:searchNearby', { includedTypes: types, maxResultCount: PLACES_PAGE_LIMIT, languageCode: 'en', locationRestriction: { circle } }, { headers: { 'X-Goog-FieldMask': NEARBY_FIELD_MASK } })),
+      { retries: 2, baseDelayMs: 800 });
+      const data = response.data;
+      if (data === null || typeof data !== 'object' || Array.isArray(data) || (data.places !== undefined && !Array.isArray(data.places))) {
+        throw new PlacesError(PLACES_ERROR.BAD_RESPONSE, 'Google Places API returned an unexpected response.', { upstreamStatus: response.status });
+      }
+      const raw = data.places ?? [];
+      const places = []; const seen = new Set();
+      for (const p of raw) { const n = normalizeNearbyPlace(p); if (n && !seen.has(n.placeId)) { seen.add(n.placeId); places.push(n); } }
+      // Never the query text or the key in a log: only the kind of call and how many came back.
+      LoggerUtil.info('[GOOGLE_PLACES] Nearby discovery call completed', { requestId, provider: query ? 'google_places_v1_text_search' : 'google_places_v1_nearby_search', results: places.length, radiusMeters });
+      return { places, capped: raw.length >= PLACES_PAGE_LIMIT };
+    } catch (err) {
+      throw classifyPlacesError(err);
+    }
+  })().finally(() => { inFlight.delete(key); });
+  inFlight.set(key, run);
+  return run;
+}
+
+// ── Business-location picking (Project Settings): Autocomplete + one field-masked Place Details ──────────────────────────────────────
+
+// Only what the form needs. No reviews, photos, phone or rating: this call is about WHERE the business is.
+const LOCATION_DETAILS_FIELD_MASK = 'id,displayName,formattedAddress,addressComponents,location,websiteUri';
+const AUTOCOMPLETE_MIN_CHARS = 3;
+const AUTOCOMPLETE_MAX_CHARS = 200;
+const SESSION_TOKEN = /^[A-Za-z0-9_-]{16,64}$/;
+
+function assertSessionToken(sessionToken) {
+  if (typeof sessionToken !== 'string' || !SESSION_TOKEN.test(sessionToken)) throw new PlacesError(PLACES_ERROR.INVALID_REQUEST, 'Invalid search request: a session token is required.');
+}
+
+/** Address suggestions for what the user is typing. Billed per session: send the same token for the typing and for the final details call. */
+export async function autocompletePlaces({ input, sessionToken, regionCode = null, client = null, timeoutMs = 10_000 }) {
+  const text = typeof input === 'string' ? input.trim() : '';
+  if (text.length < AUTOCOMPLETE_MIN_CHARS || text.length > AUTOCOMPLETE_MAX_CHARS) throw new PlacesError(PLACES_ERROR.INVALID_REQUEST, 'Invalid search request: type at least 3 characters.');
+  assertSessionToken(sessionToken);
+  try {
+    const http = client ?? getPlacesHttpClient({ timeoutMs });
+    const body = { input: text, sessionToken, languageCode: 'en', ...(/^[A-Za-z]{2}$/.test(regionCode ?? '') ? { regionCode: regionCode.toUpperCase() } : {}) };
+    const response = await withRetry(() => http.post('places:autocomplete', body, { headers: { 'X-Goog-FieldMask': 'suggestions.placePrediction.placeId,suggestions.placePrediction.text,suggestions.placePrediction.structuredFormat' } }), { retries: 2, baseDelayMs: 600 });
+    const data = response.data;
+    if (data === null || typeof data !== 'object' || Array.isArray(data) || (data.suggestions !== undefined && !Array.isArray(data.suggestions))) {
+      throw new PlacesError(PLACES_ERROR.BAD_RESPONSE, 'Google Places API returned an unexpected response.', { upstreamStatus: response.status });
+    }
+    const suggestions = [];
+    for (const s of data.suggestions ?? []) {
+      const p = s?.placePrediction;
+      if (!p?.placeId) continue;
+      suggestions.push({ placeId: String(p.placeId), text: String(p.text?.text ?? ''), primary: String(p.structuredFormat?.mainText?.text ?? p.text?.text ?? ''), secondary: String(p.structuredFormat?.secondaryText?.text ?? '') });
+    }
+    return suggestions.slice(0, 5);
+  } catch (err) {
+    throw classifyPlacesError(err);
+  }
+}
+
+const component = (components, type, key = 'longText') => components.find((c) => Array.isArray(c?.types) && c.types.includes(type))?.[key] ?? null;
+
+/** Pure: a Place Details response -> the parts of an address the form shows. Missing parts stay null (never guessed). */
+export function normalizeLocationPlace(place) {
+  const lat = place?.location?.latitude;
+  const lng = place?.location?.longitude;
+  if (!place?.id || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const c = Array.isArray(place.addressComponents) ? place.addressComponents : [];
+  const streetNumber = component(c, 'street_number');
+  const route = component(c, 'route');
+  const premise = component(c, 'premise');
+  const line = [premise, [streetNumber, route].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+  return {
+    placeId: String(place.id),
+    name: place.displayName?.text ?? null,
+    address: place.formattedAddress ?? null,
+    addressLine: line || null,
+    city: component(c, 'locality') ?? component(c, 'postal_town') ?? component(c, 'administrative_area_level_2'),
+    state: component(c, 'administrative_area_level_1'),
+    country: component(c, 'country'),
+    countryCode: (component(c, 'country', 'shortText') ?? '').toUpperCase() || null,
+    postalCode: component(c, 'postal_code'),
+    website: place.websiteUri ?? null,
+    location: { lat, lng },
+  };
+}
+
+/** The details of the ONE place the user picked. Closes the autocomplete session when the same token is sent. */
+export async function getPlaceForLocation({ placeId, sessionToken, client = null, timeoutMs = 10_000 }) {
+  if (typeof placeId !== 'string' || !/^[A-Za-z0-9_-]{10,300}$/.test(placeId)) throw new PlacesError(PLACES_ERROR.INVALID_REQUEST, 'Invalid search request: the place is not valid.');
+  assertSessionToken(sessionToken);
+  try {
+    const http = client ?? getPlacesHttpClient({ timeoutMs });
+    const response = await withRetry(() => http.get(`places/${placeId}`, { params: { sessionToken, languageCode: 'en' }, headers: { 'X-Goog-FieldMask': LOCATION_DETAILS_FIELD_MASK } }), { retries: 2, baseDelayMs: 600 });
+    const place = normalizeLocationPlace(response.data);
+    if (!place) throw new PlacesError(PLACES_ERROR.BAD_RESPONSE, 'Google Places API returned a place without a location.', { upstreamStatus: response.status });
+    return place;
+  } catch (err) {
+    throw classifyPlacesError(err);
+  }
+}
+
 export default {
   searchBusinesses,
-  getPlaceDetails
+  getPlaceDetails,
+  searchPlacesAround,
+  autocompletePlaces,
+  getPlaceForLocation
 };

@@ -92,6 +92,8 @@ import { startAutomationScheduler } from './src/modules/aiCampaign/service/autom
 import { startInvestigationRecoveryScheduler } from './src/modules/ai-investigation/service/recoveryScheduler.js';
 import { startGoogleAioVisibilityScheduler } from './src/modules/ai_visibility/google_aio_visibility/workers/recoveryScheduler.js';
 import { startReviewSnapshotScheduler } from './src/services/businessProfileReviewSnapshotScheduler.js';
+import { warmMyCompetitorIndexes } from './src/modules/competitors/service/myCompetitorsService.js';
+import { startCompetitorEnrichmentScheduler } from './src/modules/competitors/workers/enrichmentScheduler.js';
 import { handleStripeWebhook } from './src/modules/subscription/controller/subscriptionController.js';
 import auth from './src/modules/user/middleware/auth.js';
 import { requireAdmin } from './src/middleware/auth.middleware.js';
@@ -260,6 +262,14 @@ const startServer = async () => {
 
 
   await connectDB();
+
+  // My Competitors: build + verify the project_competitors unique indexes (they ARE the duplicate / 100-entry guarantees). Not awaited:
+  // nothing else waits for it. If it fails the failure is logged and only My Competitors writes answer 503 until it succeeds (it is retried
+  // on the next write, so no restart is needed once the data / index problem is fixed). See modules/competitors/service/myCompetitorsService.js.
+  void warmMyCompetitorIndexes();
+  // My Competitors SEO enrichment: the background sweeper (lease-based, kill switch COMPETITOR_ENRICHMENT_ENABLED=false). It only ever
+  // picks up competitors a user saved; it never runs a provider call on a page load.
+  startCompetitorEnrichmentScheduler();
 
   // Weekly Recheck: daily cron tick that starts the Quick Recheck pipeline for
   // projects due for their scheduled refresh (never a full Recrawl, never

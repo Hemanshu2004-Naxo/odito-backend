@@ -22,6 +22,8 @@
     "migrate:backfill-recrawl-quota": "node src/modules/app_user/scripts/backfillRecrawlQuota.js",
     "report:project-profiles": "node src/modules/app_user/scripts/reportProjectProfileIssues.js",
     "inspect:social-indexes": "node src/modules/social_meta/scripts/inspectSocialAiIndexes.js",
+    "inspect:my-competitor-indexes": "node src/modules/competitors/scripts/inspectMyCompetitorIndexes.js",
+    "test:competitors": "node --test --test-concurrency=1 \"src/modules/competitors/tests/*.test.js\"",
     "package:seo-bridge-plugin": "node src/modules/external_integration/scripts/packageSeoBridgePlugin.js",
     "load:smoke": "node load-tests/index.js --level=smoke",
     "load:light": "node load-tests/index.js --level=light",

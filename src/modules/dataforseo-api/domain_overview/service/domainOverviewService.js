@@ -16,7 +16,7 @@ import { takeProviderCalls } from './providerBudget.js';
 import { getExcludedCompetitors } from './competitorSettingsService.js';
 import {
   SECTIONS, HISTORY_MONTHS, ANCHORS_QUERY, ANCHOR_PROFILE, REFERRING_DOMAINS_QUERY, RANK_BUCKETS, RD_COUNT_BUDGET, TOXIC_SPAM_ABOVE,
-  DOMAIN_PAGES_QUERY, TOP_PAGES_FIX_FIRST, TOP_PAGES_TRAFFIC, TP_PROFILE_BUDGET, RD_LAST_30, PEEKABLE_SECTIONS,
+  HEAD_TO_HEAD, DOMAIN_PAGES_QUERY, TOP_PAGES_FIX_FIRST, TOP_PAGES_TRAFFIC, TP_PROFILE_BUDGET, RD_LAST_30, PEEKABLE_SECTIONS,
 } from '../config.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
@@ -136,6 +136,81 @@ export async function getDomainOverviewSection({ project, section, refresh = fal
     ...(backlinksQuery ? { query: { status: backlinksQuery.status, dofollow: backlinksQuery.dofollow } } : {}),
     result: result.payload,
   };
+}
+
+/** The sections My Competitors enrichment may ask for about ANY domain (a competitor). Both are plain, one-call sections. */
+export const DOMAIN_SECTIONS = Object.freeze(['rank-overview', 'backlinks']);
+
+/**
+ * One Domain Overview section for an ARBITRARY clean domain (a competitor), through exactly the same cache, provider code and cache
+ * keys as getDomainOverviewSection - so the Domain Overview, the Competitors page and enrichment never buy the same answer twice. The
+ * market is passed in (the project's, see resolveMarket). `onProviderCall` runs only when a REAL call is about to be bought (inside the
+ * cache's fetcher, which does not run on a hit): that is where a caller reserves budget. A throw there cancels the call.
+ * Resolves to { payload, fetchedAt, cached, cost } - `cost` is the provider's charge for THIS call, null on a cache hit.
+ */
+export async function getSectionForDomain({ domain, market, section, refresh = false, onProviderCall = null }) {
+  if (!DOMAIN_SECTIONS.includes(section)) throw new ValidationFailure('section', `getSectionForDomain supports ${DOMAIN_SECTIONS.join(', ')} only`);
+  if (!hasCredentials()) throw new DataForSeoApiError(DATAFORSEO_ERROR.NOT_CONFIGURED);
+  const config = SECTIONS[section];
+  const marketSpecific = section === 'rank-overview';
+  const query = section === 'backlinks' ? parseBacklinksQuery({}) : undefined;
+  let cost = null;
+  const result = await getOrFetch({
+    endpoint: config.endpoint,
+    target: domain,
+    location: marketSpecific ? market.location_name : '',
+    language: marketSpecific ? market.language_name : '',
+    variant: query?.variant ?? '',
+    ttlMs: config.ttlMs,
+    refresh,
+    fetcher: async () => {
+      if (onProviderCall) await onProviderCall();
+      try {
+        const out = await fetchSection(section, { target: domain, market, now: new Date(), query });
+        cost = out.cost ?? null;
+        LoggerUtil.info('Domain overview: provider call completed', { section, target: domain, cost, purpose: 'competitor-enrichment' });
+        return out;
+      } catch (err) {
+        LoggerUtil.warn('Domain overview: provider call failed', { section, target: domain, code: err.code, httpStatus: err.httpStatus ?? null, providerCode: err.providerCode ?? null, purpose: 'competitor-enrichment' });
+        throw err;
+      }
+    },
+  });
+  return { payload: result.payload, fetchedAt: result.fetchedAt, cached: result.cached, cost };
+}
+
+/**
+ * The keywords the PROJECT and ONE competitor both rank for (My Competitors enrichment), through the same cache and provider code. Cached
+ * per (competitor, project, market): the market is part of the key because rankings differ per country / language. `onProviderCall` runs
+ * only when a real call is about to be bought. Resolves to { payload: { sharedTotal, keywords }, fetchedAt, cached, cost }.
+ */
+export async function getHeadToHead({ projectDomain, domain, market, refresh = false, onProviderCall = null }) {
+  if (!projectDomain || !domain || projectDomain === domain) throw new ValidationFailure('domain', 'A head-to-head needs two different domains.');
+  if (!hasCredentials()) throw new DataForSeoApiError(DATAFORSEO_ERROR.NOT_CONFIGURED);
+  const config = SECTIONS['head-to-head'];
+  let cost = null;
+  const result = await getOrFetch({
+    endpoint: config.endpoint,
+    target: domain,
+    location: market.location_name,
+    language: market.language_name,
+    variant: `vs:${projectDomain}:k${HEAD_TO_HEAD.keywordLimit}`,
+    ttlMs: config.ttlMs,
+    refresh,
+    fetcher: async () => {
+      if (onProviderCall) await onProviderCall();
+      try {
+        const out = await fetchSection('head-to-head', { target: domain, market, now: new Date(), query: { projectDomain } });
+        cost = out.cost ?? null;
+        LoggerUtil.info('Domain overview: provider call completed', { section: 'head-to-head', target: domain, cost, purpose: 'competitor-enrichment' });
+        return out;
+      } catch (err) {
+        LoggerUtil.warn('Domain overview: provider call failed', { section: 'head-to-head', target: domain, code: err.code, httpStatus: err.httpStatus ?? null, providerCode: err.providerCode ?? null, purpose: 'competitor-enrichment' });
+        throw err;
+      }
+    },
+  });
+  return { payload: result.payload, fetchedAt: result.fetchedAt, cached: result.cached, cost };
 }
 
 /**

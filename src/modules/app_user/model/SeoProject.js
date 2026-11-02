@@ -75,6 +75,9 @@ const seoProjectSchema = new mongoose.Schema({
     maxlength: [100, 'Target state cannot exceed 100 characters'],
     default: null
   },
+  // Project Settings → Business Information. The business's own categories (nothing else in the model holds them). Additive.
+  primary_category: { type: String, trim: true, maxlength: [100, 'Primary category cannot exceed 100 characters'], default: null },
+  secondary_categories: { type: [String], default: undefined },
   // How target_city / location were obtained. Only user_entered and google_places count as confirmed.
   location_source: {
     type: String,
@@ -440,7 +443,16 @@ const seoProjectSchema = new mongoose.Schema({
     verifiedAt: {
       type: Date,
       required: false
-    }
+    },
+    // Added by Project Settings → Business Information. All optional: absent on projects created by onboarding.
+    addressLine: { type: String, required: false, trim: true, maxlength: 200 },
+    postalCode: { type: String, required: false, trim: true, maxlength: 20 },
+    // Set ONLY when the user explicitly confirmed this location in Project Settings. It means "the customer says the business is
+    // here" - it is NOT a Google Business Profile ownership verification (that lives in BusinessProfileMetadata).
+    confirmedByUser: { type: Boolean, required: false },
+    confirmedAt: { type: Date, required: false },
+    // True when the user moved the map marker away from the point the selected place had.
+    coordinatesAdjusted: { type: Boolean, required: false }
   },
 
   // Project source tracking

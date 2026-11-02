@@ -19,6 +19,8 @@ const ENDPOINTS = {
   LABS_HISTORICAL_RANK_OVERVIEW:   `${BASE_URL}/dataforseo_labs/google/historical_rank_overview/live`,
   LABS_RANKED_KEYWORDS:            `${BASE_URL}/dataforseo_labs/google/ranked_keywords/live`,
   LABS_COMPETITORS_DOMAIN:         `${BASE_URL}/dataforseo_labs/google/competitors_domain/live`,
+  // My Competitors enrichment: the keywords BOTH the project and one competitor rank for (head-to-head, one competitor per call).
+  LABS_DOMAIN_INTERSECTION:        `${BASE_URL}/dataforseo_labs/google/domain_intersection/live`,
   // Competitors page, Compare section.
   LABS_BULK_TRAFFIC_ESTIMATION:    `${BASE_URL}/dataforseo_labs/google/bulk_traffic_estimation/live`,
   BACKLINKS_SUMMARY:              `${BASE_URL}/backlinks/summary/live`,
@@ -321,6 +323,9 @@ export const DataForSeoService = {
   },
   postCompetitorsDomain(body, { timeoutMs = 60_000 } = {}) {
     return postOnce(ENDPOINTS.LABS_COMPETITORS_DOMAIN, [body], { timeoutMs });
+  },
+  postDomainIntersection(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_DOMAIN_INTERSECTION, [body], { timeoutMs });
   },
   postBulkTrafficEstimation(body, { timeoutMs = 60_000 } = {}) {
     return postOnce(ENDPOINTS.LABS_BULK_TRAFFIC_ESTIMATION, [body], { timeoutMs });

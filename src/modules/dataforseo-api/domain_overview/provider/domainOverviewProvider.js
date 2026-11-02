@@ -7,7 +7,7 @@ import { toProviderFilters } from '../validator/rankedKeywordsQuery.js';
 import { toProviderFilters as toCompetitorFilters } from '../validator/competitorsQuery.js';
 import { toProviderFilters as toListFilters } from '../validator/filterConditions.js';
 import {
-  RANKED_KEYWORDS_LIMIT, RANKED_KEYWORDS_QUERY, COMPETITORS_QUERY, BULK_TRAFFIC, BACKLINKS_QUERY, BACKLINKS_LIST_QUERY, ANCHORS_QUERY, ANCHOR_PROFILE,
+  RANKED_KEYWORDS_LIMIT, RANKED_KEYWORDS_QUERY, COMPETITORS_QUERY, BULK_TRAFFIC, HEAD_TO_HEAD, BACKLINKS_QUERY, BACKLINKS_LIST_QUERY, ANCHORS_QUERY, ANCHOR_PROFILE,
   REFERRING_DOMAINS_QUERY, RANK_BUCKETS, TOXIC_SPAM_ABOVE, DOMAIN_PAGES_QUERY, DOMAIN_PAGES_BASE_FILTER, TOP_PAGES_FIX_FIRST, RD_LAST_30,
 } from '../config.js';
 import { windowStartDay } from '../../shared/dates.js';
@@ -170,6 +170,20 @@ export function buildRequest(section, { target, market = {}, now = new Date(), m
       // links were lost since then. The window starts on a Monday so the answer — and its 7-day cache entry — is the same all week.
       const since = windowStartDay(now, RD_LAST_30.days);
       return [countBody(target, ['first_seen', '>=', since]), countBody(target, ['lost_date', '>=', since], 'lost')];
+    }
+    case 'head-to-head': {
+      // target1 = the PROJECT (query.projectDomain), target2 = the competitor. `intersections: true` = keywords BOTH rank for (false would
+      // return the project-only keywords, a different metric). Domains are sent bare (no scheme, no www), as the provider requires.
+      return {
+        target1: query.projectDomain,
+        target2: target,
+        location_name: market.location_name,
+        language_name: market.language_name,
+        intersections: true,
+        item_types: [...HEAD_TO_HEAD.itemTypes],
+        limit: HEAD_TO_HEAD.keywordLimit,
+        order_by: [HEAD_TO_HEAD.orderBy],
+      };
     }
     case 'bulk-traffic': {
       // The project first, then the competitors (the provider answers in a different order: rows are matched by `target`).
@@ -350,6 +364,24 @@ const etvAndCount = (obj) => pick(obj, ['etv', 'count']);
  * Bulk traffic estimation: one entry per target the provider answered, in ITS order (not the request's) — callers match by `target`.
  * Each of organic / paid / featured_snippet / local_pack is { etv, count } or null when the provider has nothing for it.
  */
+/**
+ * domain_intersection result -> { sharedTotal, keywords }. `sharedTotal` is the provider's total_count (null when the answer carries none:
+ * "no answer", never 0). Each keyword has the project's position (first_domain_serp_element) and the competitor's (second_domain_serp_element).
+ */
+export function parseHeadToHead(result) {
+  if (!result || typeof result !== 'object') return { sharedTotal: null, keywords: [] };
+  const rank = (el) => (el && typeof el === 'object' ? { rank_group: num(el.rank_group), rank_absolute: num(el.rank_absolute), etv: num(el.etv), url: typeof el.url === 'string' ? el.url : null } : null);
+  const keywords = (Array.isArray(result.items) ? result.items : []).map((i) => ({
+    keyword: typeof i?.keyword_data?.keyword === 'string' ? i.keyword_data.keyword : null,
+    search_volume: num(i?.keyword_data?.keyword_info?.search_volume),
+    cpc: num(i?.keyword_data?.keyword_info?.cpc),
+    competition: num(i?.keyword_data?.keyword_info?.competition),
+    project: rank(i?.first_domain_serp_element),
+    competitor: rank(i?.second_domain_serp_element),
+  })).filter((k) => k.keyword);
+  return { sharedTotal: num(result.total_count), keywords };
+}
+
 export function parseBulkTraffic(result) {
   const list = Array.isArray(result?.items) ? result.items : [];
   return {
@@ -673,6 +705,7 @@ const PARSERS = {
   'competitors': parseCompetitors,
   'backlinks': parseBacklinksSummary,
   'bulk-traffic': parseBulkTraffic,
+  'head-to-head': parseHeadToHead,
   'backlinks-list': parseBacklinksList,
   'anchors': (result) => parseAnchors(result),
   'referring-domains': parseReferringDomains,
@@ -703,6 +736,7 @@ const defaultTransport = {
   'ranked-keywords': (body, opts) => DataForSeoService.postRankedKeywords(body, opts),
   'competitors': (body, opts) => DataForSeoService.postCompetitorsDomain(body, opts),
   'bulk-traffic': (body, opts) => DataForSeoService.postBulkTrafficEstimation(body, opts),
+  'head-to-head': (body, opts) => DataForSeoService.postDomainIntersection(body, opts),
   'backlinks-list': (body, opts) => DataForSeoService.postBacklinksList(body, opts),
   'anchors': (body, opts) => DataForSeoService.postBacklinksAnchors(body, opts),
   'referring-domains': (body, opts) => DataForSeoService.postBacklinksReferringDomains(body, opts),
