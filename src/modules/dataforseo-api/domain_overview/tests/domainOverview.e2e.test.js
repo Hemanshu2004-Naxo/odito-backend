@@ -6,6 +6,8 @@ import mongoose from 'mongoose';
 import express from 'express';
 
 dotenv.config();
+// This suite covers the read-through behaviour (a plain GET buys on a miss); database-first reads are covered in seo_data/tests.
+process.env.SEO_DB_FIRST_READS = 'false';
 // The real DataForSEO transport is replaced in before(); these placeholders only satisfy the credentials check.
 const REAL_LOGIN = process.env.DATAFORSEO_LOGIN;
 const REAL_PASSWORD = process.env.DATAFORSEO_PASSWORD;
@@ -16,6 +18,7 @@ import User from '../../../user/model/User.js';
 import SeoProject from '../../../app_user/model/SeoProject.js';
 import { signAuthToken } from '../../../user/service/tokenService.js';
 import DataForSeoCacheEntry from '../../shared/DataForSeoCacheEntry.js';
+import SeoSnapshot from '../../seo_data/model/SeoSnapshot.js';
 import { __resetInFlightForTests, MIN_REFRESH_INTERVAL_MS } from '../../shared/apiCache.js';
 import domainOverviewRoutes from '../routes/domainOverviewRoutes.js';
 import { __setTransportForTests } from '../provider/domainOverviewProvider.js';
@@ -159,6 +162,7 @@ after(async () => {
   process.env.DATAFORSEO_PASSWORD = REAL_PASSWORD;
   if (mongoAvailable) {
     await DataForSeoCacheEntry.deleteMany({ target: new RegExp(MARK) });
+    await SeoSnapshot.deleteMany({ domain: new RegExp(MARK) });
     await SeoProject.deleteMany({ project_name: new RegExp(MARK) });
     await User.deleteMany({ email: new RegExp(MARK) });
     await mongoose.connection.close();
@@ -250,7 +254,7 @@ describe('Domain Overview API (real router + live Mongo cache, stubbed provider)
 
   test('all five dashboard sections load in parallel, each with its own body; history is cached for 7 days', async (t) => {
     if (!mongoAvailable) return t.skip('MongoDB not available');
-    const FIVE = SECTION_NAMES.filter((s) => !['bulk-traffic', 'backlinks-list', 'anchors', 'anchor-profile', 'referring-domains', 'rd-rank-buckets', 'rd-toxic-count', 'rd-last-30', 'domain-pages', 'tp-counts', 'tp-fix-first', 'top-pages-traffic'].includes(s));
+    const FIVE = SECTION_NAMES.filter((s) => !['bulk-traffic', 'backlinks-list', 'anchors', 'anchor-profile', 'referring-domains', 'rd-rank-buckets', 'rd-toxic-count', 'rd-last-30', 'domain-pages', 'tp-counts', 'tp-fix-first', 'top-pages-traffic', 'head-to-head'].includes(s));
     const results = await Promise.all(FIVE.map((s) => call(url(projectA, s), { token: tokenA })));
     assert.deepEqual(results.map((r) => r.status), [200, 200, 200, 200, 200]);
     assert.equal(calls.length, 5);

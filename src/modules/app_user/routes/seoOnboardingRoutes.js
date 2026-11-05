@@ -10,6 +10,7 @@ import {
   deleteKeywordController,
   resolveWebsiteLocation
 } from '../controller/seoOnboardingController.js';
+import { getTrackedKeywordDetailsController } from '../../keyword_research/controller/trackedKeywordDetailsController.js';
 import auth from '../../user/middleware/auth.js';
 
 const router = express.Router();
@@ -56,6 +57,24 @@ const addKeywordRateLimiter = rateLimit({
     success: false,
     error: 'add_keyword_rate_limit_exceeded',
     message: 'Maximum 20 keyword additions per hour. Please try again later.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => process.env.NODE_ENV !== 'production'
+});
+
+/**
+ * Cheap reads, but each uncached one can buy a provider call, so expanding rows in a loop is bounded per user. The provider call itself
+ * has its own tighter budget in the service. Skipped outside production like the limiters above.
+ */
+const trackedDetailsRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  keyGenerator: (req) => req.user._id.toString(),
+  message: {
+    success: false,
+    error: 'keyword_details_rate_limit_exceeded',
+    message: 'Too many keyword detail requests. Please try again in a few minutes.'
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -122,6 +141,14 @@ router.post('/keywords/:projectId', addKeywordRateLimiter, addKeywordController)
  * @param   keyword - URL-encoded keyword string to remove
  */
 router.delete('/keywords/:projectId/:keyword', deleteKeywordController);
+
+/**
+ * @route   GET /api/seo/keywords/:projectId/:keywordId/details
+ * @desc    Everything one tracked keyword's expanded row shows: volume / KD / intent / CPC, rank state + history, SERP features, backlinks
+ * @access  Private (project and keyword must belong to the caller; anything else is 404)
+ * @cost    At most one ~$0.01 DataForSEO call per keyword and market per 14 days (cached); a per-user budget caps real calls
+ */
+router.get('/keywords/:projectId/:keywordId/details', trackedDetailsRateLimiter, getTrackedKeywordDetailsController);
 
 /**
  * @route   POST /api/seo/resolve-website-location

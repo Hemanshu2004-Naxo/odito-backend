@@ -1,6 +1,6 @@
 import { describe, test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { getOrFetch, getCachedOnly, cacheKey, MIN_REFRESH_INTERVAL_MS, __resetInFlightForTests } from '../apiCache.js';
+import { getOrFetch, getCachedOnly, getStored, cacheKey, MIN_REFRESH_INTERVAL_MS, __resetInFlightForTests } from '../apiCache.js';
 
 /** An in-memory store with the same read/write contract as the MongoDB one. */
 function memoryStore() {
@@ -145,5 +145,37 @@ describe('getCachedOnly (peek)', () => {
   test('a store that cannot be read is a miss, not an error', async () => {
     const broken = { read: async () => { throw new Error('mongo read'); }, write: async () => {} };
     assert.equal(await getCachedOnly(key, { store: broken, now }), null);
+  });
+});
+
+describe('stale data is kept, not deleted', () => {
+  test('getStored returns an expired entry flagged stale, and null when nothing was ever stored', async () => {
+    assert.equal(await getStored(base, { store, now }), null);
+    await getOrFetch({ ...base, fetcher: fetcherFor({ v: 1 }) }, { store, now });
+    clock += 25 * HOUR;
+    const stored = await getStored(base, { store, now });
+    assert.equal(stored.stale, true);
+    assert.equal(stored.payload.v, 1);
+    assert.equal(calls, 1, 'reading never calls the provider');
+    assert.equal(await getCachedOnly(base, { store, now }), null, 'a peek still treats expired as a miss by default');
+    assert.equal((await getCachedOnly(base, { store, now, allowStale: true })).stale, true);
+  });
+
+  test('a failed refresh keeps the last successful entry untouched and only notes the failed attempt', async () => {
+    store.markFailure = async (key, code, at) => { Object.assign(store.rows.get(key), { lastErrorCode: code, lastAttemptedAt: at }); };
+    await getOrFetch({ ...base, fetcher: fetcherFor({ v: 1 }) }, { store, now });
+    clock += 25 * HOUR;
+    const err = Object.assign(new Error('x'), { code: 'PROVIDER_DOWN' });
+    await assert.rejects(getOrFetch({ ...base, fetcher: fetcherFor({}, { fail: err }) }, { store, now }), err);
+    const row = store.rows.get(cacheKey(base));
+    assert.equal(row.payload.v, 1);
+    assert.equal(row.lastErrorCode, 'PROVIDER_DOWN');
+    assert.equal((await getStored(base, { store, now })).payload.v, 1);
+  });
+
+  test('a purchase reports its cost and expiry', async () => {
+    const r = await getOrFetch({ ...base, fetcher: fetcherFor({ v: 1 }, { cost: 0.07 }) }, { store, now });
+    assert.equal(r.cost, 0.07);
+    assert.equal(r.expiresAt.getTime() - r.fetchedAt.getTime(), 24 * HOUR);
   });
 });

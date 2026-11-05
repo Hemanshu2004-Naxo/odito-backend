@@ -1,4 +1,5 @@
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
+import { syncTrackedLocation } from '../../keyword_research/service/trackedLocationSync.js';
 import { AuthUtil } from '../../../utils/AuthUtil.js';
 import { COUNTRY_TO_LOCATION_CODE, extractCityFromAddress } from '../../../services/dataforseoLocationService.js';
 import { resolveLocalLocationCode } from '../../../services/localLocationResolver.js';
@@ -237,7 +238,7 @@ function logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain,
  * Run SERP + optional Maps API in parallel for a single keyword.
  * Returns a result object matching the shape the frontend expects.
  */
-async function processKeyword(keyword, cleanDomain, locationCode, languageCode, seoScope, businessName) {
+async function processKeyword(keyword, cleanDomain, locationCode, languageCode, seoScope, businessName, mapsIdentity = null) {
   const shouldFetchMaps = seoScope === 'local' && !!businessName?.trim();
 
   // Distinguishes "the organic SERP request/parse itself failed" from "the
@@ -252,29 +253,22 @@ async function processKeyword(keyword, cleanDomain, locationCode, languageCode, 
   const [{ desktop: desktopScan, mobile: mobileScan }, mapsResult] = await Promise.all([
     scanKeywordDevices({ keyword, locationCode, languageCode }),
     shouldFetchMaps
-      ? MapsRankingService.fetchMapsRank(keyword, businessName.trim(), locationCode, languageCode, cleanDomain)
+      ? MapsRankingService.fetchMapsRank(keyword, businessName.trim(), locationCode, languageCode, cleanDomain, mapsIdentity)
       : Promise.resolve({ maps_rank: null, maps_listing: null }),
   ]);
 
   const serpData  = desktopScan.serpData;
-  const serpError = desktopScan.serpError;
   const mobile    = buildDeviceResult(mobileScan, cleanDomain);
 
-  let rankingUrls = [], bestRank = null, organicMapsRank = null;
-  if (serpData) {
-    logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain, serpData });
-
-    const parsed     = RankingParserService.parseOrganic(serpData, cleanDomain);
-    rankingUrls      = parsed.ranking_urls;
-    bestRank         = parsed.best_rank;
-    // Same per-device line deviceSerpScan.buildDeviceResult prints for mobile,
-    // so both devices are visible in the logs.
-    console.log(
-      `[DEVICE_SCAN_RESULT] device=desktop | target="${cleanDomain}" | organicDepth=${RankingParserService.observedOrganicDepth(serpData) ?? 'null'} | ` +
-      `matched=${parsed.best_rank !== null} | rank=${parsed.best_rank ?? 'null'} | matchedUrls=${parsed.ranking_urls.length}`
-    );
-    organicMapsRank  = parsed.maps_rank;
-  }
+  if (serpData) logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain, serpData });
+  // Same per-device rules as mobile (deviceSerpScan.buildDeviceResult), including partial (40106) results: a rank found
+  // in the returned pages is kept, "not found" in a partial response is a scan_error (previous rank preserved).
+  const desktop         = buildDeviceResult(desktopScan, cleanDomain);
+  const serpError       = desktop.scan_error;
+  const rankingUrls     = desktop.ranking_urls;
+  const bestRank        = desktop.best_rank;
+  // Local pack items in the returned pages are real observations even when the organic verdict is unknown.
+  const organicMapsRank = serpData ? RankingParserService.parseOrganic(serpData, cleanDomain).maps_rank : null;
 
   // Maps merge logic — matches Python exactly:
   //   national:          always null
@@ -309,7 +303,8 @@ async function processKeyword(keyword, cleanDomain, locationCode, languageCode, 
   console.log(
     `[ORGANIC_RETURN] keyword="${keyword}" | rawResultCount=${serpData?.tasks?.[0]?.result?.length ?? 0} | ` +
     `organicResultCount=${serpData ? RankingParserService._collectAllItems(serpData).filter(i => i?.type === 'organic').length : 0} | ` +
-    `urlsCount=${rankingUrls.length} | detectedRank=${bestRank}`
+    `urlsCount=${rankingUrls.length} | detectedRank=${bestRank} | outcome=${desktop.serp?.outcome ?? (serpData ? 'complete' : 'failed')} | ` +
+    `providerCode=${desktop.serp?.provider_code ?? 'null'} | requestedDepth=${desktop.serp?.requested_depth ?? 'null'}`
   );
 
   return {
@@ -326,6 +321,22 @@ async function processKeyword(keyword, cleanDomain, locationCode, languageCode, 
     // Desktop result time (provider response received) — used by the persistence
     // layer to refuse an older result overwriting a newer one.
     scanned_at:   desktopScan.scanned_at,
+    attempts:     desktopScan.attempts ?? 1,
+    // Provider outcome for this desktop scan ({ outcome, provider_code, requested_depth, returned_results }); absent when
+    // the request failed before any response was received.
+    ...(desktop.serp ? { serp: desktop.serp } : {}),
+    // Independent Maps outcome (success | not_found | scan_error). Absent when Maps was not requested, so those keywords
+    // keep their previous maps fields untouched by the new status handling.
+    ...(shouldFetchMaps && mapsResult.maps_status ? {
+      maps: {
+        status:           mapsResult.maps_status,
+        error:            mapsResult.maps_error ?? null,
+        attempts:         mapsResult.attempts ?? 1,
+        match_level:      mapsResult.maps_match?.level ?? null,
+        match_confidence: mapsResult.maps_match?.confidence ?? null,
+        scanned_at:       new Date(),
+      },
+    } : {}),
     // Mobile organic result for the same keyword, or undefined when mobile
     // tracking is switched off (KEYWORD_MOBILE_RANKING_ENABLED=false). Shape:
     // { ranking_urls, best_rank, tracked_depth, scan_error, scanned_at }.
@@ -737,6 +748,10 @@ export const saveRanking = async (req, res) => {
         scan_error:   kw.scan_error      ?? null,
         // Per-device mobile result echoed from checkRanking (same round-trip as
         // scan_error); sanitised again in rankingHistoryService.buildMobileUpdate.
+        // Independent desktop attempt count + Maps outcome echoed from checkRanking (sanitised in rankingHistoryService).
+        attempts:     kw.attempts        ?? null,
+        ...(kw.serp && typeof kw.serp === 'object' ? { serp: kw.serp } : {}),
+        ...(kw.maps && typeof kw.maps === 'object' ? { maps: kw.maps } : {}),
         ...(kw.mobile && typeof kw.mobile === 'object' ? { mobile: kw.mobile } : {}),
       };
     });
@@ -803,6 +818,9 @@ export const getProjectRankings = async (req, res) => {
     }
 
     LoggerUtil.info('Get project rankings request', { projectId });
+
+    // A business location confirmed in Settings is where keywords are tracked from; bring a project saved before that rule up to date.
+    await syncTrackedLocation(projectId, userId);
 
     // Primary: canonical document from seo_rankings_current (single, always up-to-date)
     const canonical = await SeoRankingCurrent
@@ -921,22 +939,40 @@ export const getProjectRankings = async (req, res) => {
 //  from the two identical inline blocks, no logic changes.
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function resolveMapsBusinessName(projectId, userId, seoScope, logLabel) {
-  let businessName = null;
-  if (seoScope === 'local') {
-    try {
-      const project = await SeoProject
-        .findOne({ _id: projectId, user_id: userId })
-        .select('verified_business.name')
-        .lean();
-      businessName = project?.verified_business?.name || null;
-    } catch (projErr) {
-      LoggerUtil.warn(`${logLabel}: could not load project for Maps business_name`, {
-        projectId, error: projErr.message
-      });
-    }
+/**
+ * The business identity the Maps matcher needs: name plus whatever branch-level data the project really holds
+ * (Google place_id, address, coordinates, website). Fields the project does not have stay null — nothing is invented.
+ * @returns {Promise<{ name: string|null, identity: object|null }>}
+ */
+async function resolveMapsBusinessIdentity(projectId, userId, seoScope, logLabel) {
+  if (seoScope !== 'local') return { name: null, identity: null };
+  try {
+    const project = await SeoProject
+      .findOne({ _id: projectId, user_id: userId })
+      .select('verified_business')
+      .lean();
+    const vb = project?.verified_business;
+    if (!vb?.name) return { name: null, identity: null };
+    return {
+      name: vb.name,
+      identity: {
+        placeId: vb.placeId ?? null,
+        address: vb.address ?? null,
+        lat:     vb.location?.lat ?? null,
+        lng:     vb.location?.lng ?? null,
+        website: vb.website ?? null,
+      },
+    };
+  } catch (projErr) {
+    LoggerUtil.warn(`${logLabel}: could not load project for Maps business identity`, {
+      projectId, error: projErr.message
+    });
+    return { name: null, identity: null };
   }
-  return businessName;
+}
+
+async function resolveMapsBusinessName(projectId, userId, seoScope, logLabel) {
+  return (await resolveMapsBusinessIdentity(projectId, userId, seoScope, logLabel)).name;
 }
 
 
@@ -984,25 +1020,12 @@ export const rescanKeyword = async (req, res) => {
       });
     }
 
-    // Per-keyword cooldown: 30 minutes between rescans
-    const COOLDOWN_MS = 30 * 60 * 1000;
-    if (existingKw.last_rescanned_at) {
-      const elapsed = Date.now() - new Date(existingKw.last_rescanned_at).getTime();
-      if (elapsed < COOLDOWN_MS) {
-        const retryAfterSec = Math.ceil((COOLDOWN_MS - elapsed) / 1000);
-        return res.status(429).json({
-          success:     false,
-          error:       'keyword_cooldown',
-          message:     `This keyword was rescanned recently. Retry in ${Math.ceil(retryAfterSec / 60)} minute(s).`,
-          retry_after: retryAfterSec
-        });
-      }
-    }
+    // Per-keyword rescan cooldown (was 30 minutes) removed for now: a keyword can be rescanned at any time.
 
     LoggerUtil.info('Keyword rescan request', { projectId, keyword });
 
     // Look up business name for local projects (needed by Maps API)
-    const rescanBusinessName = await resolveMapsBusinessName(projectId, userId, canonical.seo_scope, 'rescanKeyword');
+    const { name: rescanBusinessName, identity: rescanIdentity } = await resolveMapsBusinessIdentity(projectId, userId, canonical.seo_scope, 'rescanKeyword');
 
     const cleanDomain  = RankingParserService.normalizeDomain(canonical.domain);
     // No `|| 2840` here — a rescan must use the SAME market the keyword was
@@ -1026,7 +1049,8 @@ export const rescanKeyword = async (req, res) => {
       locationCode,
       langCode,
       seoScope,
-      rescanBusinessName
+      rescanBusinessName,
+      rescanIdentity
     );
 
     const updated = await mergeSingleKeywordRescan({
@@ -1040,6 +1064,9 @@ export const rescanKeyword = async (req, res) => {
         maps_listing: result.maps_listing ?? null,
         scan_error:   result.scan_error   ?? null,
         scanned_at:   result.scanned_at   ?? null,
+        attempts:     result.attempts     ?? null,
+        serp:         result.serp         ?? null,
+        maps:         result.maps         ?? null,
         mobile:       result.mobile       ?? null,
       },
       scanSource: 'manual_rescan'
@@ -1230,7 +1257,7 @@ export const addKeywordController = async (req, res) => {
     LoggerUtil.info('Add keyword request', { projectId, keyword: trimmedKeyword });
 
     // Business name for Maps (local-scope projects only) — shared with rescanKeyword.
-    const addBusinessName = await resolveMapsBusinessName(projectId, userId, canonical.seo_scope, 'addKeywordController');
+    const { name: addBusinessName, identity: addIdentity } = await resolveMapsBusinessIdentity(projectId, userId, canonical.seo_scope, 'addKeywordController');
 
     const cleanDomain  = RankingParserService.normalizeDomain(canonical.domain);
     // No `|| 2840` — see the identical check in rescanKeyword above.
@@ -1251,7 +1278,8 @@ export const addKeywordController = async (req, res) => {
       locationCode,
       langCode,
       seoScope,
-      addBusinessName
+      addBusinessName,
+      addIdentity
     );
 
     let updated;
@@ -1267,6 +1295,9 @@ export const addKeywordController = async (req, res) => {
           maps_listing: result.maps_listing ?? null,
           scan_error:   result.scan_error   ?? null,
           scanned_at:   result.scanned_at   ?? null,
+          attempts:     result.attempts     ?? null,
+          serp:         result.serp         ?? null,
+          maps:         result.maps         ?? null,
           mobile:       result.mobile       ?? null,
         },
         planId,

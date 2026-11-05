@@ -1,4 +1,6 @@
-import { getOrFetch, getCachedOnly } from '../../shared/apiCache.js';
+import { getOrFetch, getCachedOnly, getStored } from '../../shared/apiCache.js';
+import { recordSectionSnapshot } from '../../seo_data/service/snapshotService.js';
+import { readFromDatabase } from '../../seo_data/datasets/datasetReader.js';
 import { normalizeTargetDomain, ValidationFailure } from '../../shared/targetDomain.js';
 import { windowStartDay } from '../../shared/dates.js';
 import { DataForSeoApiError, hasCredentials, DATAFORSEO_ERROR } from '../../shared/providerErrors.js';
@@ -21,10 +23,15 @@ import {
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
 /**
- * One Domain Overview section for a project: from the cache when it is fresh, otherwise one billed provider call whose
- * (slimmed) response is cached. The target and the market come from the project, never from the request.
+ * One Domain Overview section for a project. The target and the market come from the project, never from the request.
+ *
+ *  - providerAllowed (default): from the cache when it is fresh, otherwise one billed provider call whose (slimmed) response is cached.
+ *    A real call also appends a snapshot (seo_snapshots) for the sections that have one.
+ *  - providerAllowed: false (a normal page view): NEVER a provider call. The last stored answer is returned, fresh or `stale`; nothing stored
+ *    comes back as `missing: true` with `result: null`. The page then offers an explicit scan.
+ * `scanId` ties a snapshot to the scan that bought it.
  */
-export async function getDomainOverviewSection({ project, section, refresh = false, peek = false, months, query, userId = null, now = new Date() }) {
+export async function getDomainOverviewSection({ project, section, refresh = false, peek = false, months, query, userId = null, now = new Date(), providerAllowed = true, scanId = null }) {
   if (peek && (refresh || !PEEKABLE_SECTIONS.includes(section))) {
     throw new ValidationFailure('peek', refresh ? 'peek cannot be combined with refresh' : `peek applies to ${PEEKABLE_SECTIONS.join(', ')} only`);
   }
@@ -79,10 +86,22 @@ export async function getDomainOverviewSection({ project, section, refresh = fal
 
   const cacheArgs = { endpoint: config.endpoint, target, location: marketSpecific ? market.location_name : '', language: marketSpecific ? market.language_name : '', variant };
   // A peek is answered from the cache alone: no credentials needed, no provider call, no budget used. A miss says so (`result: null`).
-  const peeked = peek ? await getCachedOnly(cacheArgs) : null;
-  if (!peek && !hasCredentials()) throw new DataForSeoApiError(DATAFORSEO_ERROR.NOT_CONFIGURED);
+  // A stored (stale) answer is still an answer: it is shown with its age.
+  const peeked = peek ? await getCachedOnly(cacheArgs, { allowStale: true }) : null;
+  // A read-only view (no provider allowed) is answered from what is stored, fresh or stale; nothing stored = `missing`.
+  const readOnly = !peek && !providerAllowed;
+  const cached = readOnly ? await getStored(cacheArgs) : null;
+  // The row-level sections (keywords, backlinks, referring domains) are answered from their stored row sets in MongoDB when one exists:
+  // paging, sorting, filtering and search are database queries. The NEWEST stored answer wins, so a user's own refresh (which buys a
+  // cache entry) is not hidden behind an older collected set.
+  const fromDb = readOnly ? await readDatasetSafely({ project, section, query: rankedQuery ?? listQuery ?? rdQuery, now }) : null;
+  const useDb = Boolean(fromDb) && (!cached || cached.fetchedAt.getTime() <= fromDb.capturedAt.getTime());
+  const stored = useDb ? { payload: fromDb.payload, fetchedAt: fromDb.capturedAt, expiresAt: fromDb.expiresAt, cached: true, stale: fromDb.stale, refreshThrottled: false, dataset: fromDb.dataset } : cached;
+  if (!peek && !readOnly && !hasCredentials()) throw new DataForSeoApiError(DATAFORSEO_ERROR.NOT_CONFIGURED);
 
-  const result = peek ? (peeked ?? { payload: null, fetchedAt: null, cached: false, refreshThrottled: false }) : await getOrFetch({
+  const result = peek ? (peeked ?? { payload: null, fetchedAt: null, cached: false, stale: false, refreshThrottled: false })
+    : readOnly ? (stored ?? { payload: null, fetchedAt: null, expiresAt: null, cached: false, stale: false, missing: true, refreshThrottled: false })
+      : await getOrFetch({
     endpoint: config.endpoint,
     target,
     location: marketSpecific ? market.location_name : '',
@@ -108,12 +127,28 @@ export async function getDomainOverviewSection({ project, section, refresh = fal
     },
   });
 
+  // A REAL purchase (not a cache hit) is appended to the history. Best effort: a failed snapshot never loses the answer just bought.
+  if (!peek && !readOnly && !result.cached) {
+    await recordSectionSnapshot({
+      project, section, target, market, variant, payload: result.payload, fetchedAt: result.fetchedAt, cost: result.cost ?? null, scanId,
+      isDefaultView: isDefaultSectionView(section, query),
+    });
+  }
+
   return {
     section,
     target,
     market: { location: market.location_name, language: market.language_name },
     fetchedAt: result.fetchedAt ? result.fetchedAt.toISOString() : null,
     cached: result.cached,
+    // The provider's reported charge, for a scan's audit trail only (never sent to a browser: the controller does not pass a scanId).
+    ...(scanId ? { cost: result.cost ?? null } : {}),
+    // Freshness: `stale` = the stored answer is past its freshness deadline (still shown); `missing` = nothing was ever collected.
+    stale: Boolean(result.stale),
+    missing: Boolean(result.missing),
+    expiresAt: result.expiresAt ? new Date(result.expiresAt).toISOString() : null,
+    // Which stored row set answered (database-first sections only): its scan, how many rows it holds, the provider's total, and whether it is capped.
+    ...(result.dataset ? { source: 'database', dataset: result.dataset } : {}),
     ...(peek ? { peek: true } : {}),
     refreshThrottled: result.refreshThrottled,
     ttlSeconds: Math.round(config.ttlMs / 1000),
@@ -136,6 +171,25 @@ export async function getDomainOverviewSection({ project, section, refresh = fal
     ...(backlinksQuery ? { query: { status: backlinksQuery.status, dofollow: backlinksQuery.dofollow } } : {}),
     result: result.payload,
   };
+}
+
+/** A stored-dataset read that fails (database hiccup, a request shape the stored rows cannot represent) falls back to the cache path instead of failing the page. */
+async function readDatasetSafely(args) {
+  try {
+    return await readFromDatabase(args);
+  } catch (err) {
+    LoggerUtil.warn('Stored dataset read failed; falling back to the cache', { section: args.section, error: err?.message });
+    return null;
+  }
+}
+
+/** Is `query` the section's default view (the one a scan collects and the dashboard shows)? Sections without a query have one view only. */
+function isDefaultSectionView(section, query) {
+  if (!query) return true;
+  if (section === 'ranked-keywords') return query.variant === parseRankedKeywordsQuery({}).variant;
+  if (section === 'competitors') return query.variant === parseCompetitorsQuery({}).variant;
+  if (section === 'backlinks') return query.variant === parseBacklinksQuery({}).variant;
+  return false;
 }
 
 /** The sections My Competitors enrichment may ask for about ANY domain (a competitor). Both are plain, one-call sections. */

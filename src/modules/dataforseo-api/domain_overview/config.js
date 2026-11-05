@@ -451,3 +451,9 @@ export const BACKLINKS_EXPORT = Object.freeze({
 });
 /** Starting a large export is expensive: a small separate limit. */
 export const BACKLINKS_EXPORT_LIMIT = Object.freeze({ windowMs: 15 * 60 * 1000, max: 6 });
+
+/**
+ * Database-first reads: a page view never buys provider data (it shows what is stored, or says nothing was collected). Read per request so
+ * it can be switched off without a code change; only the literal string 'false' disables it.
+ */
+export const dbFirstReads = () => process.env.SEO_DB_FIRST_READS !== 'false';

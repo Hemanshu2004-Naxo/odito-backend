@@ -1,17 +1,17 @@
 import { getDomainOverviewSection } from '../service/domainOverviewService.js';
 import { parseMonths, parsePeek, parseRefresh, parseSection } from '../validator/domainOverviewValidation.js';
-import { parseRankedKeywordsQuery } from '../validator/rankedKeywordsQuery.js';
-import { COMPETITORS_PARAMS, parseCompetitorsQuery } from '../validator/competitorsQuery.js';
-import { BACKLINKS_PARAMS, parseBacklinksQuery } from '../validator/backlinksQuery.js';
-import { BACKLINKS_LIST_PARAMS, parseBacklinksListQuery } from '../validator/backlinksListQuery.js';
-import { ANCHORS_PARAMS, parseAnchorsQuery } from '../validator/anchorsQuery.js';
-import { REFERRING_DOMAINS_PARAMS, parseReferringDomainsQuery } from '../validator/referringDomainsQuery.js';
-import { DOMAIN_PAGES_PARAMS, parseDomainPagesQuery } from '../validator/domainPagesQuery.js';
+import { parseSectionQuery } from '../service/sectionQuery.js';
+import { COMPETITORS_PARAMS } from '../validator/competitorsQuery.js';
+import { BACKLINKS_PARAMS } from '../validator/backlinksQuery.js';
+import { BACKLINKS_LIST_PARAMS } from '../validator/backlinksListQuery.js';
+import { ANCHORS_PARAMS } from '../validator/anchorsQuery.js';
+import { REFERRING_DOMAINS_PARAMS } from '../validator/referringDomainsQuery.js';
+import { DOMAIN_PAGES_PARAMS } from '../validator/domainPagesQuery.js';
 import { getTopPagesSection } from '../service/topPagesService.js';
-import { PEEKABLE_SECTIONS } from '../config.js';
+import { PEEKABLE_SECTIONS, dbFirstReads } from '../config.js';
 import { ProviderBudgetExceeded } from '../service/providerBudget.js';
-import { BULK_TRAFFIC_PARAMS, parseBulkTrafficQuery } from '../validator/bulkTrafficQuery.js';
-import { ValidationFailure, normalizeTargetDomain } from '../../shared/targetDomain.js';
+import { BULK_TRAFFIC_PARAMS } from '../validator/bulkTrafficQuery.js';
+import { ValidationFailure } from '../../shared/targetDomain.js';
 import { DataForSeoApiError, DATAFORSEO_HTTP_STATUS, DATAFORSEO_USER_MESSAGE } from '../../shared/providerErrors.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
@@ -73,19 +73,12 @@ export async function getSection(req, res) {
     // meant for another section is a mistake worth a 400, never a silent no-op. Everything is validated against whitelists before a billed call.
     const stray = MANAGED_PARAMS.filter((k) => req.query[k] !== undefined && !(ALLOWED_PARAMS[section] ?? []).includes(k));
     if (stray.length) throw new ValidationFailure('query', `${stray.join(', ')} do not apply to the ${section} section`);
-    let query;
-    if (section === 'ranked-keywords') query = parseRankedKeywordsQuery(req.query);
-    else if (section === 'competitors') query = parseCompetitorsQuery(req.query);
-    // The project is always the first target; the browser only chooses who to compare it with.
-    else if (section === 'backlinks') query = parseBacklinksQuery(req.query);
-    else if (section === 'backlinks-list') query = parseBacklinksListQuery(req.query);
-    else if (section === 'anchors') query = parseAnchorsQuery(req.query);
-    else if (section === 'referring-domains') query = parseReferringDomainsQuery(req.query);
-    else if (section === 'domain-pages') query = parseDomainPagesQuery(req.query);
-    else if (section === 'bulk-traffic') query = parseBulkTrafficQuery(req.query, normalizeTargetDomain(req.project.main_url));
+    const query = parseSectionQuery(section, req.query, req.project);
     // The table and "Fix first" are answered with the traffic per page joined on (see service/topPagesService.js); every other section as it is.
     const ask = section === 'domain-pages' || section === 'tp-fix-first' ? getTopPagesSection : getDomainOverviewSection;
-    const data = await ask({ project: req.project, section, refresh, peek, months, query, userId: String(req.user?._id || '') });
+    // Opening a page is READ-ONLY: it answers from what is stored (SEO_DB_FIRST_READS, on by default). Only an explicit refresh (or a scan,
+    // see seo_data/) may buy provider data; SEO_DB_FIRST_READS=false restores the old read-through behaviour.
+    const data = await ask({ project: req.project, section, refresh, peek, months, query, userId: String(req.user?._id || ''), providerAllowed: !dbFirstReads() || refresh });
     // Per-user project data: nothing between the server and the browser may keep a copy (React Query owns client freshness).
     res.set('Cache-Control', 'no-store');
     return res.status(200).json({ success: true, data });

@@ -1,5 +1,12 @@
 import axios from 'axios';
-import { SERP_DEPTH, DEFAULT_SERP_DEVICE, resolveSerpDevice, createLimiter } from './serpDevices.js';
+import { randomUUID } from 'crypto';
+import { resolveSerpDepth, DEFAULT_SERP_DEVICE, resolveSerpDevice, createLimiter } from './serpDevices.js';
+import {
+  classifyDataForSeoError, computeBackoffMs, parseEnvelope, readRetryConfig, resolveMaxAttempts, DFS_TASK_CODES,
+} from './dataForSeoRetry.js';
+import {
+  ORGANIC_ACCEPTED_TASK_CODES, ORGANIC_OUTCOMES, assessOrganicOutcome, summarizeOrganicResponse, toSerpMeta,
+} from './serpResponseOutcome.js';
 
 const BASE_URL = 'https://api.dataforseo.com/v3';
 
@@ -21,8 +28,10 @@ const ENDPOINTS = {
   LABS_COMPETITORS_DOMAIN:         `${BASE_URL}/dataforseo_labs/google/competitors_domain/live`,
   // My Competitors enrichment: the keywords BOTH the project and one competitor rank for (head-to-head, one competitor per call).
   LABS_DOMAIN_INTERSECTION:        `${BASE_URL}/dataforseo_labs/google/domain_intersection/live`,
+  // Tracked Keywords details: one keyword's volume, 12-month volume, KD, intent, CPC, competition, bids and SERP features.
+  LABS_KEYWORD_OVERVIEW:           `${BASE_URL}/dataforseo_labs/google/keyword_overview/live`,
   // Competitors page, Compare section.
-  LABS_BULK_TRAFFIC_ESTIMATION:    `${BASE_URL}/dataforseo_labs/google/bulk_traffic_estimation/live`,
+  LABS_BULK_TRAFFIC_ESTIMATION:   `${BASE_URL}/dataforseo_labs/google/bulk_traffic_estimation/live`,
   BACKLINKS_SUMMARY:              `${BASE_URL}/backlinks/summary/live`,
   // Backlinks page: the individual links.
   BACKLINKS_LIST:                 `${BASE_URL}/backlinks/backlinks/live`,
@@ -60,11 +69,13 @@ export function buildSerpOrganicPayload(keyword, locationCode, languageCode, dev
     keyword,
     location_code: locationCode,
     language_code: languageCode,
-    depth:         SERP_DEPTH,
+    depth:         resolveSerpDepth(),
     device:        config.device,
     os:            config.os,
   }];
 }
+
+const DEFAULT_BASE_DELAY_MS = 2_000;
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -77,14 +88,19 @@ function sleep(ms) {
  * Throws on DataForSEO API-level errors (status_code !== 20000) and on task-level errors (tasks[0].status_code !== 20000),
  * attaching the provider codes (apiStatusCode / taskStatusCode) so callers can classify without parsing messages.
  * Network/HTTP errors are axios errors: err.response.status, err.response.headers, err.code are intact.
+ *
+ * `acceptTaskCodes`: task codes that mean "the task completed" for this caller (e.g. 40106 partial results for organic
+ * SERPs) — returned as data instead of thrown. Every other caller keeps the strict 20000-only behaviour.
+ * The returned object carries non-enumerable `dfsHttpStatus`.
  */
-async function postOnce(url, payload, { timeoutMs = 60_000 } = {}) {
+async function postOnce(url, payload, { timeoutMs = 60_000, acceptTaskCodes = null } = {}) {
   const response = await axios.post(url, payload, {
     headers: makeHeaders(),
     timeout: timeoutMs,
   });
 
-  const data = response.data;
+  const data = parseEnvelope(response.data);
+  Object.defineProperty(data, 'dfsHttpStatus', { value: response.status ?? null, enumerable: false });
 
   if (data?.status_code !== 20000) {
     throw Object.assign(
@@ -105,7 +121,7 @@ async function postOnce(url, payload, { timeoutMs = 60_000 } = {}) {
   // searched and the target domain genuinely wasn't found". Caught
   // here instead, before any parsing happens.
   const task = data?.tasks?.[0];
-  if (task && task.status_code !== 20000) {
+  if (task && task.status_code !== DFS_TASK_CODES.OK && !acceptTaskCodes?.has(task.status_code)) {
     throw Object.assign(
       new Error(`DataForSEO task error: ${task.status_message ?? 'unknown'} (code ${task.status_code})`),
       {
@@ -119,39 +135,88 @@ async function postOnce(url, payload, { timeoutMs = 60_000 } = {}) {
   return data;
 }
 
+/** One structured line per attempt. No credentials, no request body, no response body beyond a short summary. */
+function logAttempt(fields, { failed = true } = {}) {
+  (failed ? console.warn : console.log)(`[DATAFORSEO_ATTEMPT] ${JSON.stringify(fields)}`);
+}
+
 /**
- * POST with flat retry and configurable delay.
+ * POST with classified retry (see dataForSeoRetry.js).
  *
- * Retries on network/timeout errors only.
- * Throws immediately on: 401, 402, and DataForSEO API-level errors (status_code !== 20000).
+ * Retried (exponential backoff + jitter, at most `maxRetries` attempts, further bounded by DATAFORSEO_MAX_ATTEMPTS):
+ *   network / timeout errors, HTTP 408/429/5xx, malformed (non-JSON) bodies, and provider errors that are transient by
+ *   code range or message (e.g. task 40101 "Internal SE Server Error").
+ * Thrown immediately, never retried: 401/402/403 and other 4xx, and provider errors that cannot succeed as sent
+ *   (auth, credits, paused account, invalid fields). Every attempt may be billed, so a permanent error is never repeated.
+ *
+ * A successful response is returned as-is and is never re-requested. `dfsAttempts` (non-enumerable) on the returned object
+ * and `attempts` on a thrown error tell the caller how many requests this call used.
+ *
+ * Every retry of a live endpoint is a NEW provider task (new task id). DataForSEO bills completed tasks only, so a retried
+ * 40101/40103 is not a duplicate charge; a completed task (20000, or an accepted 40102/40106) is never resubmitted.
+ * `logContext` (e.g. { requestId, device }) is added to every attempt line so one logical request can be followed across
+ * its attempts.
  */
-async function post(url, payload, { timeoutMs = 60_000, maxRetries = 3, retryDelayMs = 2_000 } = {}) {
-  let lastError;
+async function post(url, payload, {
+  timeoutMs = 60_000, maxRetries = 3, retryDelayMs = DEFAULT_BASE_DELAY_MS, acceptTaskCodes = null, logContext = null,
+} = {}) {
+  const cfg         = readRetryConfig();
+  const maxAttempts = resolveMaxAttempts(maxRetries, cfg.maxAttemptsCap);
+  const baseDelayMs = cfg.baseDelayMs ?? retryDelayMs;
+  const endpoint    = url.split('/v3/')[1];
+  let lastError, lastVerdict;
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const startedAt = Date.now();
     try {
-      console.log(`[DATAFORSEO] POST attempt ${attempt}/${maxRetries} | ${url.split('/v3/')[1]}`);
+      console.log(`[DATAFORSEO] POST attempt ${attempt}/${maxAttempts} | ${endpoint}`);
 
-      return await postOnce(url, payload, { timeoutMs });
+      const data = await postOnce(url, payload, { timeoutMs, acceptTaskCodes });
+      Object.defineProperty(data, 'dfsAttempts', { value: attempt, enumerable: false });
+      if (logContext) {
+        const task = data?.tasks?.[0];
+        logAttempt({
+          ...logContext, endpoint, attempt, maxAttempts, kind: 'completed', retryable: false, willRetry: false, delayMs: 0,
+          httpStatus: data.dfsHttpStatus ?? null, providerCode: task?.status_code ?? null, taskId: task?.id ?? null,
+          cost: task?.cost ?? null, durationMs: Date.now() - startedAt,
+        }, { failed: false });
+      }
+      return data;
 
     } catch (err) {
       lastError = err;
+      const verdict = classifyDataForSeoError(err, { extraRetryableCodes: cfg.extraRetryableCodes });
+      lastVerdict = verdict;
+      const willRetry = verdict.retryable && attempt < maxAttempts;
+      const delayMs   = willRetry
+        ? computeBackoffMs(attempt, { baseDelayMs, maxDelayMs: cfg.maxDelayMs, retryAfterMs: verdict.retryAfterMs })
+        : 0;
 
-      if (err.isApiError) throw err;
+      logAttempt({
+        ...(logContext || {}), endpoint, attempt, maxAttempts, kind: verdict.kind, retryable: verdict.retryable, willRetry, delayMs,
+        httpStatus: verdict.httpStatus, providerCode: verdict.providerCode, taskId: err.taskId ?? null,
+        durationMs: Date.now() - startedAt, message: String(err.message ?? '').slice(0, 200),
+      });
 
-      const httpStatus = err.response?.status;
-      if (httpStatus === 401) throw new Error('DataForSEO authentication failed — check DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD');
-      if (httpStatus === 402) throw new Error('DataForSEO account has insufficient credits');
-      if (httpStatus && httpStatus < 500) throw err;
-
-      if (attempt < maxRetries) {
-        console.warn(`[DATAFORSEO] Attempt ${attempt}/${maxRetries} failed — retrying in ${retryDelayMs}ms | ${err.message}`);
-        await sleep(retryDelayMs);
+      if (!verdict.retryable) {
+        if (verdict.kind === 'auth' && !err.isApiError) throw Object.assign(new Error('DataForSEO authentication failed — check DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD'), { attempts: attempt, errorKind: verdict.kind });
+        if (verdict.kind === 'credits')                 throw Object.assign(new Error('DataForSEO account has insufficient credits'), { attempts: attempt, errorKind: verdict.kind });
+        throw Object.assign(err, { attempts: attempt, errorKind: verdict.kind });
       }
+
+      if (willRetry) await sleep(delayMs);
     }
   }
 
-  throw new Error(`DataForSEO failed after ${maxRetries} attempts: ${lastError?.message}`);
+  // Retries exhausted. Provider-reported errors keep their own message (callers and the stored scan error read it);
+  // transport errors keep the historical "failed after N attempts" wrapper.
+  if (lastError?.isApiError) {
+    throw Object.assign(lastError, { attempts: maxAttempts, errorKind: lastVerdict?.kind, retryExhausted: true });
+  }
+  throw Object.assign(
+    new Error(`DataForSEO failed after ${maxAttempts} attempts: ${lastError?.message}`),
+    { attempts: maxAttempts, errorKind: lastVerdict?.kind, retryExhausted: true, response: lastError?.response, code: lastError?.code }
+  );
 }
 
 export const DataForSeoService = {
@@ -208,7 +273,7 @@ export const DataForSeoService = {
 
   /**
    * Google organic SERP for domain ranking check.
-   * 90s timeout, 3 attempts, 8s between retries — matches Python production config.
+   * 90s timeout, up to 3 attempts, exponential backoff with jitter (4s base) between retries on transient failures only.
    *
    * @param {string} keyword
    * @param {number} locationCode
@@ -236,19 +301,37 @@ export const DataForSeoService = {
     console.log(`[DATAFORSEO_CALL] type=organic | device=${device} | keyword="${keyword}" | timestamp=${new Date().toISOString()}`);
 
     const startedAt = Date.now();
+    const requestId = randomUUID();
     try {
+      // 40102 (no search results) and 40106 (partial results) are COMPLETED tasks: accepted as data, never resubmitted.
       const data = await serpLimiter(() =>
-        post(ENDPOINTS.SERP_ORGANIC, payload, { timeoutMs: 90_000, maxRetries: 3, retryDelayMs: 8_000 })
+        post(ENDPOINTS.SERP_ORGANIC, payload, {
+          timeoutMs: 90_000, maxRetries: 3, retryDelayMs: 4_000,
+          acceptTaskCodes: ORGANIC_ACCEPTED_TASK_CODES, logContext: { requestId, device },
+        })
       );
       const responseTimeMs = Date.now() - startedAt;
-      const task = data?.tasks?.[0];
-      const resultCount = Array.isArray(task?.result) ? task.result.length : 0;
+      const summary = summarizeOrganicResponse(data, { httpStatus: data.dfsHttpStatus, requestedDepth: depth });
+      const outcome = assessOrganicOutcome(summary);
 
       console.log(
-        `[DATAFORSEO_ORGANIC_RESPONSE] device=${device} | status=${data?.status_code} | success=true | ` +
-        `responseTimeMs=${responseTimeMs} | tasksCount=${data?.tasks?.length ?? 0} | resultCount=${resultCount}`
+        `[DATAFORSEO_ORGANIC_RESPONSE] device=${device} | status=${data?.status_code} | outcome=${outcome} | ` +
+        `responseTimeMs=${responseTimeMs} | tasksCount=${data?.tasks?.length ?? 0} | resultCount=${summary.resultLength}`
       );
+      console.log(`[DATAFORSEO_ORGANIC_RESPONSE_SHAPE] ${JSON.stringify({ requestId, device, attempts: data.dfsAttempts, outcome, ...summary })}`);
 
+      if (outcome === ORGANIC_OUTCOMES.PARTIAL_WITHOUT_RESULTS) {
+        // A completed task with nothing usable in it: a failed scan (previous ranks preserved downstream), not "not found".
+        throw Object.assign(
+          new Error(`DataForSEO task error: partial results with no organic items returned (code ${DFS_TASK_CODES.PARTIAL})`),
+          {
+            isApiError: true, isTaskError: true, taskStatusCode: DFS_TASK_CODES.PARTIAL, taskId: summary.taskId,
+            attempts: data.dfsAttempts, errorKind: 'partial_results', serpMeta: toSerpMeta(summary, outcome),
+          }
+        );
+      }
+
+      Object.defineProperty(data, 'dfsSerpMeta', { value: toSerpMeta(summary, outcome), enumerable: false });
       return data;
     } catch (err) {
       const responseTimeMs = Date.now() - startedAt;
@@ -259,7 +342,8 @@ export const DataForSeoService = {
       console.error(
         `[DATAFORSEO_ORGANIC_ERROR] device=${device} | message="${err.message}" | ` +
         `status=${err.response?.status ?? (err.isTaskError ? 'task_error' : 'unknown')} | ` +
-        `responseTimeMs=${responseTimeMs} | ` +
+        `taskStatusCode=${err.taskStatusCode ?? 'null'} | kind=${err.errorKind ?? 'unknown'} | attempts=${err.attempts ?? 'null'} | ` +
+        `retryExhausted=${err.retryExhausted === true} | responseTimeMs=${responseTimeMs} | ` +
         `responseBodySummary="${JSON.stringify(err.response?.data ?? {}).slice(0, 200)}"`
       );
       throw err;
@@ -326,6 +410,9 @@ export const DataForSeoService = {
   },
   postDomainIntersection(body, { timeoutMs = 60_000 } = {}) {
     return postOnce(ENDPOINTS.LABS_DOMAIN_INTERSECTION, [body], { timeoutMs });
+  },
+  postKeywordOverview(body, { timeoutMs = 60_000 } = {}) {
+    return postOnce(ENDPOINTS.LABS_KEYWORD_OVERVIEW, [body], { timeoutMs });
   },
   postBulkTrafficEstimation(body, { timeoutMs = 60_000 } = {}) {
     return postOnce(ENDPOINTS.LABS_BULK_TRAFFIC_ESTIMATION, [body], { timeoutMs });

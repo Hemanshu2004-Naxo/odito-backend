@@ -21,8 +21,19 @@ export const SERP_DEVICES = Object.freeze({
 
 export const DEFAULT_SERP_DEVICE = 'desktop';
 
-/** Requested result depth — unchanged from the original desktop request. */
+/** Default requested result depth — unchanged from the original desktop request. */
 export const SERP_DEPTH = 100;
+
+/**
+ * Requested organic depth. DATAFORSEO_SERP_DEPTH overrides the default (whole number 10..100; anything else falls back
+ * to SERP_DEPTH). Capped at 100 because stored ranks are 1..100. Read at call time so ops can change it without a deploy.
+ * A lower depth means fewer SERP pages per task (fewer pages that can fail, lower cost) but "not found" then only covers
+ * the top N — compare cost, returned results and detection before changing it in production.
+ */
+export function resolveSerpDepth(env = process.env) {
+  const n = Number(String(env.DATAFORSEO_SERP_DEPTH ?? '').trim());
+  return Number.isInteger(n) && n >= 10 && n <= 100 ? n : SERP_DEPTH;
+}
 
 export function resolveSerpDevice(device = DEFAULT_SERP_DEVICE) {
   const config = typeof device === 'string' ? SERP_DEVICES[device] : undefined;

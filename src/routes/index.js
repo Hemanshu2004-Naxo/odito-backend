@@ -28,6 +28,7 @@ import fixLogRoutes from '../modules/fix-logs/routes/fixLogRoutes.js';
 import taskRoutes from '../modules/tasks/routes/taskRoutes.js';
 import auditHistoryRoutes from '../modules/audit_history/routes/auditHistoryRoutes.js';
 import domainOverviewRoutes from '../modules/dataforseo-api/domain_overview/routes/domainOverviewRoutes.js';
+import seoScanRoutes from '../modules/dataforseo-api/seo_data/routes/seoScanRoutes.js';
 import myCompetitorsRoutes from '../modules/competitors/routes/myCompetitorsRoutes.js';
 import competitorAssessmentRoutes from '../modules/competitors/routes/assessmentRoutes.js';
 import localCompetitorRoutes from '../modules/competitors/routes/localRoutes.js';
@@ -133,6 +134,8 @@ router.use('/projects', auditHistoryRoutes);
 // plus /referring-domains-export and /referring-domain-settings): one API 9 integration, one cache.
 // Domain Overview (DataForSEO Labs + Backlinks summary): /projects/:projectId/domain-overview/:section. Cached in MongoDB; see modules/dataforseo-api/domain_overview/.
 router.use('/projects', domainOverviewRoutes);
+// Explicit SEO scans + stored snapshots (the only way, besides a user's own refresh, that provider data is bought): see modules/dataforseo-api/seo_data/.
+router.use('/projects', seoScanRoutes);
 // My Competitors (user-chosen competitors, a project_competitors collection): /projects/:projectId/my-competitors. See modules/competitors/.
 router.use('/projects', myCompetitorsRoutes);
 // Business relevance of websites (direct / indirect / informational / not relevant / needs review), with user overrides. See modules/competitors/.

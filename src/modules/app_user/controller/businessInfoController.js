@@ -3,6 +3,7 @@ import BusinessProfileMetadata from '../model/BusinessProfileMetadata.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 import { ValidationFailure } from '../../dataforseo-api/shared/targetDomain.js';
 import { isIndustryValue } from '../../../config/industries.js';
+import { syncTrackedLocation } from '../../keyword_research/service/trackedLocationSync.js';
 import { PLACES_ERROR, PlacesError, autocompletePlaces, getPlaceForLocation } from '../../../services/googlePlacesService.js';
 
 /**
@@ -224,7 +225,10 @@ export async function saveBusinessInfo(req, res) {
     await SeoProject.updateOne({ _id: req.project._id }, { $set: set }, { runValidators: true });
     const saved = await SeoProject.findById(req.project._id).lean();
     LoggerUtil.info('Business info saved', { projectId: String(req.project._id), userId: String(req.user?._id || ''), fields: Object.keys(set) });
-    return ok(res, toBusinessInfoDto(saved, await gbpConnected(saved._id)));
+    const dto = toBusinessInfoDto(saved, await gbpConnected(saved._id));
+    // A saved location is where keywords are tracked from: bring the tracked-keyword location along (best effort; the save already succeeded).
+    if ('location' in body) dto.trackingLocation = await syncTrackedLocation(req.project._id, req.user._id);
+    return ok(res, dto);
   } catch (err) { return sendError(res, err, req); }
 }
 

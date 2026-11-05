@@ -15,9 +15,11 @@ import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 /**
  * @returns {Promise<{ status: 'ok', byUrl: Record<string, { traffic: number, keywords: number }>, meta: object } | { status: 'failed', code: string }>}
  */
-export async function loadTraffic({ project, userId }) {
+export async function loadTraffic({ project, userId, providerAllowed = true }) {
   try {
-    const t = await getDomainOverviewSection({ project, section: 'top-pages-traffic', userId });
+    const t = await getDomainOverviewSection({ project, section: 'top-pages-traffic', userId, providerAllowed });
+    // Nothing collected yet: the columns stay empty ("—"), never a made-up 0.
+    if (t.missing) return { status: 'failed', code: 'NOT_SCANNED' };
     return { status: 'ok', byUrl: t.result?.byUrl ?? {}, meta: t.result?.meta ?? {} };
   } catch (err) {
     LoggerUtil.warn('Top pages: the traffic join failed; the table loads without traffic', { code: err?.code ?? 'UNKNOWN' });
@@ -47,10 +49,11 @@ const describeTraffic = (traffic) => (traffic.status === 'ok'
  * `domain-pages` (the table) or `tp-fix-first` (the five worst error pages) with the traffic joined. `traffic` may be passed in (the export loads
  * it once for all its batches). "Fix first" lists error pages and does not need traffic: its flags are the traffic-free ones.
  */
-export async function getTopPagesSection({ project, section, query, refresh = false, userId = null, traffic = null }) {
-  const base = await getDomainOverviewSection({ project, section, query, refresh, userId });
+export async function getTopPagesSection({ project, section, query, refresh = false, userId = null, traffic = null, providerAllowed = true }) {
+  const base = await getDomainOverviewSection({ project, section, query, refresh, userId, providerAllowed });
+  if (base.missing) return base;
   const needsTraffic = section === 'domain-pages';
-  const joined = needsTraffic ? (traffic ?? await loadTraffic({ project, userId })) : { status: 'failed', code: 'NOT_NEEDED' };
+  const joined = needsTraffic ? (traffic ?? await loadTraffic({ project, userId, providerAllowed })) : { status: 'failed', code: 'NOT_NEEDED' };
   const items = (base.result?.items ?? []).map((row) => joinTraffic(row, needsTraffic ? joined : { status: 'failed' }));
   return {
     ...base,

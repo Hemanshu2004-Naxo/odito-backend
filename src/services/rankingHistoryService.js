@@ -43,6 +43,9 @@ function sanitizeScanErrorForStorage(rawError) {
   if (/timed?\s*out|timeout|ETIMEDOUT|ECONNABORTED/i.test(msg)) {
     return 'Ranking check timed out. Please try again.';
   }
+  if (/partial results|\b40106\b/i.test(msg)) {
+    return 'Ranking check returned incomplete results from the search data provider; the previous ranking is kept. Please try again shortly.';
+  }
   if (/authentication failed|insufficient credits|\b401\b|\b402\b/i.test(msg)) {
     return 'Ranking check is temporarily unavailable. Please try again later.';
   }
@@ -429,6 +432,132 @@ async function buildDesktopKeywordUpdate({ existingKw, projectId, incomingResult
   };
 }
 
+// ─── Per-channel scan state (desktop / mobile / Maps) ────────────────────────
+
+const COMPLETED_STATUSES = new Set(['success', 'partial_success', 'not_found']);
+const SERP_OUTCOMES = new Set(['complete', 'no_results', 'partial', 'partial_without_results']);
+
+/**
+ * Provider outcome of an organic scan, kept separate from the rank: what depth was asked for and how many organic
+ * results actually came back (a 40106 partial returns fewer than requested). null when the provider reported nothing.
+ */
+function sanitizeSerpMeta(serp) {
+  if (!serp || typeof serp !== 'object' || !SERP_OUTCOMES.has(serp.outcome)) return null;
+  const int = (v, max) => (Number.isInteger(v) && v >= 0 ? Math.min(v, max) : null);
+  return {
+    serp_outcome:     serp.outcome,
+    provider_code:    int(serp.provider_code, 99999),
+    requested_depth:  int(serp.requested_depth, 700),
+    returned_results: int(serp.returned_results, 700),
+  };
+}
+const MAPS_STATUSES = new Set(['success', 'not_found', 'scan_error']);
+
+/**
+ * Channel status for one organic scan. A rank observed in partial (40106) results is 'partial_success'; a partial
+ * response without the site never reaches here as a success (deviceSerpScan turns it into a scan_error).
+ */
+function organicScanStatus(scanError, observedRank, serp) {
+  if (scanError) return 'scan_error';
+  if (observedRank == null) return 'not_found';
+  return serp?.outcome === 'partial' ? 'partial_success' : 'success';
+}
+
+function validDate(v, fallback) {
+  const d = v ? new Date(v) : null;
+  return d && !Number.isNaN(d.getTime()) ? d : fallback;
+}
+
+function sanitizeAttempts(n) {
+  const v = parseInt(n, 10);
+  return Number.isFinite(v) && v >= 1 ? Math.min(v, 10) : 1;
+}
+
+/**
+ * Next independent scan state for one channel. The invariant that matters: a FAILED attempt only moves
+ * last_attempt_at / status / error / retry_count. current_rank, previous_successful_rank and last_successful_scan_at keep
+ * their last successful values, so a failure can never overwrite or erase the last good ranking.
+ *
+ * @param {object|undefined} existingScan  stored scan state (undefined for a legacy keyword)
+ * @param {number|null}      existingRank  the channel's stored rank, used to seed a legacy keyword that has no scan state yet
+ * @param {'success'|'partial_success'|'not_found'|'scan_error'} status
+ * @param {number|null}      observedRank  rank from this scan (ignored on scan_error)
+ * @param {object|null}      serp          provider outcome (organic channels only); adds serp_outcome / provider_code /
+ *                                         requested_depth / returned_results. Omitted (e.g. Maps) -> fields not written.
+ */
+export function nextChannelScan({ existingScan, existingRank, status, error, attempts, observedRank, at, serp = null }) {
+  const storedRank = existingScan?.current_rank ?? existingRank ?? null;
+  const retryCount = sanitizeAttempts(attempts) - 1;
+  const serpMeta   = sanitizeSerpMeta(serp);
+  const withSerp   = (scan) => (serpMeta ? { ...scan, ...serpMeta } : scan);
+
+  if (!COMPLETED_STATUSES.has(status)) {
+    return withSerp({
+      status:                   'scan_error',
+      last_attempt_at:          at,
+      last_successful_scan_at:  existingScan?.last_successful_scan_at ?? null,
+      error:                    sanitizeScanErrorForStorage(error),
+      retry_count:              retryCount,
+      current_rank:             storedRank,
+      previous_successful_rank: existingScan?.previous_successful_rank ?? null
+    });
+  }
+  return withSerp({
+    status,
+    last_attempt_at:          at,
+    last_successful_scan_at:  at,
+    error:                    null,
+    retry_count:              retryCount,
+    current_rank:             status === 'not_found' ? null : (observedRank ?? null),
+    previous_successful_rank: storedRank
+  });
+}
+
+/**
+ * Maps result merge. Returns null when the caller supplied no Maps outcome (Maps not requested, or a legacy caller):
+ * the legacy maps handling then applies unchanged.
+ *
+ *   scan_error -> maps_rank / maps_listing keep their stored values (a provider failure is not "not in Maps")
+ *   not_found  -> the request worked and this business/location is not in the results: rank and listing cleared
+ *   success    -> rank and listing replaced
+ */
+function buildMapsUpdate({ existingKw, incoming, now }) {
+  const m = incoming?.maps;
+  if (!m || typeof m !== 'object' || !MAPS_STATUSES.has(m.status)) return null;
+
+  const at = validDate(m.scanned_at, now);
+  const base = nextChannelScan({
+    existingScan: existingKw?.maps_scan,
+    existingRank: existingKw?.maps_rank ?? null,
+    status:       m.status,
+    error:        m.status === 'scan_error' ? m.error : null,
+    attempts:     m.attempts,
+    observedRank: incoming.maps_rank ?? null,
+    at
+  });
+
+  const level = m.match_level === 'branch' || m.match_level === 'business' ? m.match_level : null;
+  const conf  = Number.isFinite(m.match_confidence) ? Math.max(0, Math.min(100, Math.round(m.match_confidence))) : null;
+  // A completed check that found nothing may carry an explanatory (customer-safe, matcher-authored) note, e.g. "several
+  // locations ... could not be told apart".
+  const note  = m.status === 'not_found' && typeof m.error === 'string' && m.error.trim() ? m.error.trim().slice(0, 300) : null;
+
+  const maps_scan = { ...base, error: note ?? base.error, match_level: level, match_confidence: conf };
+
+  if (m.status === 'scan_error') {
+    return {
+      maps_rank:    existingKw?.maps_rank    ?? incoming.maps_rank    ?? null,
+      maps_listing: existingKw?.maps_listing ?? incoming.maps_listing ?? null,
+      maps_scan:    { ...maps_scan, match_level: existingKw?.maps_scan?.match_level ?? null, match_confidence: existingKw?.maps_scan?.match_confidence ?? null }
+    };
+  }
+  return {
+    maps_rank:    m.status === 'success' ? (incoming.maps_rank ?? null) : null,
+    maps_listing: m.status === 'success' ? (incoming.maps_listing ?? null) : null,
+    maps_scan
+  };
+}
+
 // ─── Mobile merge ────────────────────────────────────────────────────────────
 
 function sanitizeTrackedDepth(depth) {
@@ -475,7 +604,12 @@ async function buildMobileUpdate({ existingMobile, incomingMobile, projectId, ke
       scan_count:         (existingMobile?.scan_count ?? 0) + 1,
       last_scanned_at:    scannedAt,
       last_scan_status:   'error',
-      last_scan_error:    sanitizeScanErrorForStorage(incomingMobile.scan_error)
+      last_scan_error:    sanitizeScanErrorForStorage(incomingMobile.scan_error),
+      scan: nextChannelScan({
+        existingScan: existingMobile?.scan, existingRank: existingMobile?.current_rank ?? null,
+        status: 'scan_error', error: incomingMobile.scan_error, attempts: incomingMobile.attempts, at: scannedAt,
+        serp: incomingMobile.serp
+      })
     };
   }
 
@@ -501,7 +635,12 @@ async function buildMobileUpdate({ existingMobile, incomingMobile, projectId, ke
     scan_count:         (existingMobile?.scan_count ?? 0) + 1,
     last_scanned_at:    scannedAt,
     last_scan_status:   'ok',
-    last_scan_error:    null
+    last_scan_error:    null,
+    scan: nextChannelScan({
+      existingScan: existingMobile?.scan, existingRank: existingMobile?.current_rank ?? null,
+      status: organicScanStatus(null, current, incomingMobile.serp), attempts: incomingMobile.attempts, observedRank: current,
+      at: scannedAt, serp: incomingMobile.serp
+    })
   };
 }
 
@@ -520,6 +659,21 @@ async function buildKeywordUpdate(args) {
     now:            args.now
   });
   if (mobile !== undefined) desktop.mobile = mobile;
+
+  const { existingKw, incomingResult, now } = args;
+  desktop.desktop_scan = nextChannelScan({
+    existingScan: existingKw?.desktop_scan,
+    existingRank: existingKw?.current_rank ?? null,
+    status:       organicScanStatus(incomingResult.scan_error, desktop.current_rank, incomingResult.serp),
+    error:        incomingResult.scan_error,
+    attempts:     incomingResult.attempts,
+    observedRank: desktop.current_rank,
+    at:           validDate(incomingResult.scanned_at, now),
+    serp:         incomingResult.serp
+  });
+
+  const maps = buildMapsUpdate({ existingKw, incoming: incomingResult, now });
+  if (maps) Object.assign(desktop, maps);
   return desktop;
 }
 
@@ -668,10 +822,14 @@ export async function mergeSingleKeywordRescan({
     const kwPath = (f) => `keywords.$[k].${f}`;
 
     // ── Desktop ──
+    // When the caller supplied an independent Maps outcome, Maps is written separately below (own status, own ordering
+    // check) so a stale desktop result can neither block nor overwrite it, and vice versa.
+    const mapsIndependent = !!updatedKw.maps_scan;
+    const legacyMapsFields = mapsIndependent ? [] : ['maps_rank', 'maps_listing'];
     const desktopFields = keywordResult.scan_error
-      ? ['maps_rank', 'maps_listing', 'last_scan_status', 'last_scan_error', 'last_rescanned_at', 'last_scan_source']
+      ? [...legacyMapsFields, 'desktop_scan', 'last_scan_status', 'last_scan_error', 'last_rescanned_at', 'last_scan_source']
       : ['current_rank', 'rank', 'best_rank', 'benchmark_rank', 'prev_scan_rank', 'prev_week_rank',
-         'prev_month_rank', 'history_derived_at', 'maps_rank', 'maps_listing', 'ranking_urls',
+         'prev_month_rank', 'history_derived_at', ...legacyMapsFields, 'ranking_urls', 'desktop_scan',
          'last_rescanned_at', 'last_scan_source', 'last_scan_status', 'last_scan_error'];
     const desktopSet = {};
     for (const f of desktopFields) desktopSet[kwPath(f)] = updatedKw[f] ?? null;
@@ -694,13 +852,32 @@ export async function mergeSingleKeywordRescan({
       }
     );
 
+    // ── Maps (only when an independent Maps outcome was supplied) ──
+    if (mapsIndependent) {
+      const mapsAt = updatedKw.maps_scan.last_attempt_at;
+      await SeoRankingCurrent.collection.updateOne(
+        { project_id: projectOid },
+        { $set: {
+            [kwPath('maps_rank')]:    updatedKw.maps_rank    ?? null,
+            [kwPath('maps_listing')]: updatedKw.maps_listing ?? null,
+            [kwPath('maps_scan')]:    updatedKw.maps_scan
+        } },
+        {
+          arrayFilters: [{
+            'k.keyword': stored,
+            $or: [{ 'k.maps_scan.last_attempt_at': null }, { 'k.maps_scan.last_attempt_at': { $lte: mapsAt } }]
+          }]
+        }
+      );
+    }
+
     // ── Mobile (only when a mobile scan ran) ──
     if (keywordResult.mobile && updatedKw.mobile) {
       const mobileAt = updatedKw.mobile.last_scanned_at;
       const mobileFields = keywordResult.mobile.scan_error
-        ? ['last_scan_status', 'last_scan_error', 'last_scanned_at']
+        ? ['last_scan_status', 'last_scan_error', 'last_scanned_at', 'scan']
         : ['current_rank', 'best_rank', 'benchmark_rank', 'prev_scan_rank', 'prev_week_rank', 'prev_month_rank',
-           'history_derived_at', 'ranking_urls', 'tracked_depth', 'last_scanned_at', 'last_scan_status', 'last_scan_error'];
+           'history_derived_at', 'ranking_urls', 'tracked_depth', 'last_scanned_at', 'last_scan_status', 'last_scan_error', 'scan'];
       const mobileSet = {};
       for (const f of mobileFields) mobileSet[kwPath(`mobile.${f}`)] = updatedKw.mobile[f] ?? null;
       await SeoRankingCurrent.collection.updateOne(

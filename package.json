@@ -12,7 +12,7 @@
     "test:gbp": "node --test",
     "test:jobs": "node test-job-queue.mjs",
     "test:referring-domains": "node --test --test-concurrency=1 \"src/modules/dataforseo-api/domain_overview/tests/referringDomains.test.js\"",
-    "test:domain-overview": "node --test --test-concurrency=1 \"src/modules/dataforseo-api/domain_overview/tests/*.test.js\" \"src/modules/dataforseo-api/shared/tests/*.test.js\"",
+    "test:domain-overview": "node --test --test-concurrency=1 \"src/modules/dataforseo-api/domain_overview/tests/*.test.js\" \"src/modules/dataforseo-api/shared/tests/*.test.js\" \"src/modules/dataforseo-api/seo_data/tests/*.test.js\"",
     "test:ai-visibility": "node --test --test-concurrency=1 \"src/modules/ai_visibility/**/*.test.js\"",
     "test:login": "node test-login.mjs",
     "seed:jobs": "node seeds/jobTypesSeed.js",

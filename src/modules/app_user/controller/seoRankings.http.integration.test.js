@@ -268,11 +268,12 @@ describe('POST /seo/keywords/:projectId/rescan', () => {
     assert.equal(m.tracked_depth, 55);
   });
 
-  it('the 30-minute per-keyword cooldown still applies and makes no provider request', async () => {
+  it('there is no per-keyword cooldown: a keyword scanned moments ago can be rescanned immediately', async () => {
     await seedCanonical(A, [{ keyword: 'alpha', ranking_urls: urls(8), mobile: mobileOk(11) }]);
     const r = await apiA('POST', `/seo/keywords/${A.projectId}/rescan`, { keyword: 'alpha' });
-    assert.equal(r.status, 429);
-    assert.equal(calls.length, 0);
+    assert.notEqual(r.status, 429);
+    assert.equal(r.status, 200);
+    assert.ok(calls.length > 0);
   });
 
   it('another tenant cannot rescan this project (404) and no provider request is made', async () => {
