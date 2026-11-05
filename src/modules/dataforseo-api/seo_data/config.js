@@ -61,6 +61,19 @@ export const SCAN_CONCURRENCY = Math.max(1, Math.min(6, Number(process.env.SEO_S
 /** A scan that stops extending its lease for this long is considered dead (its process crashed). */
 export const SCAN_LEASE_MS = 3 * 60_000;
 export const SCAN_HEARTBEAT_MS = 30_000;
+/** A scan is claimed at most this many times (a crash or an unexpected error requeues it with a backoff); after that it ends as failed. */
+export const SCAN_MAX_ATTEMPTS = Math.max(1, Math.min(10, Number(process.env.SEO_SCAN_MAX_ATTEMPTS) || 3));
+/** Transient provider errors (network, timeout, provider down / busy) are retried per dataset with this backoff; permanent ones (auth, credits, rejected) never. */
+export const SCAN_RETRY = Object.freeze({ attempts: Math.max(1, Math.min(5, Number(process.env.SEO_DATASET_RETRY_ATTEMPTS) || 3)), baseMs: Number(process.env.SEO_DATASET_RETRY_BASE_MS) || 2000 });
+/** The provider is never asked more than this many things at once by one worker process, across every scan it is running. */
+export const PROVIDER_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.SEO_PROVIDER_CONCURRENCY) || 4));
+/** The worker: how often it looks for a due scan, and how many scans it works on at once. */
+export const WORKER = Object.freeze({
+  pollMs: Math.max(250, Number(process.env.SEO_SCAN_POLL_MS) || 2000),
+  scans: Math.max(1, Math.min(4, Number(process.env.SEO_SCAN_WORKER_CONCURRENCY) || 1)),
+  shutdownGraceMs: Math.max(1000, Number(process.env.SEO_SCAN_SHUTDOWN_GRACE_MS) || 20_000),
+  embedded: process.env.SEO_SCAN_WORKER_EMBEDDED !== 'false',
+});
 /** Starting scans, per user per window. */
 export const SCAN_START_LIMIT = Object.freeze({ windowMs: 15 * 60 * 1000, max: 10 });
 
@@ -82,3 +95,17 @@ export const DATASET_CAPS = Object.freeze({
 export const COLLECT_BATCH = 1000;
 /** How long a stored dataset counts as fresh (a scan without `force` does not collect a fresh one again). Independent of retention: nothing is deleted when it passes. */
 export const DATASET_FRESH_MS = Object.freeze({ keywords: 24 * 3_600_000, backlinks: 24 * 3_600_000, referringDomains: 24 * 3_600_000 });
+
+/** The datasets each page shows (for the per-dataset freshness a page displays). */
+export const PAGE_DATASETS = Object.freeze({
+  'domain-overview': Object.freeze([...OVERVIEW]),
+  'traffic': Object.freeze(['history']),
+  'organic-keywords': Object.freeze(['ranked-keywords-top5', 'ranked-keywords-page', 'keywords-dataset']),
+  'competitors': Object.freeze(['competitors']),
+  'offpage-overview': Object.freeze(['backlinks']),
+  'backlinks': Object.freeze(['backlinks-list', 'backlinks-dataset-live', 'backlinks-dataset-lost']),
+  'anchors': Object.freeze(['anchors', 'anchor-profile', 'backlinks-dataset-live']),
+  'referring-domains': Object.freeze(['referring-domains', 'rd-rank-buckets', 'rd-toxic-count', 'referring-domains-dataset-live', 'referring-domains-dataset-lost']),
+  'top-pages': Object.freeze(['domain-pages-all', 'domain-pages-ok', 'tp-counts', 'tp-fix-first', 'top-pages-traffic', 'backlinks-dataset-live']),
+});
+export const PAGE_NAMES = Object.freeze(Object.keys(PAGE_DATASETS));

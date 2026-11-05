@@ -34,8 +34,19 @@ async function main() {
   const expired = await col.countDocuments({ expiresAt: { $lt: new Date() } });
   console.log(`TTL index found: ${ttl.name} (expireAfterSeconds ${ttl.expireAfterSeconds}); entries already past their expiry (kept once the index is gone): ${expired}`);
   if (!apply) { console.log('Dry run. Re-run with --apply to drop the TTL index. No document is changed either way.'); return; }
+  const countBefore = await col.countDocuments({});
   await col.dropIndex(ttl.name);
-  console.log(`Dropped index ${ttl.name}. documents now: ${await col.estimatedDocumentCount()}`);
+  // Verify the result instead of assuming it: no TTL index left, same documents, the unique key index untouched.
+  const after = await col.indexes();
+  const countAfter = await col.countDocuments({});
+  const stillTtl = after.some((i) => typeof i.expireAfterSeconds === 'number' && i.key?.expiresAt === 1);
+  const keyIndex = after.some((i) => i.name === 'key_1' && i.unique);
+  console.log(`Dropped index ${ttl.name}.`);
+  console.log(`indexes now: ${after.map((i) => i.name).join(', ')}`);
+  console.log(`documents before: ${countBefore}, after: ${countAfter}`);
+  const ok = !stillTtl && countBefore === countAfter && keyIndex;
+  console.log(ok ? 'VERIFIED: no TTL index on expiresAt, every cached document preserved, unique key index intact.' : 'VERIFICATION FAILED: check the lines above before relying on this migration.');
+  if (!ok) process.exitCode = 1;
 }
 
 main().catch((err) => { console.error('Migration failed:', err.message); process.exitCode = 1; }).finally(() => mongoose.disconnect());

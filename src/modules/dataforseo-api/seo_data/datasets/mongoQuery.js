@@ -63,16 +63,20 @@ export function fromCanonical(canonical, fieldMap) {
 
 /**
  * Sort rules ("field,dir") -> a Mongo sort object. `_id` is always the last key so equal values page in a stable order (no row is shown on
- * two pages or skipped between them).
+ * two pages or skipped between them), in the direction of the last rule.
  */
 export function toMongoSort(rules, orderMap) {
   const sort = {};
+  let last = 1;
   for (const rule of rules) {
     const [field, dir] = String(rule).split(',');
     const spec = Object.hasOwn(orderMap, field) ? orderMap[field] : null;
     if (!spec || !['asc', 'desc'].includes(dir)) throw new ValidationFailure('order_by', 'that sort is not available from stored data');
     if (!(spec in sort)) sort[spec] = dir === 'asc' ? 1 : -1;
+    last = dir === 'asc' ? 1 : -1;
   }
-  sort._id = 1;
+  // The tie-break follows the direction of the last rule, so a "(field, _id)" index with both keys the same way serves the sort in both
+  // directions without an in-memory sort (see the indexes in model/).
+  sort._id = last;
   return sort;
 }

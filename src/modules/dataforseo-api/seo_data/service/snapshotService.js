@@ -87,7 +87,8 @@ export async function latestSnapshot({ projectId, datasetType, part }, { model =
 }
 
 const PERIOD_DAYS = Object.freeze({ week: 7, month: 30 });
-export const COMPARISON_PERIODS = Object.freeze(Object.keys(PERIOD_DAYS));
+/** previous = the snapshot before the newest; week / month = the newest one at least that old. */
+export const COMPARISON_PERIODS = Object.freeze(['previous', ...Object.keys(PERIOD_DAYS)]);
 
 /**
  * The newest snapshot and the one to compare it with: the newest snapshot captured at least `period` before it (UTC, to the instant — two
@@ -96,11 +97,12 @@ export const COMPARISON_PERIODS = Object.freeze(Object.keys(PERIOD_DAYS));
  */
 export async function compareToPrevious({ projectId, datasetType, part, period }, { model = SeoSnapshot } = {}) {
   const days = PERIOD_DAYS[period];
-  if (!days) throw new RangeError(`period must be one of ${COMPARISON_PERIODS.join(', ')}`);
+  if (period !== 'previous' && !days) throw new RangeError(`period must be one of ${COMPARISON_PERIODS.join(', ')}`);
   const type = resolveType(datasetType);
   const latest = await model.findOne({ projectId, datasetType: type, part }).sort({ capturedAt: -1 }).select('-__v').lean();
   if (!latest) return { latest: null, previous: null, period };
-  const cutoff = new Date(new Date(latest.capturedAt).getTime() - days * 86_400_000);
-  const previous = await model.findOne({ projectId, datasetType: type, part, capturedAt: { $lte: cutoff } }).sort({ capturedAt: -1 }).select('-__v').lean();
+  // previous: strictly older than the newest; week / month: at least that much older.
+  const bound = period === 'previous' ? { $lt: new Date(latest.capturedAt) } : { $lte: new Date(new Date(latest.capturedAt).getTime() - days * 86_400_000) };
+  const previous = await model.findOne({ projectId, datasetType: type, part, capturedAt: bound }).sort({ capturedAt: -1 }).select('-__v').lean();
   return { latest, previous: previous ?? null, period };
 }

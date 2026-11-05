@@ -92,6 +92,8 @@ import { startAutomationScheduler } from './src/modules/aiCampaign/service/autom
 import { startInvestigationRecoveryScheduler } from './src/modules/ai-investigation/service/recoveryScheduler.js';
 import { startGoogleAioVisibilityScheduler } from './src/modules/ai_visibility/google_aio_visibility/workers/recoveryScheduler.js';
 import { startReviewSnapshotScheduler } from './src/services/businessProfileReviewSnapshotScheduler.js';
+import { startSeoScanWorker } from './src/modules/dataforseo-api/seo_data/worker/seoScanWorker.js';
+import { WORKER as SEO_SCAN_WORKER } from './src/modules/dataforseo-api/seo_data/config.js';
 import { warmMyCompetitorIndexes } from './src/modules/competitors/service/myCompetitorsService.js';
 import { startCompetitorEnrichmentScheduler } from './src/modules/competitors/workers/enrichmentScheduler.js';
 import { handleStripeWebhook } from './src/modules/subscription/controller/subscriptionController.js';
@@ -329,6 +331,10 @@ const startServer = async () => {
   // upsert), never calls Google, never touches connection status. Opt-out via
   // REVIEW_SNAPSHOT_ENABLED=false.
   startReviewSnapshotScheduler();
+
+  // SEO scans: the API only QUEUES them (POST /projects/:id/seo-scans); this worker claims and runs them, apart from the request. It stops cleanly on
+  // SIGTERM / SIGINT. Set SEO_SCAN_WORKER_EMBEDDED=false to run the workers as separate processes instead (seo_data/worker/seoScanWorkerMain.js).
+  if (SEO_SCAN_WORKER.embedded) startSeoScanWorker();
 
 
   /**

@@ -37,10 +37,11 @@ const schema = new mongoose.Schema({
 }, { collection: 'seo_backlinks', timestamps: true, minimize: false });
 
 schema.index({ projectId: 1, scanId: 1, nk: 1 }, { unique: true, name: 'seo_bl_scan_nk' });
-// The page's sorts within one scan + tab: rank (default), first seen, domain rank.
-schema.index({ projectId: 1, scanId: 1, status: 1, rank: -1 }, { name: 'seo_bl_scan_rank' });
-schema.index({ projectId: 1, scanId: 1, status: 1, firstSeen: -1 }, { name: 'seo_bl_scan_first_seen' });
-schema.index({ projectId: 1, scanId: 1, status: 1, domainRank: -1 }, { name: 'seo_bl_scan_domain_rank' });
+// The page's sorts within one scan + tab: rank (default), first seen, domain rank. `_id` ends each key (the sort's tie-break), so the index
+// serves the sort in both directions and a page reads only skip + limit entries.
+schema.index({ projectId: 1, scanId: 1, status: 1, rank: -1, _id: -1 }, { name: 'seo_bl_scan_rank' });
+schema.index({ projectId: 1, scanId: 1, status: 1, firstSeen: -1, _id: -1 }, { name: 'seo_bl_scan_first_seen' });
+schema.index({ projectId: 1, scanId: 1, status: 1, domainRank: -1, _id: -1 }, { name: 'seo_bl_scan_domain_rank' });
 // Exact-match filters ("links from this domain", "links to this page").
 schema.index({ projectId: 1, scanId: 1, status: 1, sourceDomain: 1 }, { name: 'seo_bl_scan_source_domain' });
 schema.index({ projectId: 1, scanId: 1, status: 1, targetUrl: 1 }, { name: 'seo_bl_scan_target' });

@@ -7,6 +7,9 @@ export const ACTIVE_STATUSES = Object.freeze(['pending', 'queued', 'running']);
 /**
  * One SEO data collection (a "scan") for a project, and the audit trail of what it bought.
  *
+ * THE QUEUE. The web request only inserts the scan (`queued`); a worker (worker/seoScanWorker.js, in this process or a separate one) claims it
+ * with one atomic update, so two workers can never process the same scan, and resumes it from the datasets not yet completed if the worker dies.
+ *
  * THE LOCK. `lockKey` holds the project id while the scan is active and is REMOVED (never set to null) when it ends; the partial unique
  * index below lets MongoDB allow exactly one active scan per project across every backend instance. Starting a scan is one insert, so
  * there is no read-then-write race. `leaseUntil` is extended by a heartbeat while the process works; a crashed worker stops
@@ -26,6 +29,8 @@ const datasetSchema = new mongoose.Schema({
   cost: { type: Number, default: null },
   durationMs: { type: Number, default: null },
   errorCode: { type: String, default: null, maxlength: 60 },
+  // How many tries the dataset needed in the attempt that finished it (transient provider errors are retried with backoff).
+  attempts: { type: Number, default: 0 },
   startedAt: { type: Date, default: null },
   finishedAt: { type: Date, default: null },
 }, { _id: false });
@@ -52,6 +57,11 @@ const scanRunSchema = new mongoose.Schema({
   error: { type: new mongoose.Schema({ code: String }, { _id: false }), default: null },
   lockKey: { type: String, default: undefined },
   leaseUntil: { type: Date, default: null },
+  // The queue: a scan is created `queued`, claimed atomically by one worker (status -> running, workerId, lease), and re-claimed by another
+  // worker when that one stops extending the lease. `attempts` counts claims; `nextAttemptAt` delays a requeued scan (backoff).
+  workerId: { type: String, default: null, maxlength: 120 },
+  attempts: { type: Number, default: 0 },
+  nextAttemptAt: { type: Date, default: null },
   startedAt: { type: Date, default: null },
   finishedAt: { type: Date, default: null },
 }, { collection: 'seo_scan_runs', timestamps: true, minimize: false });
@@ -60,6 +70,8 @@ scanRunSchema.index({ lockKey: 1 }, { unique: true, name: 'seo_scan_runs_active_
 scanRunSchema.index({ projectId: 1, createdAt: -1 }, { name: 'seo_scan_runs_project_time' });
 scanRunSchema.index({ projectId: 1, scope: 1, status: 1 }, { name: 'seo_scan_runs_project_scope_status' });
 scanRunSchema.index({ status: 1, leaseUntil: 1 }, { name: 'seo_scan_runs_status_lease' });
+// What a worker looks for: queued scans that are due, oldest first.
+scanRunSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 }, { name: 'seo_scan_runs_queue' });
 
 const SeoScanRun = mongoose.models.SeoScanRun || mongoose.model('SeoScanRun', scanRunSchema);
 export default SeoScanRun;

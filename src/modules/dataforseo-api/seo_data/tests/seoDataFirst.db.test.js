@@ -23,6 +23,7 @@ import seoScanRoutes from '../routes/seoScanRoutes.js';
 import { __setTransportForTests } from '../../domain_overview/provider/domainOverviewProvider.js';
 import { SECTION_NAMES } from '../../domain_overview/config.js';
 import { startScan } from '../service/seoScanService.js';
+import { createScanWorker } from '../worker/seoScanWorker.js';
 import { mongoRunStore } from '../service/scanRunStore.js';
 import { envelope, rankOverviewResult, historyResult, historyItem, rankedKeywordsResult, competitorsResult, competitorItem, backlinksResult } from '../../domain_overview/tests/fixtures.js';
 
@@ -36,6 +37,7 @@ const HOUR = 3_600_000;
 let mongoAvailable = false;
 let server; let baseUrl; let calls; let failures;
 let userA; let userB; let tokenA; let tokenB; let projectA; let domain; let seq = 0;
+let worker;
 
 const STUBS = {
   'rank-overview': () => envelope(rankOverviewResult()),
@@ -70,15 +72,21 @@ before(async () => {
   server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}/api/projects`;
+  // The API only queues scans; this worker (as in production) claims and runs them.
+  worker = createScanWorker({ pollMs: 40, run: { retry: { attempts: 1, baseMs: 0 }, heartbeatMs: 500 } });
+  worker.start();
 });
 
 after(async () => {
+  await worker?.stop({ timeoutMs: 3000 });
   __setTransportForTests(null);
   if (mongoAvailable) {
     const re = new RegExp(MARK);
     await DataForSeoCacheEntry.deleteMany({ target: re });
     await SeoSnapshot.deleteMany({ domain: re });
     await SeoScanRun.deleteMany({ domain: re });
+    for (const name of ['SeoKeywordRanking', 'SeoBacklink', 'SeoReferringDomain']) await (await import(`../model/${name}.js`)).default.deleteMany({ domain: re });
+    await (await import('../model/SeoProviderRequest.js')).default.deleteMany({ target: re });
     await SeoProject.deleteMany({ project_name: re });
     await User.deleteMany({ email: re });
     await mongoose.connection.close();
@@ -325,35 +333,215 @@ describe('explicit scans (real routers, real MongoDB, stubbed provider)', () => 
   });
 });
 
-describe('the scan lock on a real MongoDB unique index', () => {
-  test('E/I: many concurrent starts from "different instances" produce exactly one execution', async (t) => {
+describe('the scan queue and lock on a real MongoDB', () => {
+  const okFetch = async ({ section: s }) => ({ section: s, result: {}, cached: false, cost: null, fetchedAt: new Date() });
+  const fast = { retry: { attempts: 1, baseMs: 0 } };
+
+  test('E/I: many concurrent starts produce exactly one queued scan; workers racing for it process it exactly once', async (t) => {
     if (!mongoAvailable) return t.skip('MongoDB not available');
-    let executions = 0;
-    const slowFetch = async ({ section: s }) => { executions += 1; await new Promise((r) => setTimeout(r, 60)); return { section: s, result: {}, cached: false, cost: null, fetchedAt: new Date() }; };
-    const attempts = await Promise.all(Array.from({ length: 8 }, () => startScan(
-      { project: projectA, userId: String(userA._id), scope: 'dataset', datasets: ['rank-overview'] }, { fetchSection: slowFetch },
-    ).catch((e) => ({ error: e }))));
-    const winners = attempts.filter((a) => a.run && !a.deduped);
-    assert.equal(winners.length, 1);
-    assert.ok(attempts.every((a) => a.deduped || a === winners[0] || a.error), 'everyone else was deduplicated or refused');
-    await winners[0].done;
-    assert.equal(executions, 1);
-    assert.equal(await SeoScanRun.countDocuments({ projectId: projectA._id }), 1);
-    const stored = await SeoScanRun.findById(winners[0].run._id).lean();
-    assert.equal(stored.lockKey, undefined, 'finished: the lock field is gone, so the unique index is free');
-    assert.equal(stored.status, 'completed');
+    await worker.stop({ timeoutMs: 3000 }); // this test drives its own workers
+    try {
+      const attempts = await Promise.all(Array.from({ length: 8 }, () => startScan(
+        { project: projectA, userId: String(userA._id), scope: 'dataset', datasets: ['rank-overview', 'history'] },
+      ).catch((e) => ({ error: e }))));
+      const winners = attempts.filter((a) => a.run && !a.deduped);
+      assert.equal(winners.length, 1);
+      assert.ok(attempts.every((a) => a === winners[0] || a.deduped || a.error), 'everyone else was deduplicated or refused');
+      assert.equal(winners[0].run.status, 'queued');
+      assert.equal(await SeoScanRun.countDocuments({ projectId: projectA._id }), 1);
+
+      let executions = 0;
+      const counting = async (args) => { executions += 1; await new Promise((r) => setTimeout(r, 30)); return okFetch(args); };
+      const mk = (workerId) => createScanWorker({ workerId, pollMs: 20, run: { fetchSection: counting, ...fast } });
+      await Promise.all([mk('w1').drain(), mk('w2').drain(), mk('w3').drain()]);
+      assert.equal(executions, 2, 'two datasets, bought once each, however many workers raced');
+      const stored = await SeoScanRun.findById(winners[0].run._id).lean();
+      assert.equal(stored.lockKey, undefined, 'finished: the lock field is gone, so the unique index is free');
+      assert.equal(stored.status, 'completed');
+      assert.equal(stored.attempts, 1, 'claimed exactly once');
+    } finally { worker.start(); }
   });
 
-  test('a crashed scan (lease expired) is ended as failed by the next start, which then gets the lock', async (t) => {
+  test('a crashed worker: once its lease expired another worker claims the scan and CONTINUES with what was not completed', async (t) => {
     if (!mongoAvailable) return t.skip('MongoDB not available');
-    const dead = await mongoRunStore.tryAcquire({ projectId: projectA._id, domain, scope: 'overview', datasetsRequested: [], datasets: [], leaseUntil: new Date(Date.now() - 5000) });
-    assert.ok(dead);
-    assert.equal(await mongoRunStore.tryAcquire({ projectId: projectA._id, domain, scope: 'overview', datasets: [] }), null, 'the index refuses a second active scan');
-    const { done } = await startScan({ project: projectA, userId: String(userA._id), scope: 'dataset', datasets: ['rank-overview'] }, {
-      fetchSection: async ({ section: s }) => ({ section: s, result: {}, cached: false, cost: null, fetchedAt: new Date() }),
-    });
-    await done;
-    const old = await SeoScanRun.findById(dead._id).lean();
-    assert.deepEqual([old.status, old.error.code, old.lockKey], ['failed', 'SCAN_LEASE_EXPIRED', undefined]);
+    await worker.stop({ timeoutMs: 3000 });
+    try {
+      const { run } = await startScan({ project: projectA, userId: String(userA._id), scope: 'dataset', datasets: ['rank-overview', 'history', 'backlinks'] });
+      const claimed = await mongoRunStore.claimNext({ workerId: 'dead-worker', now: new Date(), leaseMs: 60_000 });
+      assert.equal(String(claimed._id), String(run._id));
+      assert.equal(claimed.attempts, 1);
+      await mongoRunStore.updateDataset(run._id, 'rank-overview', { status: 'completed', cached: false }, { datasetsCompleted: 1, providerRequestsCount: 1 });
+      await mongoRunStore.updateDataset(run._id, 'history', { status: 'running' });
+      assert.equal(await mongoRunStore.claimNext({ workerId: 'other', now: new Date(), leaseMs: 60_000 }), null, 'a live lease cannot be taken');
+      assert.equal(await mongoRunStore.heartbeat(run._id, 'someone-else', new Date(Date.now() + 1000)), false, 'only the owner extends the lease');
+      await SeoScanRun.updateOne({ _id: run._id }, { $set: { leaseUntil: new Date(Date.now() - 1000) } });
+
+      const bought = [];
+      const w = createScanWorker({ workerId: 'rescuer', pollMs: 20, run: { fetchSection: async (a) => { bought.push(a.section); return okFetch(a); }, ...fast } });
+      await w.drain();
+      assert.deepEqual(bought.sort(), ['backlinks', 'history'], 'the completed dataset is not bought again');
+      const after = await SeoScanRun.findById(run._id).lean();
+      assert.equal(after.status, 'completed');
+      assert.equal(after.attempts, 2);
+      assert.equal(after.datasetsCompleted, 3);
+      assert.equal(after.lockKey, undefined);
+    } finally { worker.start(); }
+  });
+
+  test('a graceful stop hands an unfinished scan back to the queue with its lock and completed datasets intact', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    await worker.stop({ timeoutMs: 3000 });
+    try {
+      const { run } = await startScan({ project: projectA, userId: String(userA._id), scope: 'dataset', datasets: ['rank-overview', 'history', 'backlinks'] });
+      let release; const gate = new Promise((r) => { release = r; });
+      let n = 0;
+      const w = createScanWorker({ workerId: 'stopper', pollMs: 20, run: { concurrency: 1, ...fast, fetchSection: async (a) => { n += 1; await gate; return okFetch(a); } } });
+      await w.tick();
+      for (let i = 0; i < 100 && n === 0; i += 1) await new Promise((r) => setTimeout(r, 10));
+      const stopping = w.stop({ timeoutMs: 5000 });
+      release();
+      await stopping;
+      const mid = await SeoScanRun.findById(run._id).lean();
+      assert.equal(mid.status, 'queued');
+      assert.equal(mid.lockKey, String(projectA._id), 'still locked: no second scan can start meanwhile');
+      assert.equal(mid.datasets.filter((d) => d.status === 'completed').length, 1);
+      assert.equal(n, 1);
+      await assert.rejects(startScan({ project: projectA, userId: String(userA._id), scope: 'dataset', datasets: ['competitors'] }), { code: 'SCAN_IN_PROGRESS' });
+      const bought = [];
+      await createScanWorker({ pollMs: 20, run: { fetchSection: async (a) => { bought.push(a.section); return okFetch(a); }, ...fast } }).drain();
+      assert.equal(bought.length, 2);
+      assert.equal((await SeoScanRun.findById(run._id).lean()).status, 'completed');
+    } finally { worker.start(); }
+  });
+});
+
+describe('provider cost protection and accounting (real routers, real MongoDB, stubbed provider)', () => {
+  const FIVE = ['rank-overview', 'history', 'ranked-keywords-top5', 'competitors', 'backlinks'];
+  const idle = async () => {
+    for (let i = 0; i < 200; i += 1) {
+      const s = (await call(`/${projectA._id}/seo-scans/latest`)).json.data.scan;
+      if (s && !['pending', 'queued', 'running'].includes(s.status)) return s;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error('scan did not finish');
+  };
+
+  test('every real request of a scan is recorded (no cache hits), with the costs the provider reported; the summary adds only known costs', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const SeoProviderRequest = (await import('../model/SeoProviderRequest.js')).default;
+    await call(`/${projectA._id}/seo-scans`, { method: 'POST', body: { scope: 'dataset', datasets: FIVE } });
+    const scan = await idle();
+    const rows = await SeoProviderRequest.find({ projectId: projectA._id }).lean();
+    assert.equal(rows.length, 5);
+    assert.equal(rows.every((r) => String(r.scanId) === scan.id && r.trigger === 'scan' && r.success === true), true);
+    assert.deepEqual(rows.map((r) => r.dataset).sort(), ['backlinks', 'competitors', 'history', 'rank-overview', 'ranked-keywords']);
+    const kw = rows.find((r) => r.dataset === 'ranked-keywords');
+    assert.ok(kw.durationMs >= 0 && kw.returnedRecords >= 1 && kw.requestedRecords === 5);
+    // nothing sensitive is stored
+    assert.deepEqual(Object.keys(rows[0]).sort(), ['__v', '_id', 'cost', 'createdAt', 'dataset', 'durationMs', 'endpoint', 'errorCode', 'projectId', 'requestedRecords', 'retryCount', 'returnedRecords', 'scanId', 'startedAt', 'success', 'target', 'trigger']);
+    assert.equal(JSON.stringify(rows).includes('test-password'), false);
+
+    const mark = calls.length;
+    const usage = (await call(`/${projectA._id}/seo-usage?scanId=${scan.id}`)).json.data;
+    assert.equal(usage.total.requests, 5);
+    assert.equal(usage.total.failures, 0);
+    assert.equal(usage.total.costComplete, true);
+    assert.ok(Math.abs(usage.total.reportedCost - 0.1844) < 1e-9);
+    assert.equal(usage.byDataset.length, 5);
+    assert.equal(usage.byTrigger[0].trigger, 'scan');
+    const project = (await call(`/${projectA._id}/seo-usage?days=7`)).json.data;
+    assert.equal(project.total.requests, 5);
+    // reading never writes to the ledger and never buys
+    for (const name of ['rank-overview', 'history', 'ranked-keywords', 'competitors', 'backlinks']) await call(`/${projectA._id}/domain-overview/${name}`);
+    assert.equal(await SeoProviderRequest.countDocuments({ projectId: projectA._id }), 5);
+    assert.equal(calls.length, mark);
+    assert.equal((await call(`/${projectA._id}/seo-usage?scanId=nope`)).status, 400);
+    assert.equal((await call(`/${projectA._id}/seo-usage`, { token: tokenB })).status, 403);
+  });
+
+  test('a failed provider request is recorded as a failure with a code only; a user refresh is recorded as a refresh', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const SeoProviderRequest = (await import('../model/SeoProviderRequest.js')).default;
+    failures.history = Object.assign(new Error('secret provider body'), { code: 'ECONNRESET' });
+    const bad = await call(`/${projectA._id}/domain-overview/history?refresh=1`);
+    assert.ok(bad.status >= 500);
+    failures = {};
+    const ok = await call(`/${projectA._id}/domain-overview/rank-overview?refresh=1`);
+    assert.equal(ok.status, 200);
+    const rows = await SeoProviderRequest.find({ projectId: projectA._id }).sort({ startedAt: 1 }).lean();
+    assert.deepEqual(rows.map((r) => [r.dataset, r.trigger, r.success]), [['history', 'refresh', false], ['rank-overview', 'refresh', true]]);
+    assert.ok(rows[0].errorCode && !JSON.stringify(rows[0]).includes('secret'));
+    const usage = (await call(`/${projectA._id}/seo-usage`)).json.data;
+    assert.deepEqual([usage.total.requests, usage.total.failures], [2, 1]);
+    assert.equal(usage.recentFailures[0].dataset, 'history');
+  });
+
+  test('a page Refresh is refused while a scan is collecting for the project (no double purchase), and allowed again afterwards', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    await worker.stop({ timeoutMs: 3000 });
+    try {
+      const started = await call(`/${projectA._id}/seo-scans`, { method: 'POST', body: { scope: 'dataset', datasets: ['rank-overview'] } });
+      assert.equal(started.status, 202);
+      assert.equal(started.json.data.scan.status, 'queued', 'the request only queued it');
+      assert.equal(calls.length, 0, 'and bought nothing');
+      const refused = await call(`/${projectA._id}/domain-overview/rank-overview?refresh=1`);
+      assert.equal(refused.status, 409);
+      assert.equal(refused.json.code, 'SCAN_IN_PROGRESS');
+      // a plain read is never refused
+      assert.equal((await call(`/${projectA._id}/domain-overview/rank-overview`)).status, 200);
+      assert.equal(calls.length, 0);
+    } finally { worker.start(); }
+    await idle();
+    assert.equal(calls.length, 1);
+    assert.equal((await call(`/${projectA._id}/domain-overview/rank-overview?refresh=1`)).status, 200);
+  });
+
+  test('EVERY page section: opening, paging, sorting, filtering and searching make ZERO provider requests - empty database, after a scan, and with stale data', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const sections = SECTION_NAMES.filter((s) => s !== 'bulk-traffic' && s !== 'head-to-head');
+    const f = (...c) => `filters=${encodeURIComponent(JSON.stringify(c.length === 1 ? c[0] : c.flatMap((x, i) => (i ? ['and', x] : [x]))))}`;
+    const variants = (name) => {
+      const base = ['', '?limit=25&offset=25'];
+      if (name === 'ranked-keywords') return [...base, `?${f(['keyword_data.keyword', 'like', '%a%'])}`, '?order_by=keyword_data.keyword,asc'];
+      if (name === 'backlinks-list') return [...base, `?${f(['url_from', 'like', '%a%'])}`, '?status=lost', '?mode=one_per_domain', '?order_by=first_seen,desc'];
+      if (name === 'referring-domains') return [...base, `?${f(['domain', 'like', '%a%'])}`, '?status=lost', '?dofollow=1', '?order_by=backlinks,asc'];
+      if (name === 'anchors') return [...base, `?${f(['anchor', 'like', '%a%'])}`, '?status=lost', '?order_by=backlinks,asc'];
+      if (name === 'domain-pages') return [...base, `?${f(['page', 'like', '%a%'])}`, '?order_by=page_summary.backlinks,asc'];
+      if (name === 'competitors') return [...base, '?order_by=avg_position,asc', '?exclude_top_domains=0'];
+      if (name === 'backlinks') return ['', '?status=lost', '?dofollow=1'];
+      if (name === 'history') return ['', '?months=6', '?months=24'];
+      return [''];
+    };
+    const sweep = async (label) => {
+      const before = calls.length;
+      let n = 0;
+      for (const name of sections) {
+        for (const q of variants(name)) {
+          const r = await call(`/${projectA._id}/domain-overview/${name}${q}`);
+          assert.ok([200, 400].includes(r.status), `${label} ${name}${q} -> ${r.status}`);
+          n += 1;
+        }
+      }
+      assert.equal(calls.length, before, `${label}: ${n} reads, provider requests made`);
+      return n;
+    };
+    const first = await sweep('empty database');
+    assert.ok(first > 40);
+    await call(`/${projectA._id}/seo-scans`, { method: 'POST', body: { scope: 'dataset', datasets: ['rank-overview', 'history', 'backlinks', 'competitors', 'keywords-dataset', 'backlinks-dataset-live', 'referring-domains-dataset-live'] } });
+    await idle().catch(() => null);
+    calls.length = 0;
+    await sweep('after a scan');
+    // stale: age every stored answer of this project past its deadline
+    const DataForSeoCache = (await import('../../shared/DataForSeoCacheEntry.js')).default;
+    await DataForSeoCache.updateMany({ target: domain }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+    await SeoSnapshot.updateMany({ projectId: projectA._id, part: /^dataset:/ }, { $set: { capturedAt: new Date(Date.now() - 5 * 86_400_000) } });
+    await sweep('stale data');
+    // the history and freshness endpoints
+    const mark = calls.length;
+    for (const p of [`/seo-datasets`, `/seo-datasets/freshness`, `/seo-datasets/changes?dataset=keywords`, `/seo-datasets/changes?dataset=backlinks&period=week`, `/seo-datasets/keywords`, `/seo-datasets/backlinks`, `/seo-datasets/referring-domains`, `/seo-datasets/anchors`, `/seo-datasets/pages`, `/seo-snapshots?datasetType=traffic`, `/seo-snapshots/comparison?datasetType=domain_overview&part=rank-overview&period=week`, `/seo-scans`, `/seo-scans/latest`, `/seo-usage`]) {
+      const r = await call(`/${projectA._id}${p}`);
+      assert.equal(r.status, 200, p);
+    }
+    assert.equal(calls.length, mark, 'history, comparison, freshness and usage read MongoDB only');
   });
 });

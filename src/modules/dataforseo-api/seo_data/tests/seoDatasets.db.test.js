@@ -25,6 +25,7 @@ import seoScanRoutes from '../routes/seoScanRoutes.js';
 import { __setTransportForTests } from '../../domain_overview/provider/domainOverviewProvider.js';
 import { SECTION_NAMES } from '../../domain_overview/config.js';
 import { persistRows } from '../datasets/datasetCollector.js';
+import { createScanWorker } from '../worker/seoScanWorker.js';
 import { envelope, rankedKeywordItem } from '../../domain_overview/tests/fixtures.js';
 import { REAL_LIST_DEFAULT } from '../../domain_overview/tests/realBacklinksList.js';
 import { RAW_RD_DEFAULT } from '../../domain_overview/tests/realReferringDomains.js';
@@ -39,6 +40,7 @@ const MARK = `seo-datasets-${Date.now()}`;
 let mongoAvailable = false;
 let server; let baseUrl; let calls; let world; let seq = 0;
 let userA; let userB; let tokenA; let tokenB; let projectA; let projectB; let domain;
+let worker;
 
 // ── the provider's world: version 1 and version 2 of the same site ──
 const KW_TOTAL = { 1: 2500, 2: 2495 };
@@ -69,8 +71,10 @@ const blRaw = (n, status) => ({
   domain_from_country: n % 2 ? 'IN' : 'US', backlink_spam_score: n % 60,
 });
 const RD_TOTAL = { live: 1200, lost: 30 };
+const rdTotal = (status) => (status === 'live' && world.version === 2 ? 1198 : RD_TOTAL[status]);
+const rdRank = (n) => (n % 600) + (world.version === 2 && n >= 100 && n < 110 ? 7 : 0) - (world.version === 2 && n >= 200 && n < 203 ? 4 : 0);
 const rdRaw = (n, status) => ({
-  ...RAW_RD_DEFAULT.items[0], domain: `ref${n}.example.net`, rank: n % 600, backlinks: 1 + (n % 90), referring_pages: 1 + (n % 90), referring_pages_nofollow: n % 4 === 0 ? 1 + (n % 90) : 0,
+  ...RAW_RD_DEFAULT.items[0], domain: `ref${n}.example.net`, rank: rdRank(n), backlinks: 1 + (n % 90) + (world.version === 2 && n >= 300 && n < 320 ? 3 : 0), referring_pages: 1 + (n % 90), referring_pages_nofollow: n % 4 === 0 ? 1 + (n % 90) : 0,
   backlinks_spam_score: n % 70, first_seen: `2024-${String((n % 12) + 1).padStart(2, '0')}-05 00:00:00 +00:00`, lost_date: status === 'lost' ? '2026-09-01 00:00:00 +00:00' : null,
 });
 
@@ -94,10 +98,11 @@ const STUBS = {
   'referring-domains': (body) => {
     const status = body.backlinks_status_type ?? 'live';
     if (world.failRd && (body.offset ?? 0) > 0) throw Object.assign(new Error('boom'), { code: 'ECONNRESET' });
-    const total = RD_TOTAL[status];
+    const total = rdTotal(status);
     const start = body.offset ?? 0;
     const count = Math.max(0, Math.min(body.limit, total - start));
-    const items = Array.from({ length: count }, (_, i) => rdRaw(start + i, status));
+    const shift = status === 'live' && world.version === 2 ? 5 : 0;
+    const items = Array.from({ length: count }, (_, i) => rdRaw(start + i + shift, status));
     return envelope({ total_count: total, items_count: count, items: count ? items : null });
   },
 };
@@ -124,9 +129,12 @@ before(async () => {
   server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   baseUrl = `http://127.0.0.1:${server.address().port}/api/projects`;
+  worker = createScanWorker({ pollMs: 40, run: { retry: { attempts: 1, baseMs: 0 }, heartbeatMs: 500 } });
+  worker.start();
 });
 
 after(async () => {
+  await worker?.stop({ timeoutMs: 3000 });
   __setTransportForTests(null);
   if (mongoAvailable) {
     const re = new RegExp(MARK);
@@ -362,6 +370,115 @@ describe('Phase 2: permanent datasets, database paging, history (real routers + 
     assert.equal(calls.length, mark);
   });
 
+  test('Anchors page: rows are rolled up from the stored backlinks in the page\'s own shape, with completeness; provider-only values stay null', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const mark = calls.length;
+    const def = (await section('anchors')).json.data;
+    assert.equal(def.source, 'database');
+    assert.equal(def.dataset.derived, true);
+    assert.deepEqual([def.dataset.complete, def.dataset.truncated, def.dataset.sourceDatasetCount], [true, false, 1500]);
+    assert.ok(def.dataset.scanId && def.dataset.lastUpdatedAt);
+    assert.equal(def.result.totalCount, 26);
+    const brand = def.result.items.find((a) => a.anchor === 'brand name');
+    assert.equal(def.result.items[0].anchor, 'brand name', 'sorted by referring domains, most first');
+    assert.deepEqual([brand.backlinks, brand.referring_domains, brand.referring_domains_nofollow], [375, 75, 25]);
+    assert.deepEqual([brand.rank, brand.backlinks_spam_score, brand.referring_main_domains], [null, null, null], 'values only the provider has are null, never 0');
+    assert.match(brand.first_seen, /^\d{4}-\d{2}-\d{2} /);
+    const page2 = (await section('anchors', '?limit=25&offset=25')).json.data.result;
+    assert.equal(page2.items.length, 1);
+    const byBacklinks = (await section('anchors', '?limit=25&order_by=backlinks,asc')).json.data.result;
+    assert.ok(byBacklinks.items.every((r, i, a) => i === 0 || a[i - 1].backlinks <= r.backlinks));
+    const search = (await section('anchors', `?${filt(['anchor', 'like', '%brand%'])}`)).json.data.result;
+    assert.deepEqual([search.totalCount, search.items[0].anchor], [1, 'brand name']);
+    const exact = (await section('anchors', `?${filt(['anchor', '=', 'anchor 7'])}`)).json.data.result;
+    assert.equal(exact.totalCount, 1);
+    const minDomains = (await section('anchors', `?${filt(['referring_domains', '>=', 100])}`)).json.data.result;
+    assert.ok(minDomains.items.every((r) => r.referring_domains >= 100));
+    const profile = (await section('anchor-profile')).json.data;
+    assert.equal(profile.result.items.length, 26);
+    assert.equal(profile.dataset.derived, true);
+    // sorting / filtering on a value only the provider has cannot be answered from stored backlinks: reported, never guessed
+    for (const q of ['?order_by=rank,desc', `?${filt(['backlinks_spam_score', '<=', 10])}`, '?status=all']) {
+      assert.equal((await section('anchors', q)).json.data.missing, true, q);
+    }
+    assert.equal(calls.length, mark);
+  });
+
+  test('Top Pages page: pages are rolled up from the stored backlinks (tabs, search, sort, paging) and the traffic columns say they are not collected', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const mark = calls.length;
+    const res = (await section('domain-pages', '?limit=50')).json.data;
+    assert.equal(res.source, 'database');
+    assert.equal(res.result.totalCount, 9);
+    assert.equal(res.result.items.reduce((n, p) => n + p.backlinks, 0), 1500);
+    assert.equal(res.dataset.derived, true);
+    assert.deepEqual(res.traffic, { status: 'failed', code: 'NOT_SCANNED' }, 'the traffic join is not collected: its columns stay empty');
+    assert.ok(res.result.items.every((p) => p.traffic === null && p.rank === null));
+    const status = res.result.items[0].status_code;
+    const same = (await section('domain-pages', `?${filt(['status_code', '>=', status], ['status_code', '<', status + 1])}`)).json.data.result;
+    assert.equal(same.totalCount, 9);
+    const none = (await section('domain-pages', `?${filt(['status_code', '>=', status + 1])}`)).json.data.result;
+    assert.equal(none.totalCount, 0);
+    const url = (await section('domain-pages', `?${filt(['page', 'like', '%/t3/%'])}`)).json.data.result;
+    assert.equal(url.totalCount, 1);
+    assert.equal(url.items[0].backlinks, [...Array(1500).keys()].filter((n) => n % 9 === 3).length);
+    const asc = (await section('domain-pages', '?order_by=page_summary.backlinks,asc')).json.data.result;
+    assert.ok(asc.items.every((r, i, a) => i === 0 || a[i - 1].backlinks <= r.backlinks));
+    assert.equal((await section('domain-pages', '?limit=25&offset=25')).json.data.result.items.length, 0, 'past the last page: empty, not an error');
+    assert.equal((await section('domain-pages', '?order_by=page_summary.rank,desc')).json.data.missing, true, 'rank is provider-only');
+    assert.equal(calls.length, mark);
+  });
+
+  test('a truncated source dataset is never reported as complete', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const state = await SeoSnapshot.findOne({ projectId: projectA._id, part: 'dataset:backlinks', variant: 'live' }).sort({ capturedAt: -1 });
+    await SeoSnapshot.updateOne({ _id: state._id }, { $set: { 'data.truncated': true, 'data.totalCount': 18343 } });
+    try {
+      const a = (await section('anchors')).json.data;
+      assert.deepEqual([a.dataset.complete, a.dataset.truncated, a.dataset.totalCount, a.dataset.sourceDatasetCount], [false, true, 18343, 1500]);
+      const d = (await ds('/anchors')).json.data;
+      assert.deepEqual([d.complete, d.truncated, d.sourceDatasetCount, d.scanId], [false, true, 1500, String(state.scanId)]);
+      assert.ok(d.lastUpdatedAt);
+      const p = (await ds('/pages')).json.data;
+      assert.equal(p.complete, false);
+      const row = d.items.find((x) => x.anchor === 'brand name');
+      assert.equal(row.follow + row.nofollow + row.unknownFollow, row.backlinks, 'every link is follow, nofollow or unknown');
+    } finally {
+      await SeoSnapshot.updateOne({ _id: state._id }, { $set: { 'data.truncated': false, 'data.totalCount': 1500 } });
+    }
+  });
+
+  test('per-dataset freshness: a scan of one dataset does not make the others fresh, and a stale one stays available', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const mark = calls.length;
+    const f = (await ds('/freshness', '?page=backlinks')).json.data.datasets;
+    const by = Object.fromEntries(f.map((d) => [d.id, d]));
+    assert.equal(by['backlinks-dataset-live'].state, 'fresh');
+    assert.deepEqual([by['backlinks-dataset-live'].rows, by['backlinks-dataset-live'].truncated], [1500, false]);
+    assert.ok(by['backlinks-dataset-live'].lastSuccessfulScanId);
+    assert.equal(by['backlinks-list'].state, 'fresh', 'the Backlinks page is answered from that row set, so it is exactly as fresh as it');
+    // datasets backed by something else are judged on their own: a backlink scan did not collect the Top Pages counts or traffic
+    const pages = Object.fromEntries((await ds('/freshness', '?page=top-pages')).json.data.datasets.map((d) => [d.id, d]));
+    assert.equal(pages['tp-counts'].state, 'missing');
+    assert.equal(pages['top-pages-traffic'].state, 'missing');
+    assert.equal(pages['domain-pages-all'].state, 'fresh');
+    assert.equal(pages['domain-pages-all'].lastSuccessfulScanId, by['backlinks-dataset-live'].lastSuccessfulScanId);
+    const summaries = Object.fromEntries((await ds('/freshness', '?page=domain-overview')).json.data.datasets.map((d) => [d.id, d]));
+    assert.equal(summaries['rank-overview'].state, 'missing', 'the overview summaries were not collected by the backlink / keyword scans');
+    // age the row set past its freshness deadline: stale, still served
+    const state = await SeoSnapshot.findOne({ projectId: projectA._id, part: 'dataset:backlinks', variant: 'live' }).sort({ capturedAt: -1 });
+    const original = state.capturedAt;
+    await SeoSnapshot.updateOne({ _id: state._id }, { $set: { capturedAt: new Date(Date.now() - 3 * 86_400_000) } });
+    try {
+      const aged = (await ds('/freshness', '?page=backlinks')).json.data.datasets.find((d) => d.id === 'backlinks-dataset-live');
+      assert.equal(aged.state, 'stale');
+      const page = (await section('backlinks-list')).json.data;
+      assert.deepEqual([page.stale, page.missing, page.result.totalCount], [true, false, 1500]);
+    } finally { await SeoSnapshot.updateOne({ _id: state._id }, { $set: { capturedAt: original } }); }
+    assert.equal((await ds('/freshness', '?page=nope')).status, 400);
+    assert.equal(calls.length, mark);
+  });
+
   test('project isolation: the same domain under another owner sees none of these rows; an outsider is refused', async (t) => {
     if (!mongoAvailable) return t.skip('MongoDB not available');
     const mark = calls.length;
@@ -433,6 +550,8 @@ describe('Phase 2: permanent datasets, database paging, history (real routers + 
     assert.equal(r.improved.count, 10);
     assert.equal(r.declined.count, 5);
     assert.ok(r.improved.items.every((i) => i.position_change === 1));
+    assert.ok(r.improved.items.every((i) => i.traffic_change === 0 && i.search_volume_change === 0), 'figures known in both scans and unchanged are 0, not missing');
+    assert.deepEqual([r.totals.latest.count, r.totals.reference.count], [2495, 2500], 'the provider\'s whole-domain totals stored with each scan');
     assert.equal(r.reference.rows, 2500);
     assert.equal(r.latest.rows, 2495);
     // the pages now read the newest set
@@ -452,6 +571,31 @@ describe('Phase 2: permanent datasets, database paging, history (real routers + 
     assert.equal(calls.length, mark);
   });
 
+  test('History: referring domains - new, lost, rank and backlink-count changes come from the two stored sets', async (t) => {
+    if (!mongoAvailable) return t.skip('MongoDB not available');
+    const one = (await ds('/changes', '?dataset=referring-domains')).json.data;
+    assert.equal(one.reference, null, 'one scan so far');
+    world.version = 2;
+    await ageCache();
+    const s = await scan({ scope: 'dataset', datasets: ['referring-domains-dataset-live'], force: true });
+    assert.equal(s.status, 'completed');
+    const mark = calls.length;
+    const r = (await ds('/changes', '?dataset=referring-domains&period=previous')).json.data;
+    assert.equal(r.new.count, 3);
+    assert.equal(r.lost.count, 5);
+    assert.deepEqual(r.new.items.map((d) => d.domain).sort(), ['ref1200.example.net', 'ref1201.example.net', 'ref1202.example.net']);
+    assert.equal(r.rankUp.count, 10);
+    assert.equal(r.rankDown.count, 3);
+    assert.ok(r.rankUp.items.every((d) => d.rank_change === 7));
+    assert.ok(r.rankDown.items.every((d) => d.rank_change === -4));
+    assert.equal(r.backlinksUp.count, 20);
+    assert.equal(r.backlinksDown.count, 0);
+    assert.deepEqual([r.reference.rows, r.latest.rows], [1200, 1198]);
+    // lost domains are a different dataset: its own (single) scan has nothing to compare with
+    assert.equal((await ds('/changes', '?dataset=referring-domains&status=lost')).json.data.reference, null);
+    assert.equal(calls.length, mark);
+  });
+
   test('Partial failure: one failing dataset leaves the others, the previous complete dataset keeps serving, and a retry runs only that dataset', async (t) => {
     if (!mongoAvailable) return t.skip('MongoDB not available');
     world.failRd = true;
@@ -461,7 +605,7 @@ describe('Phase 2: permanent datasets, database paging, history (real routers + 
     assert.deepEqual(s.datasets.map((d) => [d.id, d.status]), [['backlinks-dataset-live', 'completed'], ['referring-domains-dataset-live', 'failed']]);
     // the half-collected domain rows exist under the failed scan but nothing reads them: the earlier complete set still answers
     const rd = (await section('referring-domains')).json.data;
-    assert.equal(rd.result.totalCount, 1200);
+    assert.equal(rd.result.totalCount, 1198);
     assert.notEqual(rd.dataset.scanId, s.id);
     const bl = (await section('backlinks-list')).json.data;
     assert.equal(bl.dataset.scanId, s.id, 'the successful dataset of the same scan is already the latest');
@@ -469,7 +613,7 @@ describe('Phase 2: permanent datasets, database paging, history (real routers + 
     const retry = await call(`/${projectA._id}/seo-scans`, { method: 'POST', body: { retryOf: s.id } });
     assert.equal(retry.status, 202);
     let latest;
-    for (let i = 0; i < 200; i += 1) { latest = (await call(`/${projectA._id}/seo-scans/latest`)).json.data.scan; if (latest.status !== 'running') break; await new Promise((r) => setTimeout(r, 50)); }
+    for (let i = 0; i < 200; i += 1) { latest = (await call(`/${projectA._id}/seo-scans/latest`)).json.data.scan; if (!['queued', 'running', 'pending'].includes(latest.status)) break; await new Promise((r) => setTimeout(r, 50)); }
     assert.equal(latest.status, 'completed');
     assert.deepEqual(latest.datasets.map((d) => d.id), ['referring-domains-dataset-live']);
     assert.ok(calls.every((c) => c.section === 'referring-domains'), 'the successful backlinks dataset is not requested again');

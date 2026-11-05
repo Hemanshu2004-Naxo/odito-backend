@@ -46,11 +46,12 @@ const schema = new mongoose.Schema({
 
 // Duplicate prevention + the target of every idempotent bulk upsert.
 schema.index({ projectId: 1, scanId: 1, nk: 1 }, { unique: true, name: 'seo_kw_scan_nk' });
-// The page's sorts within one scan: traffic (default), position, search volume. Other sorts (difficulty, CPC, keyword) scan the
+// The page's sorts within one scan: traffic (default), position, search volume. `_id` is part of each key because every sort ends with the
+// _id tie-break (stable paging, see datasets/mongoQuery.js): the index then serves the sort and the page stops after skip + limit entries. Other sorts (difficulty, CPC, keyword) scan the
 // project+scan set, which a scan caps (see config.js), so they stay bounded.
-schema.index({ projectId: 1, scanId: 1, trafficEstimate: -1 }, { name: 'seo_kw_scan_traffic' });
-schema.index({ projectId: 1, scanId: 1, position: 1 }, { name: 'seo_kw_scan_position' });
-schema.index({ projectId: 1, scanId: 1, searchVolume: -1 }, { name: 'seo_kw_scan_volume' });
+schema.index({ projectId: 1, scanId: 1, trafficEstimate: -1, _id: -1 }, { name: 'seo_kw_scan_traffic' });
+schema.index({ projectId: 1, scanId: 1, position: 1, _id: 1 }, { name: 'seo_kw_scan_position' });
+schema.index({ projectId: 1, scanId: 1, searchVolume: -1, _id: -1 }, { name: 'seo_kw_scan_volume' });
 // One keyword across scans: its ranking history and best position.
 schema.index({ projectId: 1, normalizedKeyword: 1, capturedAt: -1 }, { name: 'seo_kw_history' });
 

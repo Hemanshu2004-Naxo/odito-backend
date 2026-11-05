@@ -34,9 +34,9 @@ const schema = new mongoose.Schema({
 }, { collection: 'seo_referring_domains_v2', timestamps: true, minimize: false });
 
 schema.index({ projectId: 1, scanId: 1, status: 1, referringDomain: 1 }, { unique: true, name: 'seo_rd_scan_domain' });
-schema.index({ projectId: 1, scanId: 1, status: 1, domainRank: -1 }, { name: 'seo_rd_scan_rank' });
-schema.index({ projectId: 1, scanId: 1, status: 1, backlinksCount: -1 }, { name: 'seo_rd_scan_backlinks' });
-schema.index({ projectId: 1, scanId: 1, status: 1, firstSeen: -1 }, { name: 'seo_rd_scan_first_seen' });
+schema.index({ projectId: 1, scanId: 1, status: 1, domainRank: -1, _id: -1 }, { name: 'seo_rd_scan_rank' });
+schema.index({ projectId: 1, scanId: 1, status: 1, backlinksCount: -1, _id: -1 }, { name: 'seo_rd_scan_backlinks' });
+schema.index({ projectId: 1, scanId: 1, status: 1, firstSeen: -1, _id: -1 }, { name: 'seo_rd_scan_first_seen' });
 // One domain across scans: when it appeared, its rank over time.
 schema.index({ projectId: 1, referringDomain: 1, capturedAt: -1 }, { name: 'seo_rd_history' });
 

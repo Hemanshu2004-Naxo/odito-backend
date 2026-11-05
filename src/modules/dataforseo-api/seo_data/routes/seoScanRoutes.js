@@ -4,7 +4,7 @@ import rateLimit from 'express-rate-limit';
 import auth from '../../../user/middleware/auth.js';
 import { validateProjectAccess } from '../../../../middleware/auth.middleware.js';
 import { postScan, getLatestScan, listScans, getScan, getSnapshots, getComparison } from '../controller/seoScanController.js';
-import { datasetStatus, datasetChanges, keywordHistoryRoute, listKeywords, listBacklinks, listReferringDomains, listDerived } from '../controller/seoDatasetController.js';
+import { datasetStatus, datasetChanges, keywordHistoryRoute, listKeywords, listBacklinks, listReferringDomains, listDerived, datasetFreshness, usageSummary } from '../controller/seoDatasetController.js';
 import { SCAN_START_LIMIT } from '../config.js';
 
 /**
@@ -38,6 +38,7 @@ router.get('/:projectId/seo-snapshots', ...projectScoped, getSnapshots);
 
 // Stored row-level datasets (MongoDB only; none of these can reach the provider).
 router.get('/:projectId/seo-datasets', ...projectScoped, datasetStatus);
+router.get('/:projectId/seo-datasets/freshness', ...projectScoped, datasetFreshness);
 router.get('/:projectId/seo-datasets/changes', ...projectScoped, datasetChanges);
 router.get('/:projectId/seo-datasets/keywords/history', ...projectScoped, keywordHistoryRoute);
 router.get('/:projectId/seo-datasets/keywords', ...projectScoped, listKeywords);
@@ -45,5 +46,8 @@ router.get('/:projectId/seo-datasets/backlinks', ...projectScoped, listBacklinks
 router.get('/:projectId/seo-datasets/referring-domains', ...projectScoped, listReferringDomains);
 router.get('/:projectId/seo-datasets/anchors', ...projectScoped, listDerived('anchors'));
 router.get('/:projectId/seo-datasets/pages', ...projectScoped, listDerived('pages'));
+
+// Provider request accounting (what scans and explicit refreshes really bought).
+router.get('/:projectId/seo-usage', ...projectScoped, usageSummary);
 
 export default router;

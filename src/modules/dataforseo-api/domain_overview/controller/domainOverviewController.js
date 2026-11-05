@@ -10,6 +10,7 @@ import { DOMAIN_PAGES_PARAMS } from '../validator/domainPagesQuery.js';
 import { getTopPagesSection } from '../service/topPagesService.js';
 import { PEEKABLE_SECTIONS, dbFirstReads } from '../config.js';
 import { ProviderBudgetExceeded } from '../service/providerBudget.js';
+import { mongoRunStore } from '../../seo_data/service/scanRunStore.js';
 import { BULK_TRAFFIC_PARAMS } from '../validator/bulkTrafficQuery.js';
 import { ValidationFailure } from '../../shared/targetDomain.js';
 import { DataForSeoApiError, DATAFORSEO_HTTP_STATUS, DATAFORSEO_USER_MESSAGE } from '../../shared/providerErrors.js';
@@ -73,6 +74,10 @@ export async function getSection(req, res) {
     // meant for another section is a mistake worth a 400, never a silent no-op. Everything is validated against whitelists before a billed call.
     const stray = MANAGED_PARAMS.filter((k) => req.query[k] !== undefined && !(ALLOWED_PARAMS[section] ?? []).includes(k));
     if (stray.length) throw new ValidationFailure('query', `${stray.join(', ')} do not apply to the ${section} section`);
+    // A page Refresh while a scan is collecting for this project would buy the same data twice: refuse it, the scan will deliver.
+    if (refresh && await mongoRunStore.findActive(req.project._id)) {
+      return res.status(409).json({ success: false, code: 'SCAN_IN_PROGRESS', message: 'An SEO scan is collecting data for this project right now. Please wait for it to finish.' });
+    }
     const query = parseSectionQuery(section, req.query, req.project);
     // The table and "Fix first" are answered with the traffic per page joined on (see service/topPagesService.js); every other section as it is.
     const ask = section === 'domain-pages' || section === 'tp-fix-first' ? getTopPagesSection : getDomainOverviewSection;

@@ -35,7 +35,6 @@ export async function postScan(req, res) {
 /** GET /projects/:projectId/seo-scans/latest -> the newest scan (any status) or null. A scan whose worker died is reported (and freed) here. */
 export async function getLatestScan(req, res) {
   try {
-    await mongoRunStore.expireStale(req.project._id, new Date());
     const run = await mongoRunStore.latest(req.project._id);
     res.set('Cache-Control', 'no-store');
     return res.status(200).json({ success: true, data: { scan: toPublicRun(run) } });

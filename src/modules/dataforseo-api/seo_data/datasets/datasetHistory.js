@@ -1,5 +1,6 @@
 import SeoSnapshot from '../model/SeoSnapshot.js';
 import SeoKeywordRanking from '../model/SeoKeywordRanking.js';
+import SeoReferringDomain from '../model/SeoReferringDomain.js';
 import { KINDS, STATE_PART, STATE_TYPE } from './definitions.js';
 import { variantOf } from './datasetCollector.js';
 
@@ -62,21 +63,60 @@ async function keywordMovement({ projectId, from, against }) {
       let: { k: '$nk' },
       pipeline: [
         { $match: { $expr: { $and: [{ $eq: ['$projectId', projectId] }, { $eq: ['$scanId', against] }, { $eq: ['$nk', '$$k'] }] } } },
-        { $limit: 1 }, { $project: { position: 1 } },
+        { $limit: 1 }, { $project: { position: 1, trafficEstimate: 1, searchVolume: 1 } },
       ],
       as: 'prev',
     } },
     { $match: { prev: { $size: 1 } } },
-    { $addFields: { change: { $subtract: [{ $arrayElemAt: ['$prev.position', 0] }, '$position'] } } },
+    { $addFields: {
+      change: { $subtract: [{ $arrayElemAt: ['$prev.position', 0] }, '$position'] },
+      trafficChange: { $subtract: ['$trafficEstimate', { $arrayElemAt: ['$prev.trafficEstimate', 0] }] },
+      volumeChange: { $subtract: ['$searchVolume', { $arrayElemAt: ['$prev.searchVolume', 0] }] },
+    } },
     { $facet: {
       improvedN: [{ $match: { change: { $gt: 0 } } }, { $count: 'n' }],
-      improved: [{ $match: { change: { $gt: 0 } } }, { $sort: { change: -1 } }, { $limit: SAMPLE }, { $project: { row: 1, change: 1 } }],
+      improved: [{ $match: { change: { $gt: 0 } } }, { $sort: { change: -1 } }, { $limit: SAMPLE }, { $project: { row: 1, change: 1, trafficChange: 1, volumeChange: 1 } }],
       declinedN: [{ $match: { change: { $lt: 0 } } }, { $count: 'n' }],
-      declined: [{ $match: { change: { $lt: 0 } } }, { $sort: { change: 1 } }, { $limit: SAMPLE }, { $project: { row: 1, change: 1 } }],
+      declined: [{ $match: { change: { $lt: 0 } } }, { $sort: { change: 1 } }, { $limit: SAMPLE }, { $project: { row: 1, change: 1, trafficChange: 1, volumeChange: 1 } }],
     } },
   ]).allowDiskUse(true);
-  const shape = (n, items) => ({ count: n?.[0]?.n ?? 0, items: (items ?? []).map((i) => ({ ...i.row, position_change: i.change })) });
+  // position_change > 0 = moved up that many places. traffic / volume changes are null when either scan had no figure (never 0).
+  const shape = (n, items) => ({ count: n?.[0]?.n ?? 0, items: (items ?? []).map((i) => ({ ...i.row, position_change: i.change, traffic_change: i.trafficChange ?? null, search_volume_change: i.volumeChange ?? null })) });
   return { improved: shape(r?.improvedN, r?.improved), declined: shape(r?.declinedN, r?.declined) };
+}
+
+/** Referring domains present in both scans whose domain rank or backlink count changed (change = now - before; null when either scan had no figure). */
+async function domainMovement({ projectId, status, from, against }) {
+  const [r] = await SeoReferringDomain.aggregate([
+    { $match: { projectId, scanId: from, status } },
+    { $lookup: {
+      from: SeoReferringDomain.collection.name,
+      let: { d: '$referringDomain' },
+      pipeline: [
+        { $match: { $expr: { $and: [{ $eq: ['$projectId', projectId] }, { $eq: ['$scanId', against] }, { $eq: ['$status', status] }, { $eq: ['$referringDomain', '$$d'] }] } } },
+        { $limit: 1 }, { $project: { domainRank: 1, backlinksCount: 1 } },
+      ],
+      as: 'prev',
+    } },
+    { $match: { prev: { $size: 1 } } },
+    { $addFields: {
+      rankChange: { $subtract: ['$domainRank', { $arrayElemAt: ['$prev.domainRank', 0] }] },
+      backlinksChange: { $subtract: ['$backlinksCount', { $arrayElemAt: ['$prev.backlinksCount', 0] }] },
+    } },
+    { $facet: {
+      rankUpN: [{ $match: { rankChange: { $gt: 0 } } }, { $count: 'n' }],
+      rankUp: [{ $match: { rankChange: { $gt: 0 } } }, { $sort: { rankChange: -1 } }, { $limit: SAMPLE }, { $project: { row: 1, rankChange: 1, backlinksChange: 1 } }],
+      rankDownN: [{ $match: { rankChange: { $lt: 0 } } }, { $count: 'n' }],
+      rankDown: [{ $match: { rankChange: { $lt: 0 } } }, { $sort: { rankChange: 1 } }, { $limit: SAMPLE }, { $project: { row: 1, rankChange: 1, backlinksChange: 1 } }],
+      backlinksUpN: [{ $match: { backlinksChange: { $gt: 0 } } }, { $count: 'n' }],
+      backlinksDownN: [{ $match: { backlinksChange: { $lt: 0 } } }, { $count: 'n' }],
+    } },
+  ]).allowDiskUse(true);
+  const shape = (n, items) => ({ count: n?.[0]?.n ?? 0, items: (items ?? []).map((i) => ({ ...i.row, rank_change: i.rankChange ?? null, backlinks_change: i.backlinksChange ?? null })) });
+  return {
+    rankUp: shape(r?.rankUpN, r?.rankUp), rankDown: shape(r?.rankDownN, r?.rankDown),
+    backlinksUp: { count: r?.backlinksUpN?.[0]?.n ?? 0 }, backlinksDown: { count: r?.backlinksDownN?.[0]?.n ?? 0 },
+  };
 }
 
 /**
@@ -89,7 +129,10 @@ export async function compareDatasets({ projectId, kind, status = null, period =
   const base = { kind, status, period };
   if (!latest) return { ...base, hasData: false, latest: null, reference: null };
   if (!reference) {
-    return { ...base, hasData: true, latest: describe(latest), reference: null, note: 'No earlier Odito scan of this dataset exists yet, so there is nothing to compare with.' };
+    const note = period === 'previous'
+      ? 'No earlier Odito scan of this dataset exists yet, so there is nothing to compare with.'
+      : `No scan of this dataset is ${period === 'week' ? 'a week' : 'a month'} old yet, so there is nothing to compare with.`;
+    return { ...base, hasData: true, latest: describe(latest), reference: null, note };
   }
   const { model } = KINDS[kind];
   const sort = { _id: 1 };
@@ -98,11 +141,14 @@ export async function compareDatasets({ projectId, kind, status = null, period =
     onlyIn({ ...args, from: latest.scanId, against: reference.scanId, sort }),
     onlyIn({ ...args, from: reference.scanId, against: latest.scanId, sort }),
   ]);
-  const movement = kind === 'keywords' ? await keywordMovement({ projectId, from: latest.scanId, against: reference.scanId }) : {};
+  const movement = kind === 'keywords' ? await keywordMovement({ projectId, from: latest.scanId, against: reference.scanId })
+    : kind === 'referringDomains' ? await domainMovement({ projectId, status, from: latest.scanId, against: reference.scanId }) : {};
+  // The provider's whole-domain totals stored with each scan (keywords: count, traffic, position buckets): the headline "before / after".
+  const totals = kind === 'keywords' ? { totals: { latest: latest.data?.metrics ?? null, reference: reference.data?.metrics ?? null } } : {};
   // A capped set can only be compared with a capped set: rows beyond the cap are not "lost", they are simply not stored.
   const caveat = latest.data?.truncated || reference.data?.truncated
     ? 'At least one of these scans stored only part of the provider\'s data (a row cap), so new / lost counts compare the stored parts.' : null;
-  return { ...base, hasData: true, latest: describe(latest), reference: describe(reference), new: added, lost, ...movement, ...(caveat ? { caveat } : {}) };
+  return { ...base, hasData: true, latest: describe(latest), reference: describe(reference), new: added, lost, ...movement, ...totals, ...(caveat ? { caveat } : {}) };
 }
 
 /** One keyword over time (every stored scan, newest first) and its best position. */

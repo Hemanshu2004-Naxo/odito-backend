@@ -6,6 +6,10 @@ import { parseRankedKeywordsQuery } from '../../domain_overview/validator/ranked
 import { parseBacklinksListQuery } from '../../domain_overview/validator/backlinksListQuery.js';
 import { parseReferringDomainsQuery } from '../../domain_overview/validator/referringDomainsQuery.js';
 import { sendError } from '../../domain_overview/controller/domainOverviewController.js';
+import { getDatasetFreshness } from '../service/freshnessService.js';
+import { summarizeUsage } from '../service/providerLedger.js';
+import { PAGE_NAMES } from '../config.js';
+import mongoose from 'mongoose';
 import { ValidationFailure } from '../../shared/targetDomain.js';
 
 /**
@@ -225,5 +229,31 @@ export async function keywordHistoryRoute(req, res) {
     return res.status(200).json({ success: true, data: out });
   } catch (err) {
     return sendError(res, err, { projectId: String(req.project?._id || ''), route: 'seo-datasets/keywords/history' });
+  }
+}
+
+/** GET /seo-datasets/freshness?page=<page> -> each dataset on its own: state (fresh | stale | missing), last success + scan, rows, truncation, last error. */
+export async function datasetFreshness(req, res) {
+  try {
+    const page = oneOf('page', req.query.page, PAGE_NAMES, null);
+    const out = await getDatasetFreshness({ project: req.project, userId: String(req.user?._id || ''), page });
+    noStore(res);
+    return res.status(200).json({ success: true, data: out });
+  } catch (err) {
+    return sendError(res, err, { projectId: String(req.project?._id || ''), route: 'seo-datasets/freshness' });
+  }
+}
+
+/** GET /seo-usage?days=30 | ?scanId= -> provider requests actually made (never cache hits), by dataset and trigger, with the costs the provider reported. */
+export async function usageSummary(req, res) {
+  try {
+    const scanId = one(req.query.scanId);
+    if (scanId !== undefined && !mongoose.isValidObjectId(scanId)) throw new ValidationFailure('scanId', 'scanId must be a scan id');
+    const days = whole('days', req.query.days, { min: 1, max: 365 }) ?? 30;
+    const out = await summarizeUsage({ projectId: req.project._id, scanId: scanId ? new mongoose.Types.ObjectId(scanId) : null, days });
+    noStore(res);
+    return res.status(200).json({ success: true, data: out });
+  } catch (err) {
+    return sendError(res, err, { projectId: String(req.project?._id || ''), route: 'seo-usage' });
   }
 }

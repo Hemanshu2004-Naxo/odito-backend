@@ -2,6 +2,7 @@ import { KINDS, SECTION_TO_KIND } from './definitions.js';
 import { latestDatasetState } from './datasetCollector.js';
 import { conditionsToMongo, fromCanonical, toMongoSort } from './mongoQuery.js';
 import { DATASET_FRESH_MS } from '../config.js';
+import { readDerivedSection } from './derived.js';
 
 /**
  * Answers the pages' existing section requests (ranked-keywords, backlinks-list, referring-domains) from the stored row sets in
@@ -58,6 +59,8 @@ async function groupedBacklinks(model, filter, sort, key, skip, limit) {
  * @returns {Promise<null | { payload: object, capturedAt: Date, expiresAt: Date, stale: boolean, dataset: object }>}
  */
 export async function readFromDatabase({ project, section, query, extraConditions = [], now = new Date() }) {
+  // Anchors and Top Pages are rolled up from the stored backlinks.
+  if (section === 'anchors' || section === 'anchor-profile' || section === 'domain-pages') return readDerivedSection({ project, section, query, now });
   const kind = SECTION_TO_KIND[section];
   if (!kind || !query) return null;
   const def = KINDS[kind];

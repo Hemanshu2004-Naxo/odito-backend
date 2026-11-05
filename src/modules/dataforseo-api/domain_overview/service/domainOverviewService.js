@@ -1,6 +1,7 @@
 import { getOrFetch, getCachedOnly, getStored } from '../../shared/apiCache.js';
 import { recordSectionSnapshot } from '../../seo_data/service/snapshotService.js';
 import { readFromDatabase } from '../../seo_data/datasets/datasetReader.js';
+import { recordProviderRequest, returnedRecordsOf } from '../../seo_data/service/providerLedger.js';
 import { normalizeTargetDomain, ValidationFailure } from '../../shared/targetDomain.js';
 import { windowStartDay } from '../../shared/dates.js';
 import { DataForSeoApiError, hasCredentials, DATAFORSEO_ERROR } from '../../shared/providerErrors.js';
@@ -94,8 +95,10 @@ export async function getDomainOverviewSection({ project, section, refresh = fal
   // The row-level sections (keywords, backlinks, referring domains) are answered from their stored row sets in MongoDB when one exists:
   // paging, sorting, filtering and search are database queries. The NEWEST stored answer wins, so a user's own refresh (which buys a
   // cache entry) is not hidden behind an older collected set.
-  const fromDb = readOnly ? await readDatasetSafely({ project, section, query: rankedQuery ?? listQuery ?? rdQuery, now }) : null;
-  const useDb = Boolean(fromDb) && (!cached || cached.fetchedAt.getTime() <= fromDb.capturedAt.getTime());
+  const fromDb = readOnly ? await readDatasetSafely({ project, section, query: rankedQuery ?? listQuery ?? rdQuery ?? anchorsQuery ?? dpQuery, now }) : null;
+  // A rolled-up view (anchors / top pages from stored backlinks) lacks the provider-only values (rank, spam, breakdowns), so a provider-shaped
+  // answer collected in the same scan is preferred; row sets simply use the newest.
+  const useDb = Boolean(fromDb) && (!cached || cached.fetchedAt.getTime() <= fromDb.capturedAt.getTime() - (fromDb.preferCacheWithinMs ?? 0));
   const stored = useDb ? { payload: fromDb.payload, fetchedAt: fromDb.capturedAt, expiresAt: fromDb.expiresAt, cached: true, stale: fromDb.stale, refreshThrottled: false, dataset: fromDb.dataset } : cached;
   if (!peek && !readOnly && !hasCredentials()) throw new DataForSeoApiError(DATAFORSEO_ERROR.NOT_CONFIGURED);
 
@@ -114,14 +117,19 @@ export async function getDomainOverviewSection({ project, section, refresh = fal
       if (rdCountVariant) takeProviderCalls(userId, section === 'rd-rank-buckets' ? RANK_BUCKETS.length : section === 'rd-last-30' ? 2 : 1, { bucket: 'rd-counts', ...RD_COUNT_BUDGET });
       if (tpCalls) takeProviderCalls(userId, tpCalls, { bucket: 'tp-profile', ...TP_PROFILE_BUDGET });
       if (section === 'top-pages-traffic') return buildTrafficPayload({ project, userId, target });
+      // Every REAL purchase passes through here, so this is where it is accounted for (project, scan, dataset, timing, counts, reported cost).
+      const startedAt = new Date();
+      const ledger = { projectId: project._id, scanId, trigger: scanId ? 'scan' : refresh ? 'refresh' : 'read', dataset: section, endpoint: config.endpoint, target, startedAt, requestedRecords: (rankedQuery ?? listQuery ?? rdQuery ?? anchorsQuery ?? dpQuery ?? competitorsQuery)?.limit ?? null };
       try {
         const out = await fetchSection(section, { target, market, now, months, query: rankedQuery ?? competitorsQuery ?? bulkQuery ?? backlinksQuery ?? listQuery ?? anchorsQuery ?? rdQuery ?? dpQuery, excludeDomains });
         LoggerUtil.info('Domain overview: provider call completed', { section, target, cost: out.cost });
+        await recordProviderRequest({ ...ledger, success: true, durationMs: Date.now() - startedAt.getTime(), returnedRecords: returnedRecordsOf(out.payload), cost: out.cost });
         return out;
       } catch (err) {
         LoggerUtil.warn('Domain overview: provider call failed', {
           section, target, code: err.code, httpStatus: err.httpStatus ?? null, providerCode: err.providerCode ?? null,
         });
+        await recordProviderRequest({ ...ledger, success: false, durationMs: Date.now() - startedAt.getTime(), errorCode: err.code });
         throw err;
       }
     },
