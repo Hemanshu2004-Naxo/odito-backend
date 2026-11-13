@@ -7,6 +7,7 @@ import AiVisibilityQuestionSet from '../../shared/questions/models/AiVisibilityQ
 import * as runs from '../services/runService.js';
 import * as evidence from '../services/evidenceService.js';
 import { startManualRun } from '../services/startRunService.js';
+import { retryFailedQuestions } from '../services/retryFailedService.js';
 import { processClaimedRun } from '../workers/runWorker.js';
 import { runOnce as sweepOnce } from '../workers/recoveryScheduler.js';
 import { getGoogleAioConfig } from '../config/googleAioConfig.js';
@@ -213,6 +214,46 @@ describe('executing a run', () => {
     assert.equal(run.metrics.aiOverview.denominator, 4, 'the failed question is not in any denominator');
     assert.equal(events.filter((e) => e.kind === 'question_failed').length, 1);
     assert.equal(events.at(-1).kind, 'partial');
+  });
+
+  test('retry failed: only the failed question is re-sent (same run), answers are kept, metrics recomputed, history kept', async (t) => {
+    if (!up) return t.skip('MongoDB not available');
+    const { claimed, projectId } = await queued();
+    const f1 = fakeFetch({ 3: providerError(GOOGLE_AIO_ERROR.TIMEOUT, { retryable: true }) });
+    assert.equal(await processClaimedRun(claimed, workerDeps({ fetch: f1.fetch }).deps), 'partial');
+    const before = await GoogleAioEvidence.find({ runId: claimed._id }).sort({ position: 1 }).lean();
+    const failedId = before.find((d) => d.status === 'failed').questionId;
+
+    // a run stored BEFORE retryCount existed (field absent) must be retryable too
+    await GoogleAioRun.collection.updateOne({ _id: claimed._id }, { $unset: { retryCount: '' } });
+    const kicked = [];
+    const r = await retryFailedQuestions({ projectId, runId: claimed._id }, { config: cfg(), emit: () => {}, kick: (id) => kicked.push(id) });
+    assert.equal(r.scheduled, true);
+    assert.deepEqual(r.retried, [failedId]);
+    assert.deepEqual(kicked, [String(claimed._id)]);
+    // a second retry while the first is queued is refused (one active run per project)
+    assert.equal((await retryFailedQuestions({ projectId, runId: claimed._id }, { config: cfg(), emit: () => {}, kick: () => {} })).reason, 'ACTIVE_RUN_EXISTS');
+
+    const reclaimed = await claim(claimed._id);
+    const f2 = fakeFetch();
+    assert.equal(await processClaimedRun(reclaimed, workerDeps({ fetch: f2.fetch }).deps), 'completed');
+    assert.deepEqual(f2.calls.map((c) => c.questionId), [failedId], 'exactly ONE request: the failed question only');
+
+    const after = await GoogleAioEvidence.find({ runId: claimed._id }).sort({ position: 1 }).lean();
+    assert.deepEqual(after.map((d) => d.status), ['succeeded', 'succeeded', 'succeeded', 'succeeded', 'succeeded']);
+    for (const d of before.filter((x) => x.status === 'succeeded')) {
+      const same = after.find((a) => a.questionId === d.questionId);
+      assert.equal(String(same._id), String(d._id));
+      assert.equal(+new Date(same.completedAt), +new Date(d.completedAt), 'answered questions were not touched');
+    }
+    const retried = after.find((d) => d.questionId === failedId);
+    assert.equal(retried.retryHistory.length, 1);
+    assert.equal(retried.retryHistory[0].errorCode, GOOGLE_AIO_ERROR.TIMEOUT);
+    const run = await GoogleAioRun.findById(claimed._id).lean();
+    assert.deepEqual([run.status, run.retryCount, run.failureCode, run.questionStats.succeeded, run.questionStats.failed, run.metrics.partial], ['completed', 1, null, 5, 0, false]);
+    assert.equal(run.metrics.aiOverview.denominator, 5);
+    // nothing failed any more
+    assert.equal((await retryFailedQuestions({ projectId, runId: claimed._id }, { config: cfg(), emit: () => {}, kick: () => {} })).reason, 'RUN_NOT_RETRYABLE');
   });
 
   test('a fatal provider error (auth) stops the run: remaining questions are skipped with the reason and are not sent', async (t) => {

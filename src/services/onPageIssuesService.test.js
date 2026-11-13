@@ -154,4 +154,30 @@ describe('onPageIssuesService — ignores resolved issues (P3-002)', () => {
     assert.equal(hard.title, 'Missing Organization or LocalBusiness Schema');
     assert.equal(hard.difficulty, 'hard');
   });
+
+  test('getOnPageIssues collapses per-image data_paths into ONE row per issue', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+
+    await mongoose.connection.db.collection('seo_page_summary').insertMany([
+      { projectId, page_url: 'https://example.com/' },
+      { projectId, page_url: 'https://example.com/about' },
+    ]);
+    const mk = (page, n) => ({
+      projectId, issue_code: 'images_missing_alt_text', page_url: page,
+      issue_message: `Images Missing Alt Text: https://example.com/img${n}.jpg`,
+      severity: 'high', category: 'Images', data_path: `images.https://example.com/img${n}.jpg.alt`,
+      status: 'open', dedup_key: `alt-${projectId}-${page}-${n}`,
+    });
+    await mongoose.connection.db.collection('seo_page_issues').insertMany([
+      mk('https://example.com/', 1), mk('https://example.com/', 2), mk('https://example.com/', 3), mk('https://example.com/about', 4),
+    ]);
+
+    const result = await getOnPageIssues(projectId);
+    const rows = result.issues.filter((i) => i.issue_code === 'images_missing_alt_text');
+    assert.equal(rows.length, 1, 'one row, not one per image');
+    assert.equal(rows[0].pages_affected, 2);
+    assert.equal(rows[0].total_occurrences, 4);
+    assert.equal(rows[0].title, 'Images Missing Alt Text');
+    assert.equal(rows[0].impact_percentage, 100);
+  });
 });

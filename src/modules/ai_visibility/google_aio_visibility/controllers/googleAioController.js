@@ -5,6 +5,7 @@ import { SERP_DEVICES } from '../../../ranking/services/serpDevices.js';
 import * as runs from '../services/runService.js';
 import * as evidenceService from '../services/evidenceService.js';
 import { startManualRun, previewRun } from '../services/startRunService.js';
+import { retryFailedQuestions } from '../services/retryFailedService.js';
 import { QUESTIONS_PER_RUN } from '../config/googleAioConfig.js';
 
 /**
@@ -77,6 +78,7 @@ export function toSummaryDto(run) {
     totalCost: run.totalCost ?? null,
     failureCode: run.failureCode ?? null,
     cancelRequested: Boolean(run.cancelRequested),
+    retryCount: run.retryCount ?? 0,
     startedAt: run.startedAt ?? null,
     completedAt: run.completedAt ?? null,
     failedAt: run.failedAt ?? null,
@@ -261,7 +263,10 @@ export async function getSummary(req, res) {
     const [latest, active, finished] = await Promise.all([
       runs.getLatestRun({ projectId: req.project._id }), runs.getActiveRun({ projectId: req.project._id }), runs.getLatestFinishedRun({ projectId: req.project._id }),
     ]);
-    return res.json(ResponseUtil.success({ latest: toSummaryDto(latest), active: toSummaryDto(active), overview: toOverviewDto(finished) }));
+    // While the failed questions of a finished run are being retried that run is `running`, but its previous metrics are still the
+    // truthful answer: keep showing them (as a partial run) instead of falling back to an older run or an empty page.
+    const retrying = active && active.retryCount > 0 && active.metrics ? { ...active, status: 'partial' } : null;
+    return res.json(ResponseUtil.success({ latest: toSummaryDto(latest), active: toSummaryDto(active), overview: toOverviewDto(retrying || finished) }));
   } catch (error) {
     LoggerUtil.error('Google AI Overview visibility: summary failed', { projectId: String(req.project?._id) });
     return fail(res, 500, 'Could not load the visibility summary');
@@ -301,6 +306,30 @@ export async function cancelRun(req, res) {
   } catch (error) {
     LoggerUtil.error('Google AI Overview visibility: cancel failed', { projectId: String(req.project?._id) });
     return fail(res, 500, 'Could not cancel the visibility run');
+  }
+}
+
+const RETRY_REFUSALS = {
+  DISABLED: [503, 'Google AI Overview Visibility is not enabled'],
+  RUN_NOT_FOUND: [404, 'Run not found'],
+  RUN_NOT_RETRYABLE: [409, 'Only a finished run with failed questions can be retried'],
+  NO_FAILED_QUESTIONS: [409, 'This run has no failed questions to retry'],
+  RETRY_LIMIT_REACHED: [429, 'The failed questions of this run have already been retried the maximum number of times'],
+};
+
+/** Re-send ONLY the failed questions of a finished run (same run, same five questions); answered questions are never re-sent. */
+export async function retryFailed(req, res) {
+  try {
+    if (!objectIdOr404(res, req.params.runId, 'Run')) return undefined;
+    const result = await retryFailedQuestions({ projectId: req.project._id, runId: req.params.runId });
+    if (result.scheduled) return res.status(202).json(ResponseUtil.success(toSummaryDto(result.run), 'Retrying the failed questions'));
+    if (result.reason === 'ACTIVE_RUN_EXISTS') return res.status(409).json({ ...ResponseUtil.error('A visibility run is already in progress for this project', 409), data: toSummaryDto(result.run) });
+    const refusal = RETRY_REFUSALS[result.reason];
+    if (refusal) return fail(res, refusal[0], refusal[1], { code: result.reason });
+    return fail(res, 500, 'Could not retry the failed questions');
+  } catch (error) {
+    LoggerUtil.error('Google AI Overview visibility: retry failed', { projectId: String(req.project?._id), code: error?.code });
+    return fail(res, 500, 'Could not retry the failed questions');
   }
 }
 
@@ -359,4 +388,4 @@ export async function getTrend(req, res) {
   }
 }
 
-export default { startRun, getQuestionSelection, getSummary, listRunHistory, getRunDetail, cancelRun, listRunEvidence, getRunEvidence, getQuestionHistory, getTrend };
+export default { startRun, getQuestionSelection, getSummary, listRunHistory, getRunDetail, cancelRun, retryFailed, retryFailed, listRunEvidence, getRunEvidence, getQuestionHistory, getTrend };

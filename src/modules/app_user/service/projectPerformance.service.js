@@ -114,7 +114,14 @@ export class ProjectPerformanceService {
         diagnostics: deviceData.diagnostics || [],
         passed_audits: deviceData.passed_audits || [],
         metrics: deviceData.metrics || {},
-        
+
+        // Explainer data (scans from the Lighthouse-13-aware worker only;
+        // older scans return null and the UI falls back to the fields above)
+        audits: Array.isArray(deviceData.audits) ? deviceData.audits : null,
+        score_weights: deviceData.score_weights || null,
+        field_data: deviceData.field_data === undefined ? undefined : deviceData.field_data,
+        lab_environment: deviceData.lab_environment || null,
+
         // Backward compatibility - keep existing fields
         performance_score: deviceData.performance_score || 0,
         fcp: deviceData.fcp,

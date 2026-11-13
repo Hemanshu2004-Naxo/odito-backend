@@ -3,13 +3,15 @@ import mongoose from 'mongoose';
 import rateLimit from 'express-rate-limit';
 import auth from '../../../user/middleware/auth.js';
 import { validateProjectAccess } from '../../../../middleware/auth.middleware.js';
-import { postScan, getLatestScan, listScans, getScan, getSnapshots, getComparison } from '../controller/seoScanController.js';
+import { postEnsure, postRefresh, postScan, getLatestScan, listScans, getScan, getSnapshots, getComparison } from '../controller/seoScanController.js';
 import { datasetStatus, datasetChanges, keywordHistoryRoute, listKeywords, listBacklinks, listReferringDomains, listDerived, datasetFreshness, usageSummary } from '../controller/seoDatasetController.js';
 import { SCAN_START_LIMIT } from '../config.js';
 
 /**
  * Mounted at /api/projects (routes/index.js), next to the domain-overview routes:
- *   POST /api/projects/:projectId/seo-scans                         start an explicit scan (the only call here that can buy provider data)
+ *   POST /api/projects/:projectId/seo-data/ensure                   a page was opened: queue what it needs and lacks (never calls the provider itself)
+ *   POST /api/projects/:projectId/seo-data/refresh                  optional manual refresh of one page's datasets (rate limited)
+ *   POST /api/projects/:projectId/seo-scans                         start an explicit scan (queues work for a worker; the request never calls the provider)
  *   GET  /api/projects/:projectId/seo-scans[/latest|/:scanId]       scan status / audit trail (MongoDB only)
  *   GET  /api/projects/:projectId/seo-snapshots[/comparison]        stored history and week / month comparison (MongoDB only)
  *   GET  /api/projects/:projectId/seo-datasets[/keywords|backlinks|referring-domains|anchors|pages|changes|keywords/history]   stored row sets (MongoDB only)
@@ -28,8 +30,13 @@ function requireValidProjectId(req, res, next) {
   return next();
 }
 
+const ensureLimiter = rateLimit({ ...limiterOptions, windowMs: 15 * 60 * 1000, max: 300, message: { success: false, code: 'RATE_LIMITED', message: 'Too many requests. Please try again shortly.' } });
+
 const projectScoped = [auth, readLimiter, requireValidProjectId, validateProjectAccess()];
 router.post('/:projectId/seo-scans', ...projectScoped, startLimiter, postScan);
+// Automatic collection: opening a page queues what it needs (MongoDB only on the request; a worker buys). Refresh is the optional, rate-limited manual one.
+router.post('/:projectId/seo-data/ensure', ...projectScoped, ensureLimiter, postEnsure);
+router.post('/:projectId/seo-data/refresh', ...projectScoped, startLimiter, postRefresh);
 router.get('/:projectId/seo-scans/latest', ...projectScoped, getLatestScan);
 router.get('/:projectId/seo-scans', ...projectScoped, listScans);
 router.get('/:projectId/seo-scans/:scanId', ...projectScoped, getScan);

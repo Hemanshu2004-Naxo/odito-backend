@@ -2,7 +2,7 @@ import express from 'express';
 import auth from '../../../user/middleware/auth.js';
 import { validateProjectAccess } from '../../../../middleware/auth.middleware.js';
 import {
-  startRun, getQuestionSelection, getSummary, listRunHistory, getRunDetail, cancelRun, listRunEvidence, getRunEvidence, getQuestionHistory, getTrend,
+  startRun, getQuestionSelection, getSummary, listRunHistory, getRunDetail, cancelRun, retryFailed, listRunEvidence, getRunEvidence, getQuestionHistory, getTrend,
 } from '../controllers/googleAioController.js';
 
 /**
@@ -19,6 +19,7 @@ router.get('/projects/:id/summary', validateProjectAccess(), getSummary);
 router.get('/projects/:id/runs', validateProjectAccess(), listRunHistory);
 router.get('/projects/:id/runs/:runId', validateProjectAccess(), getRunDetail);
 router.post('/projects/:id/runs/:runId/cancel', validateProjectAccess(), cancelRun);
+router.post('/projects/:id/runs/:runId/retry-failed', validateProjectAccess(), retryFailed);
 router.get('/projects/:id/runs/:runId/evidence', validateProjectAccess(), listRunEvidence);
 router.get('/projects/:id/runs/:runId/evidence/:questionId', validateProjectAccess(), getRunEvidence);
 router.get('/projects/:id/questions/:questionId/history', validateProjectAccess(), getQuestionHistory);

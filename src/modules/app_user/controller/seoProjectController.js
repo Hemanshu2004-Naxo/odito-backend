@@ -14,6 +14,8 @@ import { deleteProjectCascade } from '../service/projectCascadeDeleteService.js'
 import { hasCredits, deductCredits, refundCredits } from '../../../utils/creditService.js';
 import { canConsumeQuota } from '../../subscription/service/subscriptionLifecycle.js';
 import { isIndustryValue, LOCATION_SOURCES } from '../../../config/industries.js';
+import { RankingParserService } from '../../ranking/services/RankingParserService.js';
+import { isGoogleHost } from '../../ranking/services/serpUrlResolver.js';
 
 /**
  * Validate the business-profile fields of a create/update body. Only fields PRESENT in the body are returned, so an update never
@@ -540,6 +542,22 @@ const getSeoProjectById = async (req, res) => {
 };
 
 // Update SEO project details
+/** Validates the additionalDomains list: strings only, plain hosts, deduplicated, at most 10, never the main domain, never Google. */
+function normalizeAdditionalDomains(raw, mainUrl) {
+  if (!Array.isArray(raw) || raw.length > 10) return { error: 'additionalDomains must be a list of at most 10 domains' };
+  const main = RankingParserService.normalizeDomain(mainUrl || '');
+  const out = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || entry.length > 253) return { error: 'additionalDomains must contain domain names' };
+    const host = RankingParserService.normalizeDomain(entry);
+    if (!host || !/^[a-z0-9.-]+[.][a-z]{2,}$/.test(host)) return { error: `"${entry.slice(0, 60)}" is not a valid domain` };
+    if (isGoogleHost(host)) return { error: 'Google domains cannot be added' };
+    if (host === main || out.includes(host)) continue;
+    out.push(host);
+  }
+  return { domains: out };
+}
+
 const updateSeoProject = async (req, res) => {
   try {
     const { id } = req.params;
@@ -554,7 +572,8 @@ const updateSeoProject = async (req, res) => {
       language, 
       description,
       scrape_frequency,
-      status
+      status,
+      additionalDomains
     } = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -611,6 +630,12 @@ const updateSeoProject = async (req, res) => {
     if (description !== undefined) project.description = description?.trim() || '';
     if (scrape_frequency) project.scrape_frequency = scrape_frequency;
     if (status) project.status = status;
+    if (additionalDomains !== undefined) {
+      // Verified additional websites of this business (SeoProject.additionalDomains). Replaces the list; an omitted field leaves it alone.
+      const cleaned = normalizeAdditionalDomains(additionalDomains, project.main_url);
+      if (cleaned.error) return res.status(400).json({ success: false, message: cleaned.error });
+      project.additionalDomains = cleaned.domains;
+    }
 
     await project.save();
 

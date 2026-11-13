@@ -30,6 +30,7 @@ import { keywordSuggestionService } from '../../ranking/services/keywordSuggesti
 import SeoRanking        from '../model/SeoRanking.js';
 import SeoRankingCurrent from '../model/SeoRankingCurrent.js';
 import SeoProject        from '../model/SeoProject.js';
+import { resolveSerpItem } from '../../ranking/services/serpUrlResolver.js';
 import mongoose from 'mongoose';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -180,7 +181,7 @@ function getFallbackKeywords(subType) {
  * Logs only shape/metadata — never credentials, never the full raw response.
  * Safe to remove once the investigation is closed.
  */
-function logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain, serpData }) {
+function logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain, serpData, matchOptions = {} }) {
   try {
     const task  = serpData?.tasks?.[0];
     const allItems = RankingParserService._collectAllItems(serpData);
@@ -210,17 +211,21 @@ function logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain,
     let targetMatch = { found: false, position: null, domain: null, url: null };
     organicOnly.forEach((item, idx) => {
       const url    = item.url || item.snippet_url || item.link || '';
-      const domain = url ? RankingParserService.normalizeDomain(url) : RankingParserService.normalizeDomain(item.domain || '');
+      // The SAME resolver the ranking uses (domain / redirect parameter / breadcrumb host) - not the raw "google.com" of a goto link.
+      const resolved = resolveSerpItem(item);
+      const domain = resolved.hostname ?? '';
       const position = item.rank_group ?? item.rank_absolute ?? null;
 
       if (idx < 20) {
         console.log(
           `[DATAFORSEO_ORGANIC_ITEM] position=${position} | rank_group=${item.rank_group ?? 'null'} | ` +
-          `rank_absolute=${item.rank_absolute ?? 'null'} | domain="${domain}" | url="${url}" | title="${(item.title || '').slice(0, 80)}"`
+          `rank_absolute=${item.rank_absolute ?? 'null'} | domain="${item.domain ?? ''}" | url="${url}" | title="${(item.title || '').slice(0, 80)}" | ` +
+          `breadcrumb="${(item.breadcrumb || '').slice(0, 100)}" | website_name="${(item.website_name || '').slice(0, 60)}" | ` +
+          `resolvedHost="${domain}" | hostSource=${resolved.resolutionStatus === 'resolved' ? resolved.resolutionMethod : 'unresolved'}`
         );
       }
 
-      if (!targetMatch.found && RankingParserService.domainMatches(domain, cleanDomain)) {
+      if (!targetMatch.found && domain && RankingParserService.domainMatches(domain, cleanDomain)) {
         targetMatch = { found: true, position, domain, url };
       }
     });
@@ -238,8 +243,13 @@ function logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain,
  * Run SERP + optional Maps API in parallel for a single keyword.
  * Returns a result object matching the shape the frontend expects.
  */
-async function processKeyword(keyword, cleanDomain, locationCode, languageCode, seoScope, businessName, mapsIdentity = null) {
+async function processKeyword(keyword, cleanDomain, locationCode, languageCode, seoScope, businessName, mapsIdentity = null, matchContext = {}) {
   const shouldFetchMaps = seoScope === 'local' && !!businessName?.trim();
+  // How organic results are matched to this project: its brand (low-confidence fallback for masked results) and verified additional domains.
+  const matchOptions = {
+    brandName: matchContext.brandName ?? businessName ?? null,
+    alternateDomains: (matchContext.additionalDomains ?? []).map((d) => RankingParserService.normalizeDomain(d)).filter(Boolean),
+  };
 
   // Distinguishes "the organic SERP request/parse itself failed" from "the
   // request succeeded and genuinely found no match" — buildKeywordUpdate
@@ -251,24 +261,24 @@ async function processKeyword(keyword, cleanDomain, locationCode, languageCode, 
   // (deviceSerpScan.js): each device carries its own success/failure, so a
   // mobile failure can never mark the desktop scan as failed (or vice versa).
   const [{ desktop: desktopScan, mobile: mobileScan }, mapsResult] = await Promise.all([
-    scanKeywordDevices({ keyword, locationCode, languageCode }),
+    scanKeywordDevices({ keyword, locationCode, languageCode, cleanDomain, matchOptions }),
     shouldFetchMaps
       ? MapsRankingService.fetchMapsRank(keyword, businessName.trim(), locationCode, languageCode, cleanDomain, mapsIdentity)
       : Promise.resolve({ maps_rank: null, maps_listing: null }),
   ]);
 
   const serpData  = desktopScan.serpData;
-  const mobile    = buildDeviceResult(mobileScan, cleanDomain);
+  const mobile    = buildDeviceResult(mobileScan, cleanDomain, matchOptions);
 
-  if (serpData) logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain, serpData });
+  if (serpData) logSerpOrganicDebug({ keyword, locationCode, languageCode, cleanDomain, serpData, matchOptions });
   // Same per-device rules as mobile (deviceSerpScan.buildDeviceResult), including partial (40106) results: a rank found
   // in the returned pages is kept, "not found" in a partial response is a scan_error (previous rank preserved).
-  const desktop         = buildDeviceResult(desktopScan, cleanDomain);
+  const desktop         = buildDeviceResult(desktopScan, cleanDomain, matchOptions);
   const serpError       = desktop.scan_error;
   const rankingUrls     = desktop.ranking_urls;
   const bestRank        = desktop.best_rank;
   // Local pack items in the returned pages are real observations even when the organic verdict is unknown.
-  const organicMapsRank = serpData ? RankingParserService.parseOrganic(serpData, cleanDomain).maps_rank : null;
+  const organicMapsRank = serpData ? RankingParserService.parseOrganic(serpData, cleanDomain, matchOptions).maps_rank : null;
 
   // Maps merge logic — matches Python exactly:
   //   national:          always null
@@ -318,6 +328,11 @@ async function processKeyword(keyword, cleanDomain, locationCode, languageCode, 
     // set to the failure message when the request/parse failed outright —
     // see buildKeywordUpdate (rankingHistoryService.js) for how this is used.
     scan_error:   serpError,
+    // ranked | not_ranked | not_ranked_partial | not_ranked_uncertain | scan_error - what the desktop check established, and how many results had
+    // no readable website. scan_error is only for a check that returned nothing usable.
+    rank_state:       desktop.rank_state,
+    unreadable_count: desktop.unreadable_count ?? 0,
+    ...(desktop.match_confidence === 'low' ? { match_confidence: 'low', match_basis: desktop.match_basis } : {}),
     // Desktop result time (provider response received) — used by the persistence
     // layer to refuse an older result overwriting a newer one.
     scanned_at:   desktopScan.scanned_at,
@@ -613,7 +628,7 @@ export const checkRanking = async (req, res) => {
     // Process all keywords in parallel (SERP + Maps per keyword run concurrently)
     const results = await Promise.all(
       kwSlice.map(kw =>
-        processKeyword(kw, cleanDomain, locationCode, langCode, seoScope, businessName)
+        processKeyword(kw, cleanDomain, locationCode, langCode, seoScope, businessName, null, { brandName: businessName })
           .then(r => {
             console.log(
               `[MAPS_SAVE]` +
@@ -944,6 +959,19 @@ export const getProjectRankings = async (req, res) => {
  * (Google place_id, address, coordinates, website). Fields the project does not have stay null — nothing is invented.
  * @returns {Promise<{ name: string|null, identity: object|null }>}
  */
+/**
+ * How a project's organic results are matched beyond its main domain: the brand (project name, or the business name when known) for the
+ * low-confidence fallback on masked results, and its verified additionalDomains. Best effort: a lookup failure only means "no extras".
+ */
+async function loadMatchContext(projectId, businessName = null) {
+  try {
+    const p = await SeoProject.findById(projectId).select('project_name additionalDomains').lean();
+    return { brandName: businessName || p?.project_name || null, additionalDomains: Array.isArray(p?.additionalDomains) ? p.additionalDomains : [] };
+  } catch {
+    return { brandName: businessName || null, additionalDomains: [] };
+  }
+}
+
 async function resolveMapsBusinessIdentity(projectId, userId, seoScope, logLabel) {
   if (seoScope !== 'local') return { name: null, identity: null };
   try {
@@ -1050,7 +1078,8 @@ export const rescanKeyword = async (req, res) => {
       langCode,
       seoScope,
       rescanBusinessName,
-      rescanIdentity
+      rescanIdentity,
+      await loadMatchContext(projectId, rescanBusinessName)
     );
 
     const updated = await mergeSingleKeywordRescan({
@@ -1121,7 +1150,10 @@ export const rescanKeyword = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: 'Keyword rescanned successfully',
+      // The REQUEST succeeded either way; whether the ranking was verified is in data.keyword.status / last_scan_status.
+      message: updatedKw?.status === 'scan_error'
+        ? 'Keyword rescan finished, but the ranking could not be verified; the previous ranking is kept'
+        : 'Keyword rescanned successfully',
       data:    { keyword: updatedKw }
     });
 
@@ -1279,7 +1311,8 @@ export const addKeywordController = async (req, res) => {
       langCode,
       seoScope,
       addBusinessName,
-      addIdentity
+      addIdentity,
+      await loadMatchContext(projectId, addBusinessName)
     );
 
     let updated;

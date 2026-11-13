@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 
-const AEO_SIGNAL_RULES = ['AEO-046', 'AEO-047', 'AEO-048', 'AEO-049', 'AEO-055'];
+const AEO_SIGNAL_RULES = ['AEO-047', 'AEO-048', 'AEO-049', 'AEO-055'];
 
 
 function buildCard(raw = {}) {

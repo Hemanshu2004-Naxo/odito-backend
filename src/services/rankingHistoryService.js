@@ -43,6 +43,14 @@ function sanitizeScanErrorForStorage(rawError) {
   if (/timed?\s*out|timeout|ETIMEDOUT|ECONNABORTED/i.test(msg)) {
     return 'Ranking check timed out. Please try again.';
   }
+  // Not provider failures: the check ran but could not VERIFY the ranking. Said apart from "could not be reached" so the page does not call
+  // an unreadable redirect link or a short result list a connectivity problem.
+  if (/redirect links|no readable destination/i.test(msg)) {
+    return 'Some search results were Google redirect links whose website could not be read, so the ranking could not be verified; the previous ranking is kept.';
+  }
+  if (/requested organic results|could not be verified/i.test(msg)) {
+    return 'The search returned fewer results than requested and your previous position lies beyond them, so the ranking could not be verified; the previous ranking is kept.';
+  }
   if (/partial results|\b40106\b/i.test(msg)) {
     return 'Ranking check returned incomplete results from the search data provider; the previous ranking is kept. Please try again shortly.';
   }
@@ -120,7 +128,14 @@ function cleanRankingUrls(rawUrls) {
     .map(u => ({
       rank: parseInt(u.rank, 10),
       url:  u.url.trim(),
-      type: u.type === 'homepage' ? 'homepage' : 'internal_page'
+      type: u.type === 'homepage' ? 'homepage' : 'internal_page',
+      ...(typeof u.original_url === 'string' && u.original_url.trim() && u.original_url.trim() !== u.url.trim() ? { original_url: u.original_url.trim().slice(0, 2000) } : {}),
+      ...(Number.isInteger(u.rank_absolute) && u.rank_absolute > 0 ? { rank_absolute: u.rank_absolute } : {}),
+      ...(typeof u.host === 'string' && u.host.trim() ? { host: u.host.trim().toLowerCase().slice(0, 253) } : {}),
+      ...(u.url_masked === true ? { url_masked: true } : {}),
+      ...(u.match_confidence === 'low' ? { match_confidence: 'low' } : {}),
+      ...(u.match_basis === 'breadcrumb' || u.match_basis === 'brand_name' ? { match_basis: u.match_basis } : {}),
+      ...(typeof u.matched_domain === 'string' && u.matched_domain.trim() ? { matched_domain: u.matched_domain.trim().toLowerCase().slice(0, 253) } : {}),
     }))
     .filter(u => Number.isFinite(u.rank) && u.rank >= 1 && u.rank <= 100);
   if (rawUrls.length > 0 && cleaned.length === 0) {
@@ -200,7 +215,7 @@ export async function appendHistory({
  * never creates a history row (mobile history starts at the first success).
  */
 async function appendMobileHistoryIfObserved({ projectId, userId, domain, keyword, incomingMobile, mobileDoc, scanSource }) {
-  if (!incomingMobile || incomingMobile.scan_error || !mobileDoc) return;
+  if (!incomingMobile || incomingMobile.scan_error || !mobileDoc || mobileDoc.last_scan_status === 'error') return;
   await appendHistory({
     projectId, userId, domain, keyword,
     currentRank: mobileDoc.current_rank,
@@ -209,6 +224,31 @@ async function appendMobileHistoryIfObserved({ projectId, userId, domain, keywor
     scanSource,
     device:      'mobile'
   });
+}
+
+/**
+ * A desktop history point is an OBSERVATION. A failed or unknown organic check (scan_error: provider failure, partial results without the
+ * site, unresolved Google redirects) observed nothing: the stored rank was merely preserved, so writing it - or, for a keyword with no earlier
+ * rank, a null - as a point stamped "now" would show an old ranking as a new verified one, or invent a lost ranking.
+ */
+const organicObserved = (incoming, built = null) => !incoming?.scan_error && built?.last_scan_status !== 'error';
+
+/**
+ * A complete task that returned FEWER organic positions than requested ("short" coverage) cannot show that a site left the results when its
+ * previous rank lies BEYOND what was returned: the response simply does not reach that far. "Not found" would then be a statement about
+ * positions nobody saw, so the check becomes an unverified scan error and the previous rank is preserved. (A previous rank inside the returned
+ * range that is now absent is a real, observable change and stays a not_found.) Nothing here can create a rank.
+ */
+export function guardShortCoverage(existingRank, incoming) {
+  if (!incoming || incoming.scan_error) return incoming;
+  const serp = incoming.serp;
+  if ((incoming.ranking_urls?.length ?? 0) > 0) return incoming;
+  if (!serp || serp.result_completeness !== 'short') return incoming;
+  if (!Number.isInteger(existingRank) || !Number.isInteger(serp.deepest_organic_rank) || existingRank <= serp.deepest_organic_rank) return incoming;
+  return {
+    ...incoming,
+    scan_error: `The provider returned only ${serp.returned_results ?? '?'} of ${serp.requested_depth ?? '?'} requested organic results (down to position ${serp.deepest_organic_rank}), and the previous position (#${existingRank}) is beyond them; the ranking could not be verified`,
+  };
 }
 
 // ─── History derivation ──────────────────────────────────────────────────────
@@ -434,8 +474,9 @@ async function buildDesktopKeywordUpdate({ existingKw, projectId, incomingResult
 
 // ─── Per-channel scan state (desktop / mobile / Maps) ────────────────────────
 
-const COMPLETED_STATUSES = new Set(['success', 'partial_success', 'not_found']);
+const COMPLETED_STATUSES = new Set(['success', 'partial_success', 'not_found', 'not_found_uncertain', 'not_found_partial']);
 const SERP_OUTCOMES = new Set(['complete', 'no_results', 'partial', 'partial_without_results']);
+const COVERAGE_VALUES = new Set(['full', 'short', 'partial', 'no_results', 'none']);
 
 /**
  * Provider outcome of an organic scan, kept separate from the rank: what depth was asked for and how many organic
@@ -449,6 +490,11 @@ function sanitizeSerpMeta(serp) {
     provider_code:    int(serp.provider_code, 99999),
     requested_depth:  int(serp.requested_depth, 700),
     returned_results: int(serp.returned_results, 700),
+    ...(Number.isInteger(serp.deepest_organic_rank) ? { deepest_organic_rank: int(serp.deepest_organic_rank, 700) } : {}),
+    ...(typeof serp.coverage_complete === 'boolean' ? { coverage_complete: serp.coverage_complete } : {}),
+    ...(COVERAGE_VALUES.has(serp.result_completeness) ? { result_completeness: serp.result_completeness } : {}),
+    ...(Number.isInteger(serp.pages_count) ? { pages_count: int(serp.pages_count, 700) } : {}),
+    ...(Number.isInteger(serp.unresolved_candidates) && serp.unresolved_candidates > 0 ? { unresolved_candidates: Math.min(serp.unresolved_candidates, 700) } : {}),
   };
 }
 const MAPS_STATUSES = new Set(['success', 'not_found', 'scan_error']);
@@ -457,8 +503,11 @@ const MAPS_STATUSES = new Set(['success', 'not_found', 'scan_error']);
  * Channel status for one organic scan. A rank observed in partial (40106) results is 'partial_success'; a partial
  * response without the site never reaches here as a success (deviceSerpScan turns it into a scan_error).
  */
-function organicScanStatus(scanError, observedRank, serp) {
+function organicScanStatus(scanError, observedRank, serp, rankState = null) {
   if (scanError) return 'scan_error';
+  // Checks that ran and read the SERP but could not fully vouch for a "not found": stored as their own status so the page can say so.
+  if (observedRank === null && rankState === 'not_ranked_partial') return 'not_found_partial';
+  if (observedRank === null && rankState === 'not_ranked_uncertain') return 'not_found_uncertain';
   if (observedRank == null) return 'not_found';
   return serp?.outcome === 'partial' ? 'partial_success' : 'success';
 }
@@ -638,7 +687,7 @@ async function buildMobileUpdate({ existingMobile, incomingMobile, projectId, ke
     last_scan_error:    null,
     scan: nextChannelScan({
       existingScan: existingMobile?.scan, existingRank: existingMobile?.current_rank ?? null,
-      status: organicScanStatus(null, current, incomingMobile.serp), attempts: incomingMobile.attempts, observedRank: current,
+      status: organicScanStatus(null, current, incomingMobile.serp, incomingMobile.rank_state), attempts: incomingMobile.attempts, observedRank: current,
       at: scannedAt, serp: incomingMobile.serp
     })
   };
@@ -649,7 +698,10 @@ async function buildMobileUpdate({ existingMobile, incomingMobile, projectId, ke
  * Desktop and mobile are merged independently, so neither device's result can
  * alter the other's.
  */
-async function buildKeywordUpdate(args) {
+async function buildKeywordUpdate(rawArgs) {
+  const guardedDesktop = guardShortCoverage(rawArgs.existingKw?.current_rank, rawArgs.incomingResult);
+  const guardedMobile = guardShortCoverage(rawArgs.existingKw?.mobile?.current_rank, rawArgs.incomingResult.mobile);
+  const args = { ...rawArgs, incomingResult: { ...guardedDesktop, ...(rawArgs.incomingResult.mobile !== undefined ? { mobile: guardedMobile } : {}) } };
   const desktop = await buildDesktopKeywordUpdate(args);
   const mobile  = await buildMobileUpdate({
     existingMobile: args.existingKw?.mobile,
@@ -664,7 +716,7 @@ async function buildKeywordUpdate(args) {
   desktop.desktop_scan = nextChannelScan({
     existingScan: existingKw?.desktop_scan,
     existingRank: existingKw?.current_rank ?? null,
-    status:       organicScanStatus(incomingResult.scan_error, desktop.current_rank, incomingResult.serp),
+    status:       organicScanStatus(incomingResult.scan_error, desktop.current_rank, incomingResult.serp, incomingResult.rank_state),
     error:        incomingResult.scan_error,
     attempts:     incomingResult.attempts,
     observedRank: desktop.current_rank,
@@ -719,7 +771,7 @@ export async function saveCanonicalRanking({
 
   // Append history for all keywords (errors swallowed per-entry, non-blocking)
   await Promise.all(
-    mergedKeywords.map(kw =>
+    mergedKeywords.map((kw, i) => (!organicObserved(keywords[i], kw) ? null :
       appendHistory({
         projectId,
         userId,
@@ -730,7 +782,7 @@ export async function saveCanonicalRanking({
         rankingUrls:  kw.ranking_urls,
         scanSource
       })
-    )
+    ))
   );
 
   await Promise.all(
@@ -911,8 +963,8 @@ export async function mergeSingleKeywordRescan({
 
   const result = await SeoRankingCurrent.findOne({ project_id: projectId });
 
-  // Append to history (non-blocking)
-  await appendHistory({
+  // Append to history (non-blocking) - only for an organic check that actually observed something
+  if (organicObserved(keywordResult, updatedKw)) await appendHistory({
     projectId,
     userId,
     domain,
@@ -1110,8 +1162,8 @@ export async function addKeyword({ projectId, userId, domain, keywordResult, pla
     throw error;
   }
 
-  // Same non-blocking history append every other write path already uses.
-  await appendHistory({
+  // Same non-blocking history append every other write path already uses (not for a failed / unknown first check: nothing was observed).
+  if (organicObserved(keywordResult)) await appendHistory({
     projectId,
     userId,
     domain,

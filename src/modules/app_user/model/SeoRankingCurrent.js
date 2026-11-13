@@ -12,7 +12,14 @@ import mongoose from 'mongoose';
 const rankingUrlSchema = new mongoose.Schema({
   rank: { type: Number, required: true, min: 1, max: 100 },
   url:  { type: String, required: true, trim: true },
-  type: { type: String, enum: ['homepage', 'internal_page'], default: 'internal_page' }
+  type: { type: String, enum: ['homepage', 'internal_page'], default: 'internal_page' },
+  original_url: { type: String, trim: true },  // SERP URL as returned when it was a redirect (e.g. google.com/goto); url is the resolved destination
+  rank_absolute: { type: Number, min: 1 },
+  host: { type: String, trim: true },                       // the resolved site of a masked (google.com/goto) result; url stays the goto link
+  url_masked: { type: Boolean },
+  match_confidence: { type: String, enum: ['low'] },        // low = matched by brand name only (never a verified domain)
+  match_basis: { type: String, enum: ['breadcrumb', 'brand_name'] },
+  matched_domain: { type: String, trim: true },             // the project's additional domain that matched, when not the tracked one
 });
 
 /**
@@ -35,11 +42,18 @@ const rankingUrlSchema = new mongoose.Schema({
  *   requested_depth          organic depth asked for; returned_results is the organic item count actually returned
  */
 const channelScanFields = {
-  status:                   { type: String, enum: ['success', 'partial_success', 'not_found', 'scan_error', 'pending'] },
+  status:                   { type: String, enum: ['success', 'partial_success', 'not_found', 'not_found_uncertain', 'not_found_partial', 'scan_error', 'pending'] },
   serp_outcome:             { type: String, enum: ['complete', 'no_results', 'partial', 'partial_without_results'] },
   provider_code:            { type: Number },
   requested_depth:          { type: Number, min: 1 },
   returned_results:         { type: Number, min: 0 },
+  // Coverage of the requested depth, from the response itself: deepest organic rank_group returned, whether that establishes the depth
+  // (coverage_complete), and full | short | partial | no_results | none. `short` = a complete task that returned fewer positions than requested.
+  deepest_organic_rank:     { type: Number, min: 0 },
+  coverage_complete:        { type: Boolean },
+  result_completeness:      { type: String, enum: ['full', 'short', 'partial', 'no_results', 'none'] },
+  pages_count:              { type: Number, min: 0 },
+  unresolved_candidates:    { type: Number, min: 0 },  // organic Google-redirect results with no readable destination (scan is then unknown)
   last_attempt_at:          { type: Date, default: null },
   last_successful_scan_at:  { type: Date, default: null },
   error:                    { type: String, default: null },
@@ -78,7 +92,7 @@ const mobileRankSchema = new mongoose.Schema({
   prev_week_rank:  { type: Number, default: null, min: 1, max: 100 },
   prev_month_rank: { type: Number, default: null, min: 1, max: 100 },
   history_derived_at: { type: Date, default: null },
-  ranking_urls:    [{ rank: { type: Number, required: true, min: 1, max: 100 }, url: { type: String, required: true, trim: true }, type: { type: String, enum: ['homepage', 'internal_page'], default: 'internal_page' }, _id: false }],
+  ranking_urls:    [{ rank: { type: Number, required: true, min: 1, max: 100 }, url: { type: String, required: true, trim: true }, type: { type: String, enum: ['homepage', 'internal_page'], default: 'internal_page' }, original_url: { type: String, trim: true }, rank_absolute: { type: Number, min: 1 }, host: { type: String, trim: true }, url_masked: { type: Boolean }, match_confidence: { type: String, enum: ['low'] }, match_basis: { type: String, enum: ['breadcrumb', 'brand_name'] }, matched_domain: { type: String, trim: true }, _id: false }],
   tracked_depth:   { type: Number, default: null, min: 1, max: 100 },
   scan_count:      { type: Number, default: 0, min: 0 },
   last_scanned_at: { type: Date },

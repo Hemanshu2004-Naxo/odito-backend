@@ -421,3 +421,19 @@ describe('tracked location follows the saved business location (real MongoDB)', 
     assert.equal((await doc(mine)).location_code, 1007770);
   });
 });
+
+describe('device ranking status fields (verified vs attempted, partial)', () => {
+  test('lastVerifiedAt comes from the last successful scan, not the last attempt; partial is flagged only for a rank that was found', async () => {
+    const { buildDeviceRanking } = await import('../service/trackedKeywordDetailsService.js');
+    const verified = new Date('2026-11-01T09:00:00Z');
+    const failed = buildDeviceRanking({ status: 'scan_error', doc: { current_rank: 12, last_rescanned_at: new Date('2026-11-05T10:00:00Z') }, scan: { status: 'scan_error', serp_outcome: 'partial', last_successful_scan_at: verified, returned_results: 9, requested_depth: 100 } });
+    assert.equal(failed.position, 12);
+    assert.equal(failed.lastScannedAt, '2026-11-05T10:00:00.000Z');
+    assert.equal(failed.lastVerifiedAt, verified.toISOString());
+    assert.equal(failed.partial, false, 'a failed check is a scan error, not a partial success');
+    const partial = buildDeviceRanking({ status: 'ranked', doc: { current_rank: 6 }, scan: { status: 'partial_success', serp_outcome: 'partial', last_successful_scan_at: verified, returned_results: 80, requested_depth: 100 } });
+    assert.deepEqual([partial.partial, partial.returnedResults, partial.requestedDepth], [true, 80, 100]);
+    const legacy = buildDeviceRanking({ status: 'ranked', doc: { current_rank: 3 } });
+    assert.deepEqual([legacy.lastVerifiedAt, legacy.partial, legacy.returnedResults], [null, false, null]);
+  });
+});

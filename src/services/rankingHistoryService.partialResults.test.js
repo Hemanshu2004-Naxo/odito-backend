@@ -39,7 +39,7 @@ function failedDevice(name, error, scannedAt, attempts = 3) {
 /** Keyword result in the processKeyword shape (desktop fields at top level, mobile nested). */
 function keywordResult(keyword, d, m) {
   return {
-    keyword, ranking_urls: d.ranking_urls, maps_rank: null, maps_listing: null, scan_error: d.scan_error,
+    keyword, ranking_urls: d.ranking_urls, maps_rank: null, maps_listing: null, scan_error: d.scan_error, rank_state: d.rank_state,
     attempts: d.attempts, scanned_at: d.scanned_at, ...(d.serp ? { serp: d.serp } : {}), mobile: m,
   };
 }
@@ -117,7 +117,7 @@ describe('rankingHistoryService — partial results persistence', () => {
     assert.equal(kw.mobile.scan.serp_outcome, 'complete');
   });
 
-  test('11. no usable data (40106 without results, and 40106 without the site): the previous rank is preserved', async (t) => {
+  test('11. 40106 without the site updates desktop to not_found_partial (previous rank kept as previous_successful_rank); 40106 with NO organic items is a scan error that preserves mobile', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await seed(keywordResult('kw',
       device('desktop', serpResponse({ items: organicItems(100, { 8: SITE }) }), meta('complete', 20000, 100), at(-120_000)),
@@ -131,12 +131,11 @@ describe('rankingHistoryService — partial results persistence', () => {
         serpMeta: meta('partial_without_results', 40106, 0) }, SITE)));
 
     const kw = await getKw('kw');
-    assert.equal(kw.current_rank, 8, 'desktop rank not replaced by an unknown');
-    assert.equal(kw.best_rank, 8);
-    assert.equal(kw.last_scan_status, 'error');
-    assert.match(kw.last_scan_error, /incomplete results/);
-    assert.equal(kw.desktop_scan.status, 'scan_error');
-    assert.equal(kw.desktop_scan.current_rank, 8);
+    assert.equal(kw.current_rank ?? null, null, 'desktop: updated - no confirmed position in the partial pages');
+    assert.equal(kw.best_rank, 8, 'the best rank ever seen is never lost');
+    assert.equal(kw.last_scan_status, 'ok', 'the check ran and read the SERP; not a provider failure');
+    assert.equal(kw.desktop_scan.status, 'not_found_partial');
+    assert.equal(kw.desktop_scan.previous_successful_rank, 8);
     assert.equal(kw.desktop_scan.returned_results, 20);
     assert.equal(kw.mobile.current_rank, 11);
     assert.equal(kw.mobile.scan.status, 'scan_error');

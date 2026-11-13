@@ -136,6 +136,8 @@ export async function getAccessibilityIssues(projectId) {
       total_occurrences: issue.total_occurrences,
       impact_percentage,
       difficulty,
+      // Every page the issue is on (named `page_urls`, not `affected_urls`, so the issue detail view still fetches per-page detail).
+      page_urls: issue.affected_urls || [],
     };
 
     return enrichedIssue;

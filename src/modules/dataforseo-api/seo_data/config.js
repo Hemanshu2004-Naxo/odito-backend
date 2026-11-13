@@ -96,16 +96,49 @@ export const COLLECT_BATCH = 1000;
 /** How long a stored dataset counts as fresh (a scan without `force` does not collect a fresh one again). Independent of retention: nothing is deleted when it passes. */
 export const DATASET_FRESH_MS = Object.freeze({ keywords: 24 * 3_600_000, backlinks: 24 * 3_600_000, referringDomains: 24 * 3_600_000 });
 
-/** The datasets each page shows (for the per-dataset freshness a page displays). */
+/**
+ * The datasets each page NEEDS (checked against the requests the page hooks make; the smallest set that lets the page work, including its
+ * paging / sorting / filtering, which are MongoDB queries once a row set is stored). This is what opening the page keeps fresh automatically
+ * and what its "data freshness" list shows. Opening a page never collects anything outside its own list.
+ *  - Organic Keywords: the stored keyword set answers the table, the totals and every sort / filter, so the two small first-page requests are not bought.
+ *  - Backlinks / Anchors / Referring Domains / Top Pages: the stored link sets answer paging, search and filters; the small provider summaries are the cards.
+ *  - Anchors and Top Pages are rolled up from the stored live (and, for anchors, lost) backlinks; Top Pages' default tabs are provider-shaped (status codes).
+ *  - Competitors also shows the domain's own rank overview (the "you" row).
+ */
 export const PAGE_DATASETS = Object.freeze({
   'domain-overview': Object.freeze([...OVERVIEW]),
   'traffic': Object.freeze(['history']),
-  'organic-keywords': Object.freeze(['ranked-keywords-top5', 'ranked-keywords-page', 'keywords-dataset']),
-  'competitors': Object.freeze(['competitors']),
-  'offpage-overview': Object.freeze(['backlinks']),
-  'backlinks': Object.freeze(['backlinks-list', 'backlinks-dataset-live', 'backlinks-dataset-lost']),
-  'anchors': Object.freeze(['anchors', 'anchor-profile', 'backlinks-dataset-live']),
-  'referring-domains': Object.freeze(['referring-domains', 'rd-rank-buckets', 'rd-toxic-count', 'referring-domains-dataset-live', 'referring-domains-dataset-lost']),
-  'top-pages': Object.freeze(['domain-pages-all', 'domain-pages-ok', 'tp-counts', 'tp-fix-first', 'top-pages-traffic', 'backlinks-dataset-live']),
+  'organic-keywords': Object.freeze(['keywords-dataset']),
+  'competitors': Object.freeze(['competitors', 'rank-overview']),
+  'offpage-overview': Object.freeze(['backlinks', 'rd-last-30']),
+  'backlinks': Object.freeze(['backlinks', 'backlinks-dataset-live', 'backlinks-dataset-lost']),
+  'anchors': Object.freeze(['backlinks', 'backlinks-dataset-live', 'backlinks-dataset-lost']),
+  'referring-domains': Object.freeze(['backlinks', 'rd-rank-buckets', 'rd-toxic-count', 'referring-domains-dataset-live', 'referring-domains-dataset-lost']),
+  'top-pages': Object.freeze(['backlinks', 'domain-pages-all', 'domain-pages-ok', 'tp-counts', 'tp-fix-first', 'top-pages-traffic', 'backlinks-dataset-live']),
 });
 export const PAGE_NAMES = Object.freeze(Object.keys(PAGE_DATASETS));
+
+/**
+ * AUTOMATIC collection (service/autoCollectService.js). Opening a page asks "is anything this page needs missing or stale?"; if so ONE
+ * coordinated scan of exactly those datasets is queued (never more than one active scan per project) and the page keeps showing what is stored.
+ *  - Freshness per dataset is NOT one TTL: a section is fresh for its own `ttlMs` in domain_overview/config.js (24 h for most, 7 days for history
+ *    and the profile-level counts); a stored row set is fresh for DATASET_FRESH_MS.
+ *  - Cooldowns stop a stale dataset from creating a scan on every request: after a failed attempt the dataset waits an exponentially growing
+ *    time (capped); after an attempt that completed but left it stale it waits a fixed time.
+ */
+const msFromEnv = (name, fallbackMs, minMs, maxMs) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.min(maxMs, Math.max(minMs, n)) : fallbackMs;
+};
+export const AUTO = Object.freeze({
+  /** SEO_AUTO_COLLECT=false switches the automatic part off (pages still read MongoDB; nothing is enqueued). */
+  enabled: process.env.SEO_AUTO_COLLECT !== 'false',
+  failureBackoffBaseMs: msFromEnv('SEO_AUTO_BACKOFF_BASE_MS', 10 * 60_000, 1000, 24 * 3_600_000),
+  failureBackoffMaxMs: msFromEnv('SEO_AUTO_BACKOFF_MAX_MS', 24 * 3_600_000, 60_000, 7 * 24 * 3_600_000),
+  /** A failure that retrying will not fix (credentials, credits, rejected request) waits at least this long. */
+  permanentFailureMinMs: msFromEnv('SEO_AUTO_PERMANENT_MIN_MS', 6 * 3_600_000, 60_000, 7 * 24 * 3_600_000),
+  /** An attempt completed but the dataset is still stale / missing (the provider floor, an empty answer): do not try again for this long. */
+  incompleteRetryMs: msFromEnv('SEO_AUTO_INCOMPLETE_RETRY_MS', 30 * 60_000, 1000, 24 * 3_600_000),
+  /** The optional manual "refresh now": at most one per project in this window (it buys fresh data even when stored data is fresh). */
+  manualRefreshCooldownMs: msFromEnv('SEO_MANUAL_REFRESH_COOLDOWN_MS', 60 * 60_000, 1000, 24 * 3_600_000),
+});

@@ -451,7 +451,8 @@ describe('Phase 2: permanent datasets, database paging, history (real routers + 
   test('per-dataset freshness: a scan of one dataset does not make the others fresh, and a stale one stays available', async (t) => {
     if (!mongoAvailable) return t.skip('MongoDB not available');
     const mark = calls.length;
-    const f = (await ds('/freshness', '?page=backlinks')).json.data.datasets;
+    // every dataset (the Backlinks page itself lists only what it needs: the stored sets, not the first-page request they answer)
+    const f = (await ds('/freshness')).json.data.datasets;
     const by = Object.fromEntries(f.map((d) => [d.id, d]));
     assert.equal(by['backlinks-dataset-live'].state, 'fresh');
     assert.deepEqual([by['backlinks-dataset-live'].rows, by['backlinks-dataset-live'].truncated], [1500, false]);

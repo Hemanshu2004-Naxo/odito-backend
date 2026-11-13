@@ -22,6 +22,10 @@ const seoProjectSchema = new mongoose.Schema({
     match: [/^[a-zA-Z0-9\s\-_]+$/, 'Project name can only contain letters, numbers, spaces, hyphens, and underscores']
   },
   
+  // Websites that are VERIFIED to belong to this business (e.g. the parent brand's site). A SERP result on one of them counts as this
+  // project's ranking, and the ranking records which domain matched. Never filled automatically: a redirect, a shared name or a Maps listing
+  // is not proof. Matched as strictly as main_url (hostname or sub-domain, no look-alikes).
+  additionalDomains: { type: [String], default: [] },
   main_url: {
     type: String,
     required: [true, 'Main URL is required'],

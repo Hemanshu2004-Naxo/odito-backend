@@ -38,7 +38,7 @@ async function describeOne(id, { project, userId, now }) {
 }
 
 /** The newest failure of a dataset among recent scans that is later than its last success. */
-function lastErrorOf(id, runs, lastSuccessfulAt) {
+export function lastErrorOf(id, runs, lastSuccessfulAt) {
   for (const run of runs) {
     const d = run.datasets?.find((x) => x.id === id);
     if (!d || d.status !== 'failed' || !d.errorCode) continue;
@@ -50,14 +50,14 @@ function lastErrorOf(id, runs, lastSuccessfulAt) {
 }
 
 /**
- * @param {{ project: object, userId?: string|null, page?: string|null, now?: Date }} input `page` narrows to the datasets that page shows
+ * @param {{ project: object, userId?: string|null, page?: string|null, ids?: string[]|null, runs?: object[]|null, now?: Date }} input `page` narrows to the datasets that page shows; `runs` = recent scans already read by the caller
  * @returns {Promise<{ datasets: object[] }>}
  */
-export async function getDatasetFreshness({ project, userId = null, page = null, now = new Date() }, { store = mongoRunStore } = {}) {
-  const ids = page ? PAGE_DATASETS[page] : Object.keys(DATASETS);
+export async function getDatasetFreshness({ project, userId = null, page = null, ids: onlyIds = null, runs: knownRuns = null, now = new Date() }, { store = mongoRunStore } = {}) {
+  const ids = onlyIds ?? (page ? PAGE_DATASETS[page] : Object.keys(DATASETS));
   const [described, runs] = await Promise.all([
     Promise.all(ids.map((id) => describeOne(id, { project, userId, now }))),
-    store.list(project._id, 20),
+    knownRuns ?? store.list(project._id, 20),
   ]);
   return { datasets: described.map((d) => ({ ...d, lastError: lastErrorOf(d.id, runs, d.lastSuccessfulAt) })) };
 }

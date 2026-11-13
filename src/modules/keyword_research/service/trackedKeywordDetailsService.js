@@ -61,7 +61,10 @@ function rankingUrlsOf(list) {
  * One device's current state. `status` keeps four cases apart, and none of them is a position of zero:
  *   ranked | not_ranked (scan succeeded, not found within `trackedDepth`) | scan_error (last scan failed; `position` is the last good one, if any) | not_collected
  */
-export function buildDeviceRanking({ status, doc, prevWeek, prevMonth, trackedDepth }) {
+export function buildDeviceRanking({ status, doc, prevWeek, prevMonth, trackedDepth, scan = null }) {
+  // `lastScannedAt` is the last ATTEMPT (a failed one counts); `lastVerifiedAt` is the last check that really observed the SERP. The page must
+  // never present a preserved rank as freshly verified, and a position found in partial (40106) results is a real but incomplete observation.
+  const partial = scan?.status === 'partial_success' || scan?.serp_outcome === 'partial';
   return {
     status,
     position: nz(doc?.current_rank),
@@ -72,10 +75,23 @@ export function buildDeviceRanking({ status, doc, prevWeek, prevMonth, trackedDe
     prevMonthPosition: nz(prevMonth),
     rankingUrl: rankingUrlsOf(doc?.ranking_urls).sort((a, b) => a.rank - b.rank)[0]?.url ?? null,
     rankingUrls: rankingUrlsOf(doc?.ranking_urls),
-    trackedDepth: status === 'not_ranked' ? trackedDepth : null,
+    // N in "Not in top N" is what the response contained (returned organic results), not an assumed constant.
+    trackedDepth: status === 'not_ranked' ? (scan?.returned_results || trackedDepth) : null,
+    // A "not ranked" that ran but could not fully vouch for itself: 'partial' (provider returned part of the SERP) or 'uncertain' (unreadable results).
+    notRankedKind: status === 'not_ranked' ? (scan?.status === 'not_found_partial' ? 'partial' : scan?.status === 'not_found_uncertain' ? 'uncertain' : null) : null,
+    lowConfidence: Array.isArray(doc?.ranking_urls) && doc.ranking_urls.some((u) => u?.match_confidence === 'low'),
     scanCount: doc?.scan_count ?? 0,
     lastScannedAt: iso(doc?.last_scanned_at ?? doc?.last_rescanned_at),
     scanError: status === 'scan_error' ? (doc?.last_scan_error ?? null) : null,
+    lastVerifiedAt: iso(scan?.last_successful_scan_at),
+    partial: Boolean(partial) && status !== 'scan_error',
+    returnedResults: Number.isFinite(scan?.returned_results) ? scan.returned_results : null,
+    requestedDepth: Number.isFinite(scan?.requested_depth) ? scan.requested_depth : null,
+    // Coverage of the last check, from the provider response: full | short | partial | no_results | none (null = checked before this was recorded).
+    resultCompleteness: scan?.result_completeness ?? null,
+    coverageComplete: typeof scan?.coverage_complete === 'boolean' ? scan.coverage_complete : null,
+    deepestOrganicRank: Number.isFinite(scan?.deepest_organic_rank) ? scan.deepest_organic_rank : null,
+    unresolvedCandidates: Number.isFinite(scan?.unresolved_candidates) ? scan.unresolved_candidates : 0,
   };
 }
 
@@ -226,8 +242,8 @@ export async function getTrackedKeywordDetails({ projectId, keywordId, userId, r
       highTopOfPageBid: nz(m?.high_top_of_page_bid),
     },
     rankings: {
-      desktop: buildDeviceRanking({ status: desktopStatus(kw), doc: kw, prevWeek: desktopPrev.prev_week_rank, prevMonth: desktopPrev.prev_month_rank, trackedDepth: resolveSerpDepth() }),
-      mobile: buildDeviceRanking({ status: deriveMobileStatus(kw.mobile), doc: kw.mobile, prevWeek: mobilePrev.prev_week_rank, prevMonth: mobilePrev.prev_month_rank, trackedDepth: kw.mobile?.tracked_depth ?? null }),
+      desktop: buildDeviceRanking({ status: desktopStatus(kw), doc: kw, scan: kw.desktop_scan, prevWeek: desktopPrev.prev_week_rank, prevMonth: desktopPrev.prev_month_rank, trackedDepth: resolveSerpDepth() }),
+      mobile: buildDeviceRanking({ status: deriveMobileStatus(kw.mobile), doc: kw.mobile, scan: kw.mobile?.scan, prevWeek: mobilePrev.prev_week_rank, prevMonth: mobilePrev.prev_month_rank, trackedDepth: kw.mobile?.tracked_depth ?? null }),
       maps,
     },
     history: {

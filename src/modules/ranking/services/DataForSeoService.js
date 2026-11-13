@@ -8,6 +8,9 @@ import {
   ORGANIC_ACCEPTED_TASK_CODES, ORGANIC_OUTCOMES, assessOrganicOutcome, summarizeOrganicResponse, toSerpMeta,
 } from './serpResponseOutcome.js';
 
+import { providerFor, fallbackToLive } from '../standard/config.js';
+import { fetchSerpViaStandard } from '../standard/serpStandardFetcher.js';
+
 const BASE_URL = 'https://api.dataforseo.com/v3';
 
 const ENDPOINTS = {
@@ -288,7 +291,19 @@ export const DataForSeoService = {
    * after. Safe to remove once the investigation is closed; no credentials,
    * no full response body.
    */
-  async getSerpOrganic(keyword, locationCode, languageCode, { device = DEFAULT_SERP_DEVICE } = {}) {
+  async getSerpOrganic(keyword, locationCode, languageCode, { device = DEFAULT_SERP_DEVICE, context = {} } = {}) {
+    // DATAFORSEO_SERP_MODE=standard (and the keyword inside the rollout percentage): the asynchronous task API. Same output shape as Live,
+    // so nothing downstream changes. Live is used only when it is the configured mode for this keyword, or - only if explicitly
+    // enabled (DATAFORSEO_SERP_FALLBACK_TO_LIVE) - after Standard has FINALLY failed for this request. Never both for one request.
+    if (providerFor({ keyword, locationCode, languageCode }) === 'standard') {
+      resolveSerpDevice(device); // an unsupported device fails before any task is recorded
+      try {
+        return await fetchSerpViaStandard({ keyword, locationCode, languageCode, device, context });
+      } catch (err) {
+        if (!(err?.standardFinal === true && fallbackToLive())) throw err;
+        console.warn(`[DATAFORSEO_STANDARD_FALLBACK] device=${device} | keyword="${keyword}" | reason=${err.code ?? err.message} | falling back to Live once`);
+      }
+    }
     const endpointPath = ENDPOINTS.SERP_ORGANIC.split('/v3/')[1];
     const payload = buildSerpOrganicPayload(keyword, locationCode, languageCode, device);
     const { depth, os } = payload[0];

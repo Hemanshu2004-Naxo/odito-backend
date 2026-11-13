@@ -66,6 +66,8 @@ const runSchema = new mongoose.Schema({
   lease: { expiresAt: { type: Date, default: null } },
   heartbeatAt: { type: Date, default: null },
   attempts: { type: Number, default: 0 },
+  // How many times the failed questions of this run were re-sent (see services/retryFailedService.js).
+  retryCount: { type: Number, default: 0 },
   cancelRequested: { type: Boolean, default: false },
 
   failureCode: { type: String, default: null },

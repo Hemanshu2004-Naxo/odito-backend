@@ -94,11 +94,11 @@ const errorCodeOf = (err) => String(err?.code ?? 'UNKNOWN').slice(0, 60);
 
 /**
  * Validates and ENQUEUES a scan. Nothing is bought here and the request does not wait for any provider call: a worker picks the scan up.
- * @param {{ project: object, userId: string, scope: string, datasets?: string[], force?: boolean, retryOf?: string|null }} input
+ * @param {{ project: object, userId: string, scope: string, datasets?: string[], force?: boolean, retryOf?: string|null, triggerType?: 'manual'|'auto' }} input
  * @param {{ store?: typeof mongoRunStore, now?: () => Date }} [deps]
  * @returns {Promise<{ run: object, deduped: boolean }>}
  */
-export async function startScan({ project, userId, scope, datasets, force = false, retryOf = null }, deps = {}) {
+export async function startScan({ project, userId, scope, datasets, force = false, retryOf = null, triggerType = 'manual' }, deps = {}) {
   const { store = mongoRunStore, now = () => new Date() } = deps;
   const target = normalizeTargetDomain(project.main_url);
   const market = resolveMarket(project);
@@ -118,7 +118,7 @@ export async function startScan({ project, userId, scope, datasets, force = fals
   const createdAt = now();
   const doc = {
     projectId: project._id, domain: target, market: { location: market.location_name, language: market.language_name },
-    scope: retryOf ? 'dataset' : scope, triggerType: retryOf ? 'retry' : 'manual', requestedBy: userId || null,
+    scope: retryOf ? 'dataset' : scope, triggerType: retryOf ? 'retry' : triggerType, requestedBy: userId || null,
     force: Boolean(force), retryOf: retryOf || null, retryCount, datasetsRequested: ids,
     datasets: ids.map((id) => ({ id, section: DATASETS[id].section, status: 'pending' })), attempts: 0, nextAttemptAt: null,
   };

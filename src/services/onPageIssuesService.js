@@ -37,6 +37,21 @@ export async function getOnPageIssues(projectId) {
         }
       },
 
+      // Per-element data_paths ("images.<url>.alt", "images.<url>.size", ...) are unique per image, so grouping on them turned
+      // every image into its own "issue type" row (43 identical "Images Missing Alt Text" rows). Those are occurrences of ONE
+      // issue, not distinct finding types: collapse them to a null group key. Subtype paths (structured_data.*) are kept.
+      {
+        $addFields: {
+          _group_path: {
+            $cond: [
+              { $regexMatch: { input: { $ifNull: ['$data_path', ''] }, regex: '^images[.]' } },
+              null,
+              '$data_path',
+            ],
+          },
+        },
+      },
+
       // Stage 1 — deduplicate by (issue_code, page_url, data_path).
       // data_path is included because a single rule can emit genuinely
       // different finding types on the same page under the same issue_code
@@ -49,8 +64,10 @@ export async function getOnPageIssues(projectId) {
           _id: {
             issue_code: '$issue_code',
             page_url: '$page_url',
-            data_path: '$data_path',
+            data_path: '$_group_path',
           },
+          // Number of per-element documents folded into this (issue, page) — e.g. images lacking alt on the page.
+          element_count: { $sum: 1 },
           issue_message: { $first: '$issue_message' },
           severity: { $first: '$severity' },
           category: { $first: '$category' },
@@ -75,7 +92,7 @@ export async function getOnPageIssues(projectId) {
           category: { $first: '$category' },
           ai_confidence: { $first: '$ai_confidence' },
           pages_affected: { $sum: 1 },
-          total_occurrences: { $sum: 1 },
+          total_occurrences: { $sum: '$element_count' },
           affected_urls: { $push: '$_id.page_url' },
         },
       },
@@ -131,6 +148,9 @@ export async function getOnPageIssues(projectId) {
       difficulty,
       ai_confidence,
       sample_pages: issue.sample_pages,
+      // Every page the issue is on: the On-Page screen's "By page" view is built from this. NOT named `affected_urls`:
+      // the issue detail view treats that field as "the URLs are already known" and would skip fetching per-page detail.
+      page_urls: issue.affected_urls || [],
     };
 
     return enrichedIssue;

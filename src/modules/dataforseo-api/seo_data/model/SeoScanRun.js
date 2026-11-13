@@ -41,7 +41,7 @@ const scanRunSchema = new mongoose.Schema({
   market: { type: new mongoose.Schema({ location: String, language: String }, { _id: false }), default: null },
   scope: { type: String, required: true, maxlength: 40 },
   status: { type: String, enum: SCAN_STATUSES, required: true, default: 'pending' },
-  triggerType: { type: String, enum: ['manual', 'retry', 'scheduled'], default: 'manual' },
+  triggerType: { type: String, enum: ['manual', 'retry', 'scheduled', 'auto'], default: 'manual' },
   requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   // true = fresh stored entries were bought again as well (a complete refresh); false = only missing / stale data was bought.
   force: { type: Boolean, default: false },

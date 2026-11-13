@@ -93,6 +93,8 @@ import { startInvestigationRecoveryScheduler } from './src/modules/ai-investigat
 import { startGoogleAioVisibilityScheduler } from './src/modules/ai_visibility/google_aio_visibility/workers/recoveryScheduler.js';
 import { startReviewSnapshotScheduler } from './src/services/businessProfileReviewSnapshotScheduler.js';
 import { startSeoScanWorker } from './src/modules/dataforseo-api/seo_data/worker/seoScanWorker.js';
+import { startStandardSerpWorker } from './src/modules/ranking/standard/serpStandardWorker.js';
+import serpStandardRoutes from './src/modules/ranking/standard/serpStandardRoutes.js';
 import { WORKER as SEO_SCAN_WORKER } from './src/modules/dataforseo-api/seo_data/config.js';
 import { warmMyCompetitorIndexes } from './src/modules/competitors/service/myCompetitorsService.js';
 import { startCompetitorEnrichmentScheduler } from './src/modules/competitors/workers/enrichmentScheduler.js';
@@ -336,6 +338,10 @@ const startServer = async () => {
   // SIGTERM / SIGINT. Set SEO_SCAN_WORKER_EMBEDDED=false to run the workers as separate processes instead (seo_data/worker/seoScanWorkerMain.js).
   if (SEO_SCAN_WORKER.embedded) startSeoScanWorker();
 
+  // Ranking SERP tasks through DataForSEO Standard (DATAFORSEO_SERP_MODE=standard): submits batches, collects results, recovers failures.
+  // Persistent in MongoDB; idle (once a minute) while the mode is live. DATAFORSEO_SERP_STANDARD_WORKER_EMBEDDED=false to run it elsewhere.
+  startStandardSerpWorker();
+
 
   /**
 
@@ -505,6 +511,7 @@ const startServer = async () => {
 
 
 
+  app.use('/api/serp-standard', serpStandardRoutes);
   app.use('/api', routes);
 
 

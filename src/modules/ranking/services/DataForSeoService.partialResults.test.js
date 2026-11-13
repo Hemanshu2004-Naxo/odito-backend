@@ -45,7 +45,7 @@ async function scanBoth(script) {
     const resp = list[Math.min(calls[device]++, list.length - 1)];
     return typeof resp === 'function' ? resp() : resp;
   });
-  const scans = await settle(scanKeywordDevices({ keyword: 'an asg eye center near me', locationCode: 1007785, languageCode: 'en', mobileEnabled: true }));
+  const scans = await settle(scanKeywordDevices({ keyword: 'an asg eye center near me', locationCode: 1007785, languageCode: 'en', mobileEnabled: true, cleanDomain: SITE }));
   return { calls, desktop: buildDeviceResult(scans.desktop, SITE), mobile: buildDeviceResult(scans.mobile, SITE) };
 }
 
@@ -58,7 +58,7 @@ describe('organic task outcomes', () => {
     assert.equal(calls.desktop, 1);
     assert.equal(desktop.scan_error, null);
     assert.equal(desktop.best_rank, 7);
-    assert.deepEqual(desktop.serp, { outcome: 'complete', provider_code: 20000, requested_depth: 100, returned_results: 100 });
+    assert.deepEqual(desktop.serp, { outcome: 'complete', provider_code: 20000, requested_depth: 100, returned_results: 100, deepest_organic_rank: 100, coverage_complete: true, result_completeness: 'full' });
     assert.equal(desktop.tracked_depth, 100);
   });
 
@@ -70,20 +70,45 @@ describe('organic task outcomes', () => {
     assert.equal(calls.desktop, 1, 'a completed 40106 task is not resubmitted');
     assert.equal(desktop.scan_error, null);
     assert.equal(desktop.best_rank, 34);
-    assert.deepEqual(desktop.serp, { outcome: 'partial', provider_code: 40106, requested_depth: 100, returned_results: 80 });
+    assert.deepEqual(desktop.serp, { outcome: 'partial', provider_code: 40106, requested_depth: 100, returned_results: 80, deepest_organic_rank: 80, coverage_complete: false, result_completeness: 'partial' });
     assert.equal(desktop.tracked_depth, 80, 'tracked depth is what came back, not what was asked for');
   });
 
-  test('3. 40106 with 20 returned results and the site absent: scan_error (rank unknown), not "not ranked"', async () => {
+  test('3. 40106 with 20 returned results and the site absent: retried ONCE, still partial -> not_ranked_partial (an update, not a scan error)', async () => {
     const { calls, desktop } = await scanBoth({
       desktop: [serpResponse({ code: 40106, items: organicItems(20) })],
       mobile:  [serpResponse({ items: organicItems(100), device: 'mobile' })],
     });
-    assert.equal(calls.desktop, 1);
-    assert.match(desktop.scan_error, /partial results \(code 40106\)/);
+    assert.equal(calls.desktop, 2, 'one retry, not more');
+    assert.equal(desktop.attempts, 2);
+    assert.equal(desktop.scan_error, null);
+    assert.equal(desktop.rank_state, 'not_ranked_partial');
+    assert.equal(desktop.ranking_status, 'unknown', 'not a verified not-found');
+    assert.equal(desktop.completeness, 'partial');
     assert.equal(desktop.best_rank, null);
     assert.deepEqual(desktop.ranking_urls, []);
     assert.equal(desktop.serp.returned_results, 20);
+    assert.equal(desktop.tracked_depth, 20, 'N = the deepest rank actually returned');
+  });
+
+  test('3c. 40106 without the site, then the retry returns the complete SERP: the complete answer is used', async () => {
+    const { calls, desktop } = await scanBoth({
+      desktop: [serpResponse({ code: 40106, items: organicItems(20) }), serpResponse({ items: organicItems(100, { 31: SITE }) })],
+      mobile:  [serpResponse({ items: organicItems(100), device: 'mobile' })],
+    });
+    assert.equal(calls.desktop, 2);
+    assert.equal(desktop.rank_state, 'ranked');
+    assert.equal(desktop.best_rank, 31);
+    assert.equal(desktop.serp.outcome, 'complete');
+  });
+
+  test('3d. a partial that already contains the site is NOT retried', async () => {
+    const { calls, desktop } = await scanBoth({
+      desktop: [serpResponse({ code: 40106, items: organicItems(20, { 3: SITE }) })],
+      mobile:  [serpResponse({ items: organicItems(100), device: 'mobile' })],
+    });
+    assert.equal(calls.desktop, 1);
+    assert.equal(desktop.best_rank, 3);
   });
 
   test('3b. 40106 with 20 returned results and the site at 3: rank recorded from the partial page', async () => {
@@ -104,7 +129,7 @@ describe('organic task outcomes', () => {
     assert.equal(calls.desktop, 1);
     assert.match(desktop.scan_error, /no organic items/);
     assert.equal(desktop.attempts, 1);
-    assert.deepEqual(desktop.serp, { outcome: 'partial_without_results', provider_code: 40106, requested_depth: 100, returned_results: 0 });
+    assert.deepEqual(desktop.serp, { outcome: 'partial_without_results', provider_code: 40106, requested_depth: 100, returned_results: 0, deepest_organic_rank: null, coverage_complete: false, result_completeness: 'none' });
   });
 
   test('4b. 40106 with result: null is the same failed scan', async () => {
@@ -113,6 +138,18 @@ describe('organic task outcomes', () => {
       mobile:  [serpResponse({ items: organicItems(10), device: 'mobile' })],
     });
     assert.match(desktop.scan_error, /no organic items/);
+  });
+
+  test('5b. 40101 twice then 20000: the third response is used (three attempts, no scan error)', async () => {
+    const { calls, desktop } = await scanBoth({
+      desktop: [serpResponse({ code: 40101, items: null }), serpResponse({ code: 40101, items: null }), serpResponse({ items: organicItems(100, { 5: SITE }) })],
+      mobile:  [serpResponse({ items: organicItems(100), device: 'mobile' })],
+    });
+    assert.equal(calls.desktop, 3);
+    assert.equal(desktop.attempts, 3);
+    assert.equal(desktop.best_rank, 5);
+    assert.equal(desktop.scan_error, null);
+    assert.equal(desktop.rank_state, 'ranked');
   });
 
   test('5. 40101 then 20000: retried once, the second task is used', async () => {

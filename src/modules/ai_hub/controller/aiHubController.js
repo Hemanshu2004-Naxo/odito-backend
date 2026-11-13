@@ -404,7 +404,6 @@ export const getAEOHubData = async (req, res) => {
         },
 
         signals: {
-          direct_answer:    buildSignal('AEO-046'),
           question_h2:      buildSignal('AEO-047'),
           faq_schema:       buildSignal('AEO-048'),
           howto_schema:     buildSignal('AEO-049'),

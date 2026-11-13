@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { startScan, ScanConflict, toPublicRun } from '../service/seoScanService.js';
 import { mongoRunStore } from '../service/scanRunStore.js';
 import { listSnapshots, compareToPrevious, DATASET_TYPES, DATASET_ALIASES, COMPARISON_PERIODS, SNAPSHOT_RULES } from '../service/snapshotService.js';
+import { ensurePageData, refreshPage } from '../service/autoCollectService.js';
 import { sendError } from '../../domain_overview/controller/domainOverviewController.js';
 import { ValidationFailure } from '../../shared/targetDomain.js';
 
@@ -124,3 +125,28 @@ export async function getComparison(req, res) {
 }
 
 const toPublicSnapshot = (s) => ({ id: String(s._id), datasetType: s.datasetType, part: s.part, variant: s.variant, capturedAt: s.capturedAt, scanId: s.scanId ? String(s.scanId) : null, data: s.data });
+
+/**
+ * POST /projects/:projectId/seo-data/ensure { page } -> the page's data state; queues ONE coordinated scan of what the page needs and does not
+ * have (missing / stale, not already being collected, not cooling down). Reads MongoDB only; never waits for or calls the provider.
+ */
+export async function postEnsure(req, res) {
+  try {
+    const out = await ensurePageData({ project: req.project, userId: String(req.user?._id || ''), page: (req.body ?? {}).page });
+    res.set('Cache-Control', 'no-store');
+    return res.status(200).json({ success: true, data: out });
+  } catch (err) {
+    return sendError(res, err, { projectId: String(req.project?._id || ''), route: 'seo-data/ensure' });
+  }
+}
+
+/** POST /projects/:projectId/seo-data/refresh { page } -> the optional manual refresh (one per project per hour, refused while a scan is active). */
+export async function postRefresh(req, res) {
+  try {
+    const out = await refreshPage({ project: req.project, userId: String(req.user?._id || ''), page: (req.body ?? {}).page });
+    res.set('Cache-Control', 'no-store');
+    return res.status(out.accepted ? 202 : out.reason === 'COOLDOWN' || out.reason === 'SCAN_IN_PROGRESS' ? 409 : 503).json({ success: out.accepted, data: out, ...(out.accepted ? {} : { code: out.reason }) });
+  } catch (err) {
+    return sendError(res, err, { projectId: String(req.project?._id || ''), route: 'seo-data/refresh' });
+  }
+}

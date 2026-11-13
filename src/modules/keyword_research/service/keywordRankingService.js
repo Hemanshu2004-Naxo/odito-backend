@@ -131,7 +131,7 @@ class KeywordRankingService {
 
     const results = await Promise.all(
       keywords.map(async keyword => {
-        const { desktop, mobile } = await scanKeywordDevices({ keyword, locationCode, languageCode: langCode });
+        const { desktop, mobile } = await scanKeywordDevices({ keyword, locationCode, languageCode: langCode, cleanDomain });
         const d = buildDeviceResult(desktop, cleanDomain);
         const m = buildDeviceResult(mobile, cleanDomain);
         return {

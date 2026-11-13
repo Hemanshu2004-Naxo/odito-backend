@@ -85,6 +85,8 @@ const evidenceSchema = new mongoose.Schema({
   completedAt: { type: Date, default: null },
   durationMs: { type: Number, default: null },
   retainUntil: { type: Date, default: null },
+  // Earlier failures of this question that were retried (kept so a retry never erases the diagnostics).
+  retryHistory: { type: [mongoose.Schema.Types.Mixed], default: [] },
 }, { collection: 'google_aio_visibility_evidence', timestamps: true });
 
 evidenceSchema.index({ runId: 1, questionId: 1 }, { unique: true, name: 'unique_google_aio_evidence_per_run_question' });

@@ -12,7 +12,14 @@ import mongoose from 'mongoose';
 const rankingUrlSchema = new mongoose.Schema({
   rank: { type: Number, required: true, min: 1, max: 100 },
   url:  { type: String, required: true, trim: true },
-  type: { type: String, enum: ['homepage', 'internal_page'], default: 'internal_page' }
+  type: { type: String, enum: ['homepage', 'internal_page'], default: 'internal_page' },
+  original_url: { type: String, trim: true },  // SERP URL as returned when it was a redirect (e.g. google.com/goto); url is the resolved destination
+  rank_absolute: { type: Number, min: 1 },
+  host: { type: String, trim: true },                       // the resolved site of a masked (google.com/goto) result; url stays the goto link
+  url_masked: { type: Boolean },
+  match_confidence: { type: String, enum: ['low'] },        // low = matched by brand name only (never a verified domain)
+  match_basis: { type: String, enum: ['breadcrumb', 'brand_name'] },
+  matched_domain: { type: String, trim: true },             // the project's additional domain that matched, when not the tracked one
 }, { _id: false });
 
 const keywordRankingHistorySchema = new mongoose.Schema({

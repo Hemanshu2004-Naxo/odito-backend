@@ -5,6 +5,8 @@
  */
 
 import { URL } from 'url';
+import { calculateSerpRankings } from './serpRankCalculator.js';
+import { matchSerpResultDomain } from './serpDomainMatcher.js';
 
 export const RankingParserService = {
 
@@ -39,10 +41,7 @@ export const RankingParserService = {
    * competitor's page as the tracked site's ranking.
    */
   domainMatches(serpHost, targetHost) {
-    const a = this._matchHost(serpHost);
-    const b = this._matchHost(targetHost);
-    if (!a || !b) return false;
-    return a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+    return matchSerpResultDomain({ trackedDomain: targetHost, resultHostname: serpHost }).matched;
   },
 
   classifyUrlType(url) {
@@ -113,30 +112,8 @@ export const RankingParserService = {
    * @returns {number|null}
    */
   extractLocalPackRank(items, cleanDomain) {
-    for (const item of items) {
-      if (item?.type !== 'local_pack') continue;
-      for (const nested of (item.items || [])) {
-        if (nested?.type !== 'local_pack_element') continue;
-
-        const itemUrl    = nested.url || '';
-        let   itemDomain = itemUrl ? this.normalizeDomain(itemUrl) : '';
-        if (!itemDomain) itemDomain = this.normalizeDomain(nested.domain || '');
-        if (!itemDomain) continue;
-
-        if (
-          itemDomain === cleanDomain ||
-          cleanDomain.includes(itemDomain) ||
-          itemDomain.includes(cleanDomain)
-        ) {
-          const rank = nested.rank_group ?? nested.rank_absolute;
-          if (rank) {
-            console.log(`[RANKING_PARSER] Local pack match | rank=${rank} | domain="${itemDomain}"`);
-            return rank;
-          }
-        }
-      }
-    }
-    return null;
+    // Whole-label domain match (the old substring `includes` matched "tech.com" for "wowinfotech.com").
+    return calculateSerpRankings(items, cleanDomain).localPackRank;
   },
 
   /**
@@ -165,40 +142,42 @@ export const RankingParserService = {
    *
    * @param {Object} data        - Raw DataForSEO response from getSerpOrganic()
    * @param {string} cleanDomain - Pre-normalised target domain
+   * @param {{ brandName?: string|null, alternateDomains?: Array }} [opts] project brand (low-confidence brand_name fallback) and verified additional domains
    * @returns {{ ranking_urls: Array, best_rank: number|null, maps_rank: number|null }}
    */
-  parseOrganic(data, cleanDomain) {
-    const allItems    = this._collectAllItems(data);
-    const rankingUrls = [];
-    const seenUrls    = new Set();
-    let   mapsRank    = null;
-
-    try { mapsRank = this.extractLocalPackRank(allItems, cleanDomain); } catch { /* non-fatal */ }
-
-    for (const item of allItems) {
-      if (item?.type !== 'organic') continue;
-
-      const serpUrl    = item.url || item.snippet_url || item.link || '';
-      let   serpDomain = item.domain || '';
-      if (serpUrl) {
-        const extracted = this.normalizeDomain(serpUrl);
-        if (extracted) serpDomain = extracted;
-      }
-      const serpDomainClean = this.normalizeDomain(serpDomain);
-      const rank = item.rank_group ?? item.rank_absolute;
-
-      const isMatch = this.domainMatches(serpDomainClean, cleanDomain);
-
-      if (isMatch && rank && !seenUrls.has(serpUrl)) {
-        seenUrls.add(serpUrl);
-        rankingUrls.push({ rank, url: serpUrl, type: this.classifyUrlType(serpUrl) });
-      }
-    }
-
-    rankingUrls.sort((a, b) => a.rank - b.rank);
-    const bestRank = rankingUrls.length > 0 ? rankingUrls[0].rank : null;
-
-    return { ranking_urls: rankingUrls, best_rank: bestRank, maps_rank: mapsRank };
+  parseOrganic(data, cleanDomain, opts = {}) {
+    const calc = calculateSerpRankings(data, cleanDomain, { brandName: opts.brandName ?? null, alternateDomains: opts.alternateDomains ?? [] });
+    const st = calc.stats;
+    console.log(
+      `[RANKING_PARSER] target="${cleanDomain}" | total=${st.organicItems} | resolvedFromDomain=${st.resolvedFromDomain} | ` +
+      `resolvedFromBreadcrumb=${st.resolvedFromBreadcrumb} | unresolved=${st.unresolvedOrganic} | brandNameMatches=${st.brandNameMatches}`
+    );
+    return {
+      // Persisted shape: { rank, url, type } plus optional original_url when the SERP URL was a redirect, and - only when they say something -
+      // the resolved host of a masked result (url stays the goto link, url_masked true), a low-confidence brand match, the alternate domain that matched.
+      ranking_urls: calc.matches.map((m) => ({
+        rank: m.rank, url: m.url, type: m.type,
+        ...(m.originalUrl && m.originalUrl !== m.url ? { original_url: m.originalUrl } : {}),
+        ...(m.absoluteRank ? { rank_absolute: m.absoluteRank } : {}),
+        ...(m.host ? { host: m.host } : {}),
+        ...(m.urlMasked ? { url_masked: true } : {}),
+        ...(m.matchConfidence === 'low' ? { match_confidence: 'low' } : {}),
+        ...(m.matchBasis && m.matchBasis !== 'domain' ? { match_basis: m.matchBasis } : {}),
+        ...(m.viaAlternateDomain ? { matched_domain: m.viaAlternateDomain } : {}),
+      })),
+      match_confidence:   calc.matchConfidence,
+      match_basis:        calc.matchBasis,
+      best_rank:    calc.organicRank,
+      maps_rank:    calc.localPackRank,
+      // Additive and in-memory only (never stored): absolute position, local pack listing, status, resolution detail.
+      absolute_rank:      calc.absoluteRank,
+      local_pack_rank:    calc.localPackRank,
+      local_pack_listing: calc.localPackListing,
+      ranking_status:     calc.rankingStatus,
+      better_rank_possible: calc.betterRankPossible,
+      ranking_details:    calc.matches,
+      resolution_stats:   calc.stats,
+    };
   },
 
   // ── Related Keywords (async job pipeline) ────────────────────────────────────
