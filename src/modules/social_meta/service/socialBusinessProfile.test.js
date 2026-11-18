@@ -43,6 +43,7 @@ const websiteLogo = async () => ({ brandLogo: 'https://site.example/logo.png', f
 const EMPTY_BRAND_KIT = {
   primaryColor: null, secondaryColor: null, accentColor: null, fontHeading: null, fontBody: null,
   name: null, description: null, voice: null, personality: [], tagline: null, keyMessages: [], preferredWords: [], additionalInstructions: null, logo: null,
+  fonts: { heading: { regular: null, bold: null }, body: { regular: null, bold: null } },
 };
 
 describe('SocialBusinessProfile — resolver + service (real MongoDB)', () => {

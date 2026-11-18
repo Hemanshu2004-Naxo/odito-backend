@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { toPublicFonts } from './brandFontService.js';
 import SocialBusinessProfile, { BUSINESS_MODELS, SERVICE_STATUSES } from '../model/SocialBusinessProfile.js';
 import SeoProject from '../../app_user/model/SeoProject.js';
 import {
@@ -281,6 +282,7 @@ export function toEditableProfile(doc) {
       keyMessages: [...(b.keyMessages || [])], preferredWords: [...(b.preferredWords || [])],
       additionalInstructions: b.additionalInstructions ?? null,
       logo: toPublicLogo(b.logo),
+      fonts: toPublicFonts(b.fonts),
     },
     prohibitedPhrases: [...(d.prohibitedPhrases || [])],
     contentPillars: [...(d.contentPillars || [])],

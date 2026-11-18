@@ -9,15 +9,15 @@ import { attachGeneratedDesign, submitDesignForApproval, getPublication } from '
 import mediaStorageService from '../media/mediaStorageService.js';
 import {
   getDesignProvider, loadBriefContext, loadDesignAssets, productFacts, activeAccountFor, DESIGNABLE_STATES, designFailureFor, DESIGN_FAILURE_MESSAGES,
-  toApiGeneration, recoverStaleDesignGenerations, briefFailureCode,
+  toApiGeneration, recoverStaleDesignGenerations, briefFailureCode, PHOTO_FALLBACK_NOTE,
 } from './socialDesignGenerationService.js';
 import sharp from 'sharp';
 import { buildDesignRequest, DESIGN_PROMPT_VERSION } from './designBrief.js';
-import { produceDesign } from './designProducer.js';
+import { produceWithPhotoFallback } from './designProducer.js';
 import { interpretChange } from './designDirector.js';
 import { chooseCandidateTypes, CREATIVE_TYPES, cleanInstruction, parseChanges } from './designStrategy.js';
-import { processAndStoreDesign, prepareReferenceImage } from './designMedia.js';
-import { PLATFORM_DESIGN, MAX_REFERENCE_IMAGES } from './designConfig.js';
+import { processAndStoreDesign } from './designMedia.js';
+import { PLATFORM_DESIGN } from './designConfig.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
 /**
@@ -45,7 +45,6 @@ const CANDIDATE_COUNT = 3;
 const MAX_INSTRUCTION = 400;
 const MAX_PRODUCT_ASSETS = 4;
 const toId = (id) => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : null);
-const iso = (d) => (d ? new Date(d).toISOString() : null);
 const fail = (code, message, extra = {}) => ({ success: false, error: { code, message, ...extra } });
 
 export const STUDIO_FAILURE_MESSAGES = Object.freeze({
@@ -62,6 +61,11 @@ const FORMAT_LABELS = Object.freeze({
 });
 
 /** The post text split into the caption and its trailing hashtag block (hashtags are part of the real publication text). */
+import { usesConceptStudio, latestConceptRecord, toApiConceptGeneration, getDesignCosts } from './conceptStudioService.js';
+import { captionPoints } from './concept/carousel.js';
+import { matchFamily } from './compose/designFonts.js';
+import { MIN_CAROUSEL_POINTS, MAX_CAROUSEL_POINTS } from './concept/conceptConfig.js';
+
 export function splitContent(text) {
   const value = String(text || '');
   const match = value.match(/(?:\s*#[\p{L}\p{N}_]+)+\s*$/u);
@@ -77,7 +81,7 @@ const productFilesFor = (product) => (product?.images || []).map((i) => ({ media
  * The post must belong to THIS project, be a draft, have APPROVED content for exactly the version the caller saw, and its account
  * must still be connected. Everything is decided from the database: nothing about the post comes from the client.
  */
-async function loadDesignablePost(projectId, publicationId, contentVersion) {
+export async function loadDesignablePost(projectId, publicationId, contentVersion) {
   if (typeof publicationId !== 'string' || !mongoose.Types.ObjectId.isValid(publicationId)) return fail('INVALID_PUBLICATION', 'publicationId is required.');
   if (!Number.isInteger(contentVersion) || contentVersion < 1) return fail('INVALID_VERSION', 'contentVersion (the content version you are designing for) is required.');
   const pub = await SocialPublication.findOne({ _id: toId(publicationId), project_id: toId(projectId) }).lean();
@@ -95,7 +99,7 @@ async function loadDesignablePost(projectId, publicationId, contentVersion) {
 const currentMediaUrl = (pub) => (Array.isArray(pub.media) && pub.media[0]?.type === 'image' ? pub.media[0].url : null);
 
 /** The calendar item the post was written from and its product, both looked up inside this project only. */
-async function loadPlan(pub) {
+export async function loadPlan(pub) {
   const planItem = pub.generation?.calendarItemId ? await SocialContentCalendarItem.findOne({ _id: pub.generation.calendarItemId, project_id: pub.project_id }).lean() : null;
   const product = planItem?.productId ? await SocialProduct.findOne({ _id: planItem.productId, project_id: pub.project_id, status: 'active' }).lean() : null;
   return { planItem, product };
@@ -168,7 +172,16 @@ export async function getStudioState(projectId, publicationId, { now = new Date(
       businessName: ctx?.snapshotData?.business?.name || null,
       logo: { available: !!logoUrl, url: logoUrl },
       colors: { ...colors, configured: !!(colors.primary || colors.secondary || colors.accent) },
-      fonts: { heading: liveBrand.fontHeading || null, body: liveBrand.fontBody || null, isDefault: !(liveBrand.fontHeading || liveBrand.fontBody) },
+      fonts: {
+        heading: liveBrand.fontHeading || null, body: liveBrand.fontBody || null, isDefault: !(liveBrand.fontHeading || liveBrand.fontBody),
+        // available = an uploaded file, or a shipped family of that name; a named font that is neither is flagged (brand_font_unavailable)
+        headingUploaded: !!(liveBrand.fonts?.heading?.regular?.storageKey || liveBrand.fonts?.heading?.bold?.storageKey),
+        bodyUploaded: !!(liveBrand.fonts?.body?.regular?.storageKey || liveBrand.fonts?.body?.bold?.storageKey),
+        unavailable: [
+          ...(liveBrand.fontHeading && !matchFamily(liveBrand.fontHeading) && !(liveBrand.fonts?.heading?.regular?.storageKey || liveBrand.fonts?.heading?.bold?.storageKey) ? [liveBrand.fontHeading] : []),
+          ...(liveBrand.fontBody && !matchFamily(liveBrand.fontBody) && !(liveBrand.fonts?.body?.regular?.storageKey || liveBrand.fonts?.body?.bold?.storageKey) ? [liveBrand.fontBody] : []),
+        ],
+      },
       voice: liveBrand.voice || null,
       tone: ctx?.snapshotData?.toneOfVoice?.primary || null,
       visualGuidelines: ctx?.strategy?.brandRules?.visualGuidelines || [],
@@ -179,13 +192,32 @@ export async function getStudioState(projectId, publicationId, { now = new Date(
     },
     currentDesign: currentMediaUrl(pub) ? {
       url: currentMediaUrl(pub), designVersion: pub.designVersion, approvalState: pub.approvalState ?? null, source: pub.design?.source === 'ai' && pub.design.designVersion === pub.designVersion ? 'ai' : 'upload',
+      format: (pub.media || []).length > 1 ? 'carousel' : 'single', slides: (pub.media || []).map((m) => m.url),
     } : null,
-    generation: toApiStudioGeneration(rec, pub),
+    ...(await conceptStudioState(pub, ctx, projectId, rec)),
+  };
+}
+
+/** Concept Studio (no product photo to place): the concept record, the formats the post allows, the design costs. Else the original studio. */
+async function conceptStudioState(pub, ctx, projectId, rec) {
+  const concept = await usesConceptStudio(pub, ctx?.liveProfile || null);
+  if (!concept) return { pipeline: 'rules', generation: toApiStudioGeneration(rec, pub) };
+  const points = captionPoints(pub.content).length;
+  const carouselAllowed = points >= MIN_CAROUSEL_POINTS && points <= MAX_CAROUSEL_POINTS;
+  const latest = await latestConceptRecord(projectId, String(pub._id));
+  const costs = await getDesignCosts(projectId, { publicationId: String(pub._id) });
+  return {
+    pipeline: 'concept',
+    formats: { single: { allowed: true }, carousel: { allowed: carouselAllowed, points, reason: carouselAllowed ? null : 'A carousel needs a caption with 3 to 6 numbered points.' } },
+    costs: { currency: costs.currency, post: costs.post, month: costs.month },
+    generation: toApiConceptGeneration(latest, pub),
   };
 }
 
 // ── starting a generation ────────────────────────────────────────────────────
 
+// control characters in a change request are refused on purpose
+// eslint-disable-next-line no-control-regex
 const INSTRUCTION_RE = /[\u0000-\u001F\u007F]/;
 
 /** Every stored file a candidate owns: the finished design and the photograph kept for refinements. */
@@ -332,7 +364,6 @@ export async function runStudioGeneration(generationId, lockedBy, userId = null)
     const context = await loadBriefContext(pub);
     const assets = await loadDesignAssets(pub, context.liveProfile, { productMediaIds: (rec.studio?.productMediaIds || []).map(String) });
     const provider = getDesignProvider();
-    const size = PLATFORM_DESIGN[rec.platform].size;
     const regenerating = rec.studio?.action === 'regenerate';
 
     // which candidates this run produces, and in which creative direction
@@ -367,14 +398,19 @@ export async function runStudioGeneration(generationId, lockedBy, userId = null)
         const keepVisual = !!refine && !wantsNewPhoto && !!cand.visual?.storageKey;
         const visualBytes = keepVisual ? await mediaStorageService.readByKey(cand.visual.storageKey, { projectId }) : null;
         const reuse = keepVisual && visualBytes ? visualBytes : null;
-        const request = buildDesignRequest({
+        const requestFor = (forceType) => buildDesignRequest({
           caption: pub.content, platform: pub.platform, pillar: pub.generation?.contentPillar || null, objective: pub.generation?.objective || null,
           snapshotData: context.snapshotData, strategy: context.strategy, planItem: assets.planItem, product: productFacts(assets.product),
           productAssetCount: assets.references.length, hasLogo: !!assets.logo, services: context.services, contact: context.contact, prohibitedPhrases: context.prohibitedPhrases,
-          patch: direction?.patch || {}, visualChange: direction?.photoRequest || null, seed: `${pub._id}:${cand.slot}`, sceneSeed: String(pub._id), sceneOffset: cand.slot + 3 * ((reuse ? previousRevision : revision) - 1), variant: String(reuse ? previousRevision : revision), forceType: type, instruction: refine || '',
+          patch: direction?.patch || {}, visualChange: direction?.photoRequest || null, seed: `${pub._id}:${cand.slot}`, sceneSeed: String(pub._id), sceneOffset: cand.slot + 3 * ((reuse ? previousRevision : revision) - 1), variant: String(reuse ? previousRevision : revision), forceType, instruction: refine || '',
         });
-        if (request.problems.length) throw Object.assign(new Error('brief invalid'), { code: briefFailureCode(request.problems) });
-        const produced = await produceDesign({ request, provider, generationId, logo: assets.logo, productImages: assets.references.map((r) => r.buffer), visualBuffer: reuse });
+        const planned = requestFor(type);
+        if (planned.problems.length) throw Object.assign(new Error('brief invalid'), { code: briefFailureCode(planned.problems) });
+        // the photograph failing (retired model, refusal, outage, unusable picture) never fails the card: it is drawn without one, and says why
+        const produced = await produceWithPhotoFallback({ request: planned, rebuild: regenerating ? null : requestFor, provider, generationId, logo: assets.logo, productImages: assets.references.map((r) => r.buffer), visualBuffer: reuse });
+        const request = produced.request;
+        const photoFallback = produced.photoFailure ? designFailureFor(produced.photoFailure) : null;
+        if (photoFallback) LoggerUtil.warn(`${EVENT} design_photo_fallback`, { event: 'design_photo_fallback', ...ids, slot: cand.slot, plannedLayout: planned.brief.layoutId, usedLayout: request.brief.layoutId, failureCode: photoFallback.code, providerCode: produced.photoFailure.code, reason: produced.photoFailure.reason || null, ...(produced.photoFailure.diagnostics || {}) });
         usageIn += produced.provider?.usage?.inputTokens || 0; usageOut += produced.provider?.usage?.outputTokens || 0; model = produced.provider?.model || model;
         const media = { ...(await processAndStoreDesign({ buffer: produced.png, projectId, platform: rec.platform, logo: null })), logoApplied: produced.report.logoApplied };
         stored.push(media.url); attemptFiles.push(media.url);
@@ -388,11 +424,12 @@ export async function runStudioGeneration(generationId, lockedBy, userId = null)
         const oldVisualUrl = cand.visual?.url && cand.visual.url !== visual?.url ? cand.visual.url : null;
         const written = await SocialDesignGeneration.updateOne({ ...lock, 'candidates._id': cand._id }, {
           $set: {
-            'candidates.$.status': 'ready', 'candidates.$.creativeType': request.brief.creativeType, 'candidates.$.label': request.brief.label, 'candidates.$.layoutId': request.brief.layoutId, 'candidates.$.revision': revision,
+            'candidates.$.status': 'ready', 'candidates.$.creativeType': photoFallback ? planned.brief.creativeType : request.brief.creativeType, 'candidates.$.label': request.brief.label, 'candidates.$.layoutId': request.brief.layoutId, 'candidates.$.revision': revision,
             'candidates.$.media': { url: media.url, storageKey: `${projectId}/${media.url.split('/').pop()}`, width: media.width, height: media.height, bytes: media.bytes },
             'candidates.$.visual': visual ? { url: visual.url, storageKey: visual.storageKey } : { url: null, storageKey: null },
             'candidates.$.logoApplied': !!media.logoApplied, 'candidates.$.referencePhotos': request.brief.productAssets.count,
-            'candidates.$.notes': [...new Set([...request.brief.notes, ...produced.report.notes, ...(assets.logo && !media.logoApplied ? ['logo_not_applied'] : [])])],
+            'candidates.$.notes': [...new Set([...request.brief.notes, ...produced.report.notes, ...(assets.logo && !media.logoApplied ? ['logo_not_applied'] : []), ...(photoFallback ? ['photo_fallback'] : [])])],
+            'candidates.$.fallback': photoFallback ? { code: photoFallback.code, message: PHOTO_FALLBACK_NOTE(photoFallback) } : { code: null, message: null },
             'candidates.$.instruction': refine || null, 'candidates.$.failure': { code: null, message: null }, 'candidates.$.generatedAt': new Date(),
           },
         });
@@ -403,7 +440,7 @@ export async function runStudioGeneration(generationId, lockedBy, userId = null)
         const failure = designFailureFor(error);
         const code = error?.code === 'DESIGN_FILE_MISSING' ? 'DESIGN_FILE_MISSING' : failure.code;
         const message = STUDIO_FAILURE_MESSAGES[code] || failure.message;
-        LoggerUtil.error(`${EVENT} design_candidate_failed`, { event: 'design_candidate_failed', ...ids, slot: cand.slot, failureCode: code, providerCode: error?.code || null });
+        LoggerUtil.error(`${EVENT} design_candidate_failed`, { event: 'design_candidate_failed', ...ids, slot: cand.slot, failureCode: code, providerCode: error?.code || null, reason: error?.reason || null, ...(error?.diagnostics || {}), message: error?.provider ? undefined : String(error?.message || '').slice(0, 200) });
         // a regenerate that fails keeps the previous image (it is still a valid candidate); a first generation records the failure on the card
         if (!regenerating) await SocialDesignGeneration.updateOne({ ...lock, 'candidates._id': cand._id }, { $set: { 'candidates.$.status': 'failed', 'candidates.$.failure': { code, message } } });
         return { ok: false, cand, failure: { code, message } };

@@ -20,7 +20,17 @@ const FAMILIES = Object.freeze({
   Inter: { variable: 'Inter.var.ttf' },
   Manrope: { variable: 'Manrope.var.ttf' },
   Sora: { variable: 'Sora.var.ttf' },
+  'Open Sans': { variable: 'OpenSans.var.ttf' },
+  'DM Sans': { files: { 400: 'DM_Sans/DMSans-Regular.ttf', 500: 'DM_Sans/DMSans-Medium.ttf', 600: 'DM_Sans/DMSans-SemiBold.ttf', 700: 'DM_Sans/DMSans-Bold.ttf' } },
 });
+
+/** The file of the nearest shipped weight (a family without ExtraBold uses Bold, never Regular). */
+function fileForWeight(def, w) {
+  if (def.variable) return def.variable;
+  if (def.files[w]) return def.files[w];
+  const weights = Object.keys(def.files).map(Number).sort((a, b) => Math.abs(a - w) - Math.abs(b - w) || b - a);
+  return def.files[weights[0]];
+}
 
 export const DEFAULT_FAMILY = 'Poppins';
 export const AVAILABLE_FAMILIES = Object.freeze(Object.keys(FAMILIES));
@@ -36,26 +46,52 @@ export function matchFamily(name) {
   return null;
 }
 
-/** { heading, body } families for a brief's typography, with whether each came from the brand. */
-export function resolveTypography(typography = {}) {
-  const heading = matchFamily(typography.heading);
-  const body = matchFamily(typography.body);
+/**
+ * A brand's OWN uploaded font (Brand Kit), registered under a key (e.g. "brand:<project>:heading") with its real family name and the files
+ * it has (400 regular and / or 700 bold, absolute paths in private storage). Re-registering a key replaces it.
+ */
+const CUSTOM = new Map();
+export function registerCustomFamily(key, { family, files }) {
+  CUSTOM.set(key, { family, files: { ...files } });
+}
+export const isCustomFamily = (key) => CUSTOM.has(key);
+
+/**
+ * { heading, body } families for a brief's typography, with whether each came from the brand. `custom` = { heading, body } keys of the
+ * brand's uploaded fonts (registerCustomFamily): an uploaded font wins over a shipped family of the same name.
+ */
+export function resolveTypography(typography = {}, custom = null) {
+  const headingCustom = custom?.heading && CUSTOM.has(custom.heading) ? custom.heading : null;
+  const bodyCustom = custom?.body && CUSTOM.has(custom.body) ? custom.body : null;
+  const heading = headingCustom || matchFamily(typography.heading);
+  const body = bodyCustom || matchFamily(typography.body);
   return {
     heading: heading || DEFAULT_FAMILY,
     body: body || heading || DEFAULT_FAMILY,
     headingFromBrand: !!heading,
     bodyFromBrand: !!body,
+    headingUploaded: !!headingCustom,
+    bodyUploaded: !!bodyCustom,
     brandFontUnavailable: !!((typography.heading && !heading) || (typography.body && !body)),
   };
 }
 
 /** { font, fontfile } for the renderer: family + weight -> the pango font name and the file it lives in. */
 export function fontSpec(family, weight = 400) {
+  const custom = CUSTOM.get(family);
+  if (custom) {
+    // an uploaded family has a regular and / or a bold file: the nearest one (500 -> regular, 600 / 800 -> bold)
+    const want = weight >= 600 ? 700 : 400;
+    const drawn = custom.files[want] ? want : Number(Object.keys(custom.files)[0]);
+    return { family: custom.family, weight: drawn, weightName: drawn >= 700 ? 'Bold' : 'Regular', fontfile: custom.files[drawn] };
+  }
   const def = FAMILIES[family] || FAMILIES[DEFAULT_FAMILY];
   const name = FAMILIES[family] ? family : DEFAULT_FAMILY;
   const w = WEIGHT_NAME[weight] ? weight : 400;
-  const file = def.variable || def.files[w] || def.files[400];
-  return { family: name, weight: w, weightName: WEIGHT_NAME[w], fontfile: path.join(FONT_DIR, file) };
+  const file = fileForWeight(def, w);
+  // a static family is drawn at the weight its file has (pango needs the name of what the file really is)
+  const drawnWeight = def.variable ? w : Number(Object.keys(def.files).find((k) => def.files[k] === file));
+  return { family: name, weight: drawnWeight, weightName: WEIGHT_NAME[drawnWeight], fontfile: path.join(FONT_DIR, file) };
 }
 
 /** True when every shipped font file is present (a deployment check, and a precondition the composer tests assert). */

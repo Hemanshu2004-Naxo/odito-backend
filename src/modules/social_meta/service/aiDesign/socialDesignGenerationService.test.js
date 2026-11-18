@@ -33,6 +33,10 @@ import { PROVIDER_ERROR } from '../aiContent/providers/contentProviderErrors.js'
 import { IMAGE_REFUSED } from './providers/openAIImageProvider.js';
 import { validRawStrategy, providerError } from '../../testSupport/aiStrategyFixtures.js';
 import { mockImageProvider, makeImage, removeProjectMedia, listProjectMedia } from '../../testSupport/designFixtures.js';
+import { asWaitingForDesign } from '../../testSupport/approvalFixtures.js';
+import { getPublication } from '../socialPublishingService.js';
+import { setBriefProviderOverride } from './concept/creativeBrief.js';
+import { setQualityProviderOverride } from './concept/conceptQuality.js';
 
 /**
  * Real MongoDB, real sharp, real files under storage/social_media/, scripted image provider. Proves that a
@@ -72,7 +76,9 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
       assert.equal((await submitContentForApproval(pid, pub.id, userId)).success, true);
       const a = await approveContent(pid, pub.id, reviewerId, 1);
       assert.equal(a.success, true, JSON.stringify(a));
-      pub = a.publication;
+      // a text post is approved with its content; these tests are about a post WAITING for its design (see approvalFixtures)
+      await asWaitingForDesign(pub.id);
+      pub = await getPublication(pid, pub.id);
     }
     return pub;
   }
@@ -108,6 +114,9 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
   afterEach(async () => {
     if (realConsole) for (const k of Object.keys(realConsole)) console[k] = realConsole[k];
     resetDesignProviderOverride();
+    setBriefProviderOverride(null);
+    setQualityProviderOverride(null);
+    delete process.env.SOCIAL_AI_DESIGN_PIPELINE;
     globalThis.fetch = realFetch;
     for (const key of Object.keys(original)) { const [p, m] = key.split('.'); adapters[p][m] = original[key]; }
     if (!mongoAvailable) return;
@@ -343,6 +352,7 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     await SocialApprovalSettings.create({ project_id: project._id, contentApprovalRequired: false, designApprovalRequired: true });
     const pub = await seedPost({ approve: false });
     assert.equal((await submitContentForApproval(pid, pub.id, userId)).success, true);
+    await asWaitingForDesign(pub.id); // the post waits for its design (see approvalFixtures)
     assert.equal((await row(pub.id)).approvalState, 'content_approved');
     let release;
     const gate = new Promise((res) => { release = res; });
@@ -351,13 +361,13 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     assert.equal((await updatePublication(pid, pub.id, userId, { content: 'A different caption, auto-approved again' })).success, true);
     const mid = await row(pub.id);
     assert.equal(mid.contentVersion, 2);
-    assert.equal(mid.approvalState, 'content_approved', 'same approval state as when generation started');
+    assert.equal(mid.approvalState, 'design_approved', 'the edit re-approved the text post automatically (content approval is off)');
     release();
     await waitDone(started.generation.id);
     const after = await row(pub.id);
     assert.deepEqual(after.media, [], 'the image drawn for caption v1 is not attached to caption v2');
     assert.equal(after.designVersion, 1);
-    assert.equal(after.approvalState, 'content_approved');
+    assert.equal(after.approvalState, 'design_approved');
     assert.equal((await SocialDesignGeneration.findById(started.generation.id).lean()).failure.code, 'DESIGN_STALE');
     assert.deepEqual(await listProjectMedia(pid), []);
   });
@@ -396,46 +406,56 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
   });
 
   // ── provider / media / storage failures ────────────────────────────────────
-  test('16: provider failures map to user-safe codes; the provider text, key and prompt are never stored or returned; no media, no state change', async (t) => {
+  test('16: a FIRST design whose photograph fails is drawn without one: the post gets a design, the reason is a clear user-safe message (never the generic one), and no provider text, key or prompt is stored or returned', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const pub = await seedPost();
     const cases = [
       [PROVIDER_ERROR.RATE_LIMITED, 'AI_BUSY'], [PROVIDER_ERROR.UNAVAILABLE, 'AI_BUSY'], [PROVIDER_ERROR.TIMEOUT, 'AI_TIMEOUT'], [PROVIDER_ERROR.NETWORK, 'AI_UNREACHABLE'],
       [PROVIDER_ERROR.BAD_OUTPUT, 'AI_BAD_OUTPUT'], [PROVIDER_ERROR.AUTH, 'AI_UNAVAILABLE'], [PROVIDER_ERROR.QUOTA, 'AI_UNAVAILABLE'], [PROVIDER_ERROR.NOT_CONFIGURED, 'AI_UNAVAILABLE'],
-      [IMAGE_REFUSED, 'DESIGN_REJECTED'], [PROVIDER_ERROR.FAILED, 'GENERATION_FAILED'], ['SOMETHING_UNEXPECTED', 'GENERATION_FAILED'],
+      [PROVIDER_ERROR.MISCONFIGURED, 'DESIGN_IMAGE_MODEL_UNAVAILABLE'], [IMAGE_REFUSED, 'DESIGN_REJECTED'], [PROVIDER_ERROR.FAILED, 'DESIGN_IMAGE_FAILED'], ['SOMETHING_UNEXPECTED', 'DESIGN_IMAGE_FAILED'],
     ];
     for (const [providerCode, expected] of cases) {
+      const pub = await seedPost();
       const provider = mockImageProvider({ behavior: () => { throw providerError(providerCode, { message: 'sk-SECRET-KEY upstream said: <prompt text>' }); } });
       const r = await gen(provider, pub);
-      assert.equal(r.generation.status, 'failed', providerCode);
-      assert.equal(r.generation.failure.code, expected, providerCode);
+      assert.equal(r.generation.status, 'ready', `${providerCode}: ${JSON.stringify(r.generation.failure)}`);
+      assert.equal(r.generation.creative.layoutId, 'statement_quote', `${providerCode}: a layout without a photograph`);
+      assert.equal(r.generation.creative.fallback.code, expected, providerCode);
+      assert.match(r.generation.creative.fallback.message, /This option uses a layout without a photograph instead\.$/);
+      assert.ok(r.generation.creative.notes.includes('photo_fallback'));
+      const after = await row(pub.id);
+      assert.equal(after.approvalState, 'design_review', 'the fallback design goes to design review like any design');
+      assert.equal(after.designVersion, 2);
       const stored = JSON.stringify(await SocialDesignGeneration.find({ project_id: project._id }).lean());
       assert.equal(stored.includes('sk-SECRET'), false);
       assert.equal(stored.includes('prompt text'), false);
       assert.equal(JSON.stringify(r).includes('sk-SECRET'), false);
-      await SocialDesignGeneration.deleteMany({ project_id: project._id });
     }
-    const after = await row(pub.id);
-    assert.equal(after.approvalState, 'content_approved');
-    assert.deepEqual(after.media, []);
-    assert.equal(after.designVersion, 1);
-    assert.deepEqual(await listProjectMedia(pid), []);
   });
 
-  test('17: an unusable photograph (garbage, SVG with script, empty) -> MEDIA_INVALID, nothing stored or attached; an unusual SHAPE is simply cropped to its frame', async (t) => {
+  test('16b: a REGENERATION whose photograph fails keeps the current design and says why (clear message, never the generic one)', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const pub = await seedPost({ platform: 'instagram' });
+    const pub = await seedPost();
+    assert.equal((await gen(mockImageProvider(), pub)).generation.status, 'ready');
+    const good = await row(pub.id);
+    const r = await gen(mockImageProvider({ behavior: () => { throw providerError(PROVIDER_ERROR.MISCONFIGURED, { status: 400, reason: 'model_not_found' }); } }), pub);
+    assert.equal(r.generation.status, 'failed');
+    assert.equal(r.generation.failure.code, 'DESIGN_IMAGE_MODEL_UNAVAILABLE');
+    assert.match(r.generation.failure.message, /image model Odito is set up to use is not available/);
+    const now = await row(pub.id);
+    assert.deepEqual([now.media[0].url, now.designVersion], [good.media[0].url, good.designVersion]);
+  });
+
+  test('17: an unusable photograph (garbage, SVG with script, empty) is never used or stored: the first design falls back to a layout without one (MEDIA_INVALID said); an unusual SHAPE is simply cropped to its frame', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const bads = [Buffer.from('not an image at all'), Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'), Buffer.alloc(0)];
     for (const bad of bads) {
+      const pub = await seedPost({ platform: 'instagram' });
       const r = await gen(mockImageProvider({ behavior: () => bad }), pub);
-      assert.equal(r.generation.status, 'failed');
-      assert.equal(r.generation.failure.code, 'MEDIA_INVALID');
-      await SocialDesignGeneration.deleteMany({ project_id: project._id });
+      assert.equal(r.generation.status, 'ready');
+      assert.equal(r.generation.creative.fallback.code, 'MEDIA_INVALID');
+      assert.equal(r.generation.creative.layoutId, 'statement_quote');
     }
-    assert.deepEqual(await listProjectMedia(pid), []);
-    const after = await row(pub.id);
-    assert.deepEqual(after.media, []);
-    assert.equal(after.approvalState, 'content_approved');
+    assert.equal((await listProjectMedia(pid)).length, bads.length, 'only the finished designs are stored, never the bad pictures');
     // a very wide or a tiny photograph is a valid picture: the composer crops it to the frame, so the finished design is still the platform's size
     for (const odd of [await makeImage({ width: 2400, height: 800 }), await makeImage({ width: 100, height: 100 })]) {
       const r = await gen(mockImageProvider({ behavior: () => odd }), await seedPost({ platform: 'instagram' }));
@@ -568,7 +588,7 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     assert.equal(s.publication.approval.state, 'design_review');
     assert.equal(s.publication.approval.designVersion, 2);
     assert.equal(s.publication.media.length, 1);
-    assert.deepEqual(s.publication.design, { source: 'ai', designVersion: 2, contentVersion: 1, generatedAt: s.publication.design.generatedAt });
+    assert.deepEqual(s.publication.design, { source: 'ai', designVersion: 2, contentVersion: 1, generatedAt: s.publication.design.generatedAt, format: 'single', generationId: s.generation.id });
     assert.equal((await getDesignGenerationStatus(pid, { publicationId: pub.id, generationId: 'nope' })).error.code, 'NOT_FOUND');
     assert.equal((await getDesignGenerationStatus(pid, { publicationId: pub.id, generationId: new mongoose.Types.ObjectId().toString() })).error.code, 'NOT_FOUND');
   });
@@ -600,12 +620,14 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     for (const tokenish of ['FB-SECRET-TOKEN', 'IG-SECRET-TOKEN', 'accessToken', 'Bearer']) assert.equal(provider.calls[0].prompt.includes(tokenish), false, `prompt: ${tokenish}`);
   });
 
-  test('29: failure logs carry codes only (no provider message / prompt / key)', async (t) => {
+  test('29: failure logs carry codes only (no provider message / prompt / key) - for a failed regeneration and for a first design that fell back', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const pub = await seedPost();
     await gen(mockImageProvider({ behavior: () => { throw providerError(PROVIDER_ERROR.AUTH, { message: 'sk-LEAK-KEY and the prompt text' }); } }), pub);
+    assert.ok(captured.join('\n').includes('design_photo_fallback'), 'the first design fell back, and that is logged');
+    await gen(mockImageProvider({ behavior: () => { throw providerError(PROVIDER_ERROR.AUTH, { message: 'sk-LEAK-KEY and the prompt text' }); } }), pub);
     const logs = captured.join('\n');
-    assert.ok(logs.includes('design_generation_failed'));
+    assert.ok(logs.includes('design_generation_failed'), 'the regeneration failed, and that is logged');
     assert.equal(logs.includes('sk-LEAK'), false);
     assert.equal(logs.includes('prompt text'), false);
   });
@@ -647,7 +669,7 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     const r = await gen(provider, pub);
     assert.equal(r.generation.status, 'ready', JSON.stringify(r));
     assert.equal(provider.calls.length, 0, 'a numbered infographic has no photograph: the image model is not used (nothing to pay for, nothing to misspell)');
-    assert.deepEqual(r.generation.creative, { type: 'educational_list', label: 'Educational list', layoutId: 'infographic_points', logoApplied: false, referencePhotos: 0, notes: [] });
+    assert.deepEqual(r.generation.creative, { type: 'educational_list', label: 'Educational list', layoutId: 'infographic_points', logoApplied: false, referencePhotos: 0, notes: [], fallback: null, pipeline: 'rules', concept: null, qc: null, imageModel: null });
     const rec = await SocialDesignGeneration.findById(r.generation.id).lean();
     assert.equal(rec.creative.type, 'educational_list');
     assert.match(rec.generation.promptVersion, /^social-ai-design-v\d+$/);
@@ -880,16 +902,15 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     assert.doesNotMatch(JSON.stringify(record), /turning down service requests|growth ceiling/, 'the record holds codes, never the post text');
   });
 
-  test('Q2: a provider picture that decodes but is BLANK is refused (MEDIA_INVALID): nothing stored, nothing attached, the post is unchanged', async (t) => {
+  test('Q2: a provider picture that decodes but is BLANK is never used: the first design falls back to a layout without a photograph and says why (MEDIA_INVALID)', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const pub = await seedPost();
     const flat = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#f5f5f5' } }).png().toBuffer();
     const r = await gen(mockImageProvider({ behavior: () => flat }), pub);
-    assert.equal(r.generation.status, 'failed');
-    assert.equal(r.generation.failure.code, 'MEDIA_INVALID');
-    assert.deepEqual(await listProjectMedia(pid), []);
-    const after = await row(pub.id);
-    assert.deepEqual([after.media, after.designVersion, after.approvalState], [[], 1, 'content_approved']);
+    assert.equal(r.generation.status, 'ready');
+    assert.equal(r.generation.creative.fallback.code, 'MEDIA_INVALID');
+    assert.equal(r.generation.creative.layoutId, 'statement_quote');
+    assert.equal((await listProjectMedia(pid)).length, 1, 'the finished design only: the blank picture is not stored');
   });
 
   test('Q3: a FAILED regeneration keeps the previous successful design: same file, same version, same approval state - and the file is still on disk', async (t) => {
@@ -1076,6 +1097,142 @@ describe('AI design generation (real MongoDB + sharp + storage, scripted provide
     assert.equal(record.model, 'mock-image-model');
     assert.equal(record.creative.layoutId, 'photo_hero');
     assert.deepEqual([(await row(pub.id)).designVersion, (await row(pub.id)).approvalState], [2, 'design_review']);
+  });
+
+
+  // ── the CONCEPT pipeline (creative brief -> image -> overlay -> QC), Claude scripted ─────────────────────────────
+  const CONCEPT = (over = {}) => ({
+    format: 'single_image', big_idea: 'A toothbrush resting on a sunlit bathroom shelf: the smallest daily habit that keeps a family smiling.',
+    hook_headline: 'Small habit, big smile.', subline: 'Your check-up keeps it that way.', cta: 'Book your visit', slides: [], visual_style: 'photo', layout: 'full_bleed_bottom', image_labels: [],
+    headline_candidates: ['Small habit, big smile.', 'Two minutes that protect your smile.', 'Healthy smiles start at the sink.', 'The habit your teeth thank you for.', 'Brush well, smile often.'],
+    image_prompt: 'A single bamboo toothbrush standing in a clear glass on a pale wooden bathroom shelf, soft morning light from a window on the left, shallow depth of field, '
+      + 'warm natural colours with deep blue accents, calm and uncluttered, the lower 40% of the frame is soft out-of-focus wall for the headline.',
+    why_it_works: 'Specific, warm and calm instead of a generic clinic.', ...over,
+  });
+  // the headline judge scores every candidate (the first one best); every other call is the brief / QC under test
+  const judge = (req) => ({ sets: (req.user.match(/<set id="([^"]+)"[^>]*>\n([\s\S]*?)\n<\/set>/g) || []).map((block) => {
+    const [, id, body] = block.match(/<set id="([^"]+)"[^>]*>\n([\s\S]*?)\n<\/set>/);
+    return { id, scores: body.split('\n').map((l, i) => ({ headline: l.replace(/^- /, ''), natural: i === 0 ? 5 : 4, clear: 5, fits: 5, issue: '' })) };
+  }) });
+  const claude = (parsedFor) => {
+    const calls = [];
+    return {
+      calls,
+      async generateStructured(req) {
+        if (req.tool?.name === 'judge_headlines') return { parsed: judge(req), model: 'claude-sonnet-4-6', usage: { inputTokens: 300, outputTokens: 100 }, durationMs: 2 };
+        calls.push(req);
+        const parsed = await parsedFor(req, calls.length);
+        return { parsed, model: 'claude-sonnet-4-6', usage: { inputTokens: 1200, outputTokens: 400 }, durationMs: 3 };
+      },
+    };
+  };
+  const QC_OK = (score = 8) => ({ score, readable_at_phone_size: true, spelling_errors: [], word_count: 12, matches_big_idea: true, ai_artifacts: [], looks_stock_or_template: false, on_brand: true, invented_facts: [], cut_off_text: false, issues: score >= 7 ? [] : ['the picture is too busy behind the headline'] });
+
+  test('C1: concept design: brief, exact image prompt, model ids, size, QC and cost are stored on the version; the post goes to design_review', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const pub = await seedPost();
+    const brief = claude(async () => ({ concepts: [CONCEPT()] }));
+    const qc = claude(async () => QC_OK(8));
+    setBriefProviderOverride(brief);
+    setQualityProviderOverride(qc);
+    const provider = mockImageProvider();
+    const r = await gen(provider, pub);
+    assert.equal(r.success, true, JSON.stringify(r));
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r.generation));
+    assert.equal(brief.calls.length, 1);
+    assert.equal(qc.calls.length, 1);
+    assert.equal(provider.calls.length, 1);
+    assert.equal(provider.calls[0].size, '1088x1360');
+    assert.match(provider.calls[0].prompt, /Absolutely no text/);
+
+    const rec = await SocialDesignGeneration.findById(r.generation.id).lean();
+    assert.equal(rec.creative.pipeline, 'concept');
+    assert.equal(rec.creative.concept.layout, 'full_bleed_bottom');
+    assert.equal(rec.creative.concept.hook_headline, 'Small habit, big smile.');
+    assert.equal(rec.creative.imagePrompt, provider.calls[0].prompt);
+    assert.equal(rec.creative.image.model, 'mock-image-model');
+    assert.equal(rec.creative.image.size, '1088x1360');
+    assert.equal(rec.creative.qc.score, 8);
+    assert.equal(rec.creative.qc.passed, true);
+    assert.deepEqual(rec.cost.calls.map((c) => c.step), ['brief', 'headline_judge', 'image', 'quality_check']);
+    assert.equal(typeof rec.cost.usd, 'number');
+    assert.ok(rec.cost.usd > 0);
+    assert.equal(r.generation.creative.pipeline, 'concept');
+    assert.equal(r.generation.creative.qc.score, 8);
+    assert.equal(r.generation.costUsd, rec.cost.usd);
+    assert.equal((await row(pub.id)).approvalState, 'design_review');
+    assert.equal(captured.some((l) => l.includes('Small habit, big smile') || l.includes('bamboo toothbrush')), false, 'no brief text or prompt in the logs');
+  });
+
+  test('C2: QC below 7 -> exactly one new image, the better result kept', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const pub = await seedPost();
+    setBriefProviderOverride(claude(async () => ({ concepts: [CONCEPT()] })));
+    setQualityProviderOverride(claude(async (_req, n) => QC_OK(n === 1 ? 5 : 8)));
+    const provider = mockImageProvider();
+    const r = await gen(provider, pub);
+    assert.equal(r.generation.status, 'ready');
+    assert.equal(provider.calls.length, 2);
+    assert.match(provider.calls[1].prompt, /Fix these problems of the previous attempt/);
+    const rec = await SocialDesignGeneration.findById(r.generation.id).lean();
+    assert.equal(rec.creative.qc.score, 8);
+    assert.equal(rec.creative.qc.attempts, 2);
+    assert.deepEqual(rec.cost.calls.map((c) => c.step), ['brief', 'headline_judge', 'image', 'quality_check', 'image_picture_retry', 'quality_check']);
+  });
+
+  test('C3: the brief cannot be made -> the rule-based design, noted as concept_fallback, nothing lost', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const pub = await seedPost();
+    setBriefProviderOverride(claude(async () => { throw Object.assign(new Error('x'), { code: 'CLAUDE_BAD_OUTPUT' }); }));
+    setQualityProviderOverride(claude(async () => QC_OK()));
+    const provider = mockImageProvider();
+    const r = await gen(provider, pub);
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r.generation));
+    const rec = await SocialDesignGeneration.findById(r.generation.id).lean();
+    assert.equal(rec.creative.pipeline, 'rules');
+    assert.ok(rec.creative.notes.includes('concept_fallback'));
+    assert.equal((await row(pub.id)).approvalState, 'design_review');
+    assert.ok(captured.some((l) => l.includes('design_concept_fallback')));
+  });
+
+  test('C4: an invented figure in the brief is rejected (repaired once, then the rules design)', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const pub = await seedPost();
+    const brief = claude(async () => ({ concepts: [CONCEPT({ hook_headline: '93% fewer cavities.', headline_candidates: ['93% fewer cavities.', ...CONCEPT().headline_candidates.slice(1)] })] }));
+    setBriefProviderOverride(brief);
+    setQualityProviderOverride(claude(async () => QC_OK()));
+    const r = await gen(mockImageProvider(), pub);
+    assert.equal(r.generation.status, 'ready');
+    assert.equal(brief.calls.length, 2, 'one repair pass');
+    assert.equal((await SocialDesignGeneration.findById(r.generation.id).lean()).creative.pipeline, 'rules');
+  });
+
+  test('C5: SOCIAL_AI_DESIGN_PIPELINE=rules switches the concept pipeline off', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    process.env.SOCIAL_AI_DESIGN_PIPELINE = 'rules';
+    const pub = await seedPost();
+    const brief = claude(async () => ({ concepts: [CONCEPT()] }));
+    setBriefProviderOverride(brief);
+    const r = await gen(mockImageProvider(), pub);
+    assert.equal(r.generation.status, 'ready');
+    assert.equal(brief.calls.length, 0);
+    const rec = await SocialDesignGeneration.findById(r.generation.id).lean();
+    assert.equal(rec.creative.pipeline, 'rules');
+    assert.equal(rec.creative.notes.includes('concept_fallback'), false);
+  });
+
+  test('C6: rotation: the latest concept design is sent to the brief, newest first', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    setQualityProviderOverride(claude(async () => QC_OK()));
+    setBriefProviderOverride(claude(async () => ({ concepts: [CONCEPT()] })));
+    const first = await seedPost();
+    assert.equal((await gen(mockImageProvider(), first)).generation.status, 'ready');
+    const brief = claude(async () => ({ concepts: [CONCEPT({ visual_style: '3d_render', layout: 'split_image_text' })] }));
+    setBriefProviderOverride(brief);
+    const second = await seedPost({ content: 'Flossing once a day keeps gums healthy. Ask us how at your next visit' });
+    assert.equal((await gen(mockImageProvider(), second)).generation.status, 'ready');
+    const user = typeof brief.calls[0].user === 'string' ? brief.calls[0].user : JSON.stringify(brief.calls[0].user);
+    assert.match(user, /style=photo layout=full_bleed_bottom/);
   });
 
   test('P5: concurrent requests for a list design with no provider still make exactly one generation, one image, one new version', async (t) => {

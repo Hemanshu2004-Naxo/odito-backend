@@ -57,7 +57,7 @@ export const LIMITS = Object.freeze({
   trending: { max: 6, topic: 90, why: 160, angle: 140 },
   hooks: { min: 6, max: 12, hook: 150 },
   competitor: { namesMax: 10, name: 100, item: 180, itemsMax: 4 },
-  platform: { role: 160, contentType: 40, contentTypesMin: 1, contentTypesMax: 5, postsPerWeekMax: 21, behavior: 160, guideline: 140, guidelinesMax: 3 },
+  platform: { role: 240, contentType: 40, contentTypesMin: 1, contentTypesMax: 5, postsPerWeekMax: 21, behavior: 160, guideline: 140, guidelinesMax: 3 },
   tone: { primary: 120, secondary: 60, secondaryMax: 3, guideline: 140, guidelinesMin: 1, guidelinesMax: 4, avoid: 100, avoidMax: 10 },
   posting: { postsPerWeekMax: 28, rangeMax: 14, window: 80, windowsMax: 3 },
   hashtags: { approach: 240, countMax: 30, category: 80, categoriesMax: 5 },
@@ -282,11 +282,14 @@ export function fitText(text, max) {
   const clean = (s) => s.replace(/[\s,;:–—-]+$/, '').replace(/\s+(and|or|but|with|for|to|of|in|on|at|the|a|an|&)$/i, '').trim();
   const lastSentence = Math.max(head.lastIndexOf('. '), head.lastIndexOf('! '), head.lastIndexOf('? '));
   if (lastSentence >= floor) return head.slice(0, lastSentence + 1).trim();
-  const lastClause = Math.max(head.lastIndexOf(', '), head.lastIndexOf('; '), head.lastIndexOf(': '), head.lastIndexOf(' – '), head.lastIndexOf(' — '), head.lastIndexOf(' - '));
-  if (lastClause >= floor) return clean(head.slice(0, lastClause));
-  const lastSpace = head.lastIndexOf(' ');
-  if (lastSpace >= floor) return clean(head.slice(0, lastSpace));
-  return text.slice(0, max).trim();
+  // Anything else is a fragment ("... through visual, high-value"): it ends with an ellipsis, so a reader can see the text was shortened
+  // instead of reading a sentence that stops mid-thought. One character is kept free for it.
+  const room = head.slice(0, max); // (max - 1 visible characters + the ellipsis)
+  const lastClause = Math.max(room.lastIndexOf(', '), room.lastIndexOf('; '), room.lastIndexOf(': '), room.lastIndexOf(' – '), room.lastIndexOf(' — '), room.lastIndexOf(' - '));
+  if (lastClause >= floor) return `${clean(room.slice(0, lastClause))}…`;
+  const lastSpace = room.lastIndexOf(' ');
+  if (lastSpace >= floor) return `${clean(room.slice(0, lastSpace))}…`;
+  return `${text.slice(0, max - 1).trim()}…`;
 }
 
 class Collector {

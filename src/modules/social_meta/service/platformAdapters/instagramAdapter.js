@@ -57,12 +57,96 @@ async function waitForContainerReady(creationId, pageAccessToken) {
   return { ready: false, error: { code: 'INSTAGRAM_PROCESSING_TIMEOUT', message: 'Meta is still processing this media — try publishing again in a moment.', category: 'TRANSIENT', retryable: true, outcome: 'not_published', accountAction: 'none', requiresReconnect: false } };
 }
 
+/** Instagram's carousel limits: 2-10 items. Odito's carousels are images only. */
+export const INSTAGRAM_CAROUSEL_MIN = 2;
+export const INSTAGRAM_CAROUSEL_MAX = 10;
+
+/**
+ * CAROUSEL: one child container per image (is_carousel_item), each checked ready, then the parent CAROUSEL container with the children
+ * and the caption, checked ready, then media_publish of the parent. Only media_publish creates the post, so only a lost answer THERE is
+ * an unknown outcome; every earlier failure is a plain "not published" (a retry makes fresh containers).
+ */
+async function publishCarousel({ igAccountId, pageAccessToken, content, media }) {
+  if (media.length < INSTAGRAM_CAROUSEL_MIN || media.length > INSTAGRAM_CAROUSEL_MAX) {
+    return { success: false, externalPostId: null, error: { code: 'MEDIA_NOT_SUPPORTED', message: `An Instagram carousel needs ${INSTAGRAM_CAROUSEL_MIN} to ${INSTAGRAM_CAROUSEL_MAX} images.` } };
+  }
+  if (media.some((m) => m?.type !== 'image')) {
+    return { success: false, externalPostId: null, error: { code: 'MEDIA_NOT_SUPPORTED', message: 'Odito carousels are images only.' } };
+  }
+  if (media.some((m) => !isPubliclyReachableUrl(m.url))) {
+    LoggerUtil.service('InstagramAdapter', 'publish', 'media_url_unreachable', { carousel: true });
+    return { success: false, externalPostId: null, error: { code: 'INSTAGRAM_MEDIA_URL_UNREACHABLE', message: 'Instagram could not access the uploaded media. Publishing requires a publicly reachable HTTPS media URL.' } };
+  }
+  const children = [];
+  for (const item of media) {
+    // eslint-disable-next-line no-await-in-loop
+    const child = await metaApiService.request({
+      method: 'POST', path: `/${igAccountId}/media`, params: { image_url: item.url, is_carousel_item: true },
+      accessToken: pageAccessToken, context: 'instagram_create_carousel_item', timeoutMs: getPublishConfig().publishTimeoutMs,
+    });
+    if (!child.success) return { success: false, externalPostId: null, error: normalizeFailure(child, 'create_container') };
+    const id = child.data?.id || null;
+    if (!id) return { success: false, externalPostId: null, error: { code: 'INSTAGRAM_PUBLISH_FAILED', message: 'Meta accepted a carousel image but returned no container ID.' } };
+    // eslint-disable-next-line no-await-in-loop
+    const ready = await waitForContainerReady(id, pageAccessToken);
+    if (!ready.ready) return { success: false, externalPostId: null, error: ready.error };
+    children.push(id);
+  }
+  const parent = await metaApiService.request({
+    method: 'POST', path: `/${igAccountId}/media`, params: { media_type: 'CAROUSEL', children: children.join(','), caption: content || '' },
+    accessToken: pageAccessToken, context: 'instagram_create_carousel_container', timeoutMs: getPublishConfig().publishTimeoutMs,
+  });
+  if (!parent.success) return { success: false, externalPostId: null, error: normalizeFailure(parent, 'create_container') };
+  const creationId = parent.data?.id || null;
+  if (!creationId) return { success: false, externalPostId: null, error: { code: 'INSTAGRAM_PUBLISH_FAILED', message: 'Meta accepted the carousel but returned no container ID.' } };
+  const readiness = await waitForContainerReady(creationId, pageAccessToken);
+  if (!readiness.ready) return { success: false, externalPostId: null, error: readiness.error };
+  return finishPublish({ igAccountId, pageAccessToken, creationId, carousel: true, items: children.length });
+}
+
+/** The final, post-creating step: media_publish of a ready container. */
+async function finishPublish({ igAccountId, pageAccessToken, creationId, carousel = false, items = 1 }) {
+  const publishResult = await metaApiService.request({
+    method: 'POST', path: `/${igAccountId}/media_publish`, params: { creation_id: creationId },
+    accessToken: pageAccessToken, context: 'instagram_publish_media', timeoutMs: getPublishConfig().publishTimeoutMs,
+  });
+  if (!publishResult.success) return { success: false, externalPostId: null, error: normalizeFailure(publishResult, 'publish_container') };
+  const externalPostId = publishResult.data?.id || null;
+  if (!externalPostId) {
+    LoggerUtil.service('InstagramAdapter', 'publish', 'malformed_publish_response', {});
+    return { success: false, externalPostId: null, error: { code: 'PUBLISH_OUTCOME_UNKNOWN', message: 'Meta accepted the publish request but returned no media ID, so Odito cannot confirm whether it was published.', category: 'UNKNOWN_OUTCOME', retryable: true, outcome: 'unknown', accountAction: 'none', requiresReconnect: false } };
+  }
+  LoggerUtil.service('InstagramAdapter', 'publish', 'completed', { igAccountId, carousel, items });
+  return { success: true, externalPostId, error: null };
+}
+
+/** What a publish WOULD send, in order, without calling Meta (dry run). No token, no caption text. */
+export function planPublish({ account, media }) {
+  const ig = account?.instagramBusinessAccountId || account?.platformAccountId || '{ig-user-id}';
+  const list = Array.isArray(media) ? media : [];
+  if (list.length > 1) {
+    return [
+      ...list.map((m, i) => ({ step: `carousel_item_${i + 1}`, method: 'POST', path: `/${ig}/media`, params: { image_url: m.url, is_carousel_item: true } })),
+      ...list.map((_, i) => ({ step: `wait_item_${i + 1}`, method: 'GET', path: '/{child-container-id}', params: { fields: 'status_code' } })),
+      { step: 'carousel_container', method: 'POST', path: `/${ig}/media`, params: { media_type: 'CAROUSEL', children: '{child ids}', caption: '{caption}' } },
+      { step: 'wait_container', method: 'GET', path: '/{container-id}', params: { fields: 'status_code' } },
+      { step: 'publish', method: 'POST', path: `/${ig}/media_publish`, params: { creation_id: '{container-id}' } },
+    ];
+  }
+  const m = list[0];
+  return m ? [
+    { step: 'container', method: 'POST', path: `/${ig}/media`, params: m.type === 'video' ? { video_url: m.url, media_type: 'REELS', caption: '{caption}' } : { image_url: m.url, caption: '{caption}' } },
+    { step: 'wait_container', method: 'GET', path: '/{container-id}', params: { fields: 'status_code' } },
+    { step: 'publish', method: 'POST', path: `/${ig}/media_publish`, params: { creation_id: '{container-id}' } },
+  ] : [];
+}
+
 export async function publish({ account, content, media }) {
   if (!Array.isArray(media) || media.length === 0) {
     return { success: false, externalPostId: null, error: { code: 'MEDIA_REQUIRED', message: 'Instagram requires a photo or video.' } };
   }
   if (media.length > 1) {
-    return { success: false, externalPostId: null, error: { code: 'MEDIA_NOT_SUPPORTED', message: 'Only a single image or video is supported per Instagram post in this phase — carousels are not yet supported.' } };
+    return publishCarousel({ igAccountId: account.instagramBusinessAccountId || account.platformAccountId, pageAccessToken: account.accessToken, content, media });
   }
 
   const igAccountId = account.instagramBusinessAccountId || account.platformAccountId;
@@ -193,4 +277,4 @@ export async function reconcile({ account, content, since, excludeIds = null }) 
   return windowCovered ? { status: 'not_found' } : { status: 'unknown', reason: 'WINDOW_NOT_COVERED' };
 }
 
-export default { publish, reconcile };
+export default { publish, reconcile, planPublish };

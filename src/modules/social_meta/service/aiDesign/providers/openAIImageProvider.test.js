@@ -23,7 +23,8 @@ afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete pro
 
 const make = (responder, options = {}) => {
   const fetchFn = scriptedFetch(responder);
-  const provider = new OpenAIImageProvider({ clientFactory: clientFactoryFor(fetchFn, options.timeoutMs), sleep: noSleep, ...options });
+  // the fallback model is off here (these tests are about ONE model's retries); its rules: openAIImageFallback.test.js
+  const provider = new OpenAIImageProvider({ clientFactory: clientFactoryFor(fetchFn, options.timeoutMs), sleep: noSleep, fallbackModel: null, ...options });
   return { provider, fetchFn };
 };
 let png;
@@ -41,7 +42,7 @@ describe('OpenAIImageProvider - the request', () => {
     assert.equal('response_format' in body, false, 'GPT Image models reject response_format');
     assert.equal('user' in body, false, 'no user/project id is sent to the provider');
     assert.ok(Buffer.isBuffer(r.buffer) && r.buffer.length > 0);
-    assert.deepEqual(r.usage, { inputTokens: 60, outputTokens: 1056 });
+    assert.deepEqual(r.usage, { inputTokens: 60, outputTokens: 1056, textInputTokens: 60, imageInputTokens: 0, imageOutputTokens: 1056 });
     assert.equal(r.model, DEFAULT_DESIGN_MODEL);
     assert.equal(r.attempts, 1);
   });
@@ -179,15 +180,39 @@ describe('OpenAIImageProvider - building on the real product photo', () => {
   const imageRequests = (fetchFn) => fetchFn.requests.filter((q) => q.url.includes('/images/'));
   const photo = async (n = 1) => ({ buffer: await makeImage({ width: 64, height: 64, format: 'jpeg' }), mimeType: 'image/jpeg', n });
 
-  test('12: with reference photos the call is the Images API EDIT endpoint, same model / quality / size, the photos as image parts, and high input fidelity', async () => {
-    const { provider, fetchFn } = make(okImage);
+  test('12b: a model the key cannot use (retired: 400 "does not exist", param model) -> MISCONFIGURED / model_not_found, ONE request, diagnostics for the log (not serialised), and it is logged with model, status, prompt length and size', async () => {
+    const { provider, fetchFn } = make(() => openAIErrorResponse(400, "The model 'gpt-image-1' does not exist.", { code: 'invalid_value', param: 'model', type: 'image_generation_user_error' }));
+    const logged = [];
+    const realError = console.error;
+    const realLog = console.log;
+    console.error = (...a) => logged.push(a.map(String).join(' '));
+    console.log = (...a) => logged.push(a.map(String).join(' '));
+    try {
+      await assert.rejects(() => provider.generateImage({ prompt: 'A calm studio scene', size: '1024x1536' }), (e) => {
+        assert.equal(e.code, PROVIDER_ERROR.MISCONFIGURED);
+        assert.equal(e.reason, 'model_not_found');
+        assert.deepEqual(e.diagnostics, { status: 400, providerCode: 'invalid_value', providerType: 'image_generation_user_error', param: 'model' });
+        assert.equal(JSON.stringify(e).includes('does not exist'), false, 'the provider text is not on the error');
+        return true;
+      });
+    } finally { console.error = realError; console.log = realLog; }
+    assert.equal(fetchFn.requests.length, 1, 'a configuration problem is never retried');
+    const line = logged.find((l) => l.includes('image_request_failed'));
+    assert.ok(line, 'the failure is logged');
+    for (const part of ['openai', 'model_not_found', '400', 'invalid_value', '1024x1536', 'promptLength', 'SOCIAL_AI_DESIGN_MODEL']) assert.ok(line.includes(part), part);
+    assert.equal(line.includes(KEY), false, 'never the key');
+    assert.equal(line.includes('A calm studio scene'), false, 'never the prompt');
+  });
+
+  test('12: with reference photos the call is the Images API EDIT endpoint, same model / quality / size, the photos as image parts, and high input fidelity (gpt-image-1 family)', async () => {
+    const { provider, fetchFn } = make(okImage, { model: 'gpt-image-1' });
     const r = await provider.generateImage({ prompt: 'Build on the real product', size: '1024x1024', referenceImages: [await photo(), await photo()] });
     assert.ok(Buffer.isBuffer(r.buffer) && r.buffer.length > 0);
     assert.equal(imageRequests(fetchFn).length, 1);
     const { url, body } = imageRequests(fetchFn)[0];
     assert.equal(url, 'https://api.openai.com/v1/images/edits');
     assert.equal(typeof body.getAll, 'function', 'a multipart request');
-    assert.equal(body.get('model'), DEFAULT_DESIGN_MODEL);
+    assert.equal(body.get('model'), 'gpt-image-1');
     assert.equal(body.get('prompt'), 'Build on the real product');
     assert.equal(body.get('size'), '1024x1024');
     assert.equal(body.get('quality'), DESIGN_QUALITY);

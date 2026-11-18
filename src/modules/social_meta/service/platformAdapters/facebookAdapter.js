@@ -21,9 +21,64 @@ import { getPublishConfig } from '../socialPublishConfig.js';
  * to poll for here (unlike Instagram's container→publish flow, where the
  * SECOND step cannot succeed until Meta's processing finishes).
  */
+/** Facebook multi-photo post limits used by Odito (images only). */
+export const FACEBOOK_MULTI_PHOTO_MAX = 10;
+
+/**
+ * MULTI-PHOTO POST: every image uploaded UNPUBLISHED (/photos published=false - nothing appears on the Page), then ONE /feed post with all
+ * of them as attached_media, in order. Only the /feed call creates the post, so only a lost answer there is an unknown outcome; a failed
+ * upload is a plain "not published" (the unpublished photos are not visible).
+ */
+async function publishMultiPhoto({ pageId, pageAccessToken, content, media }) {
+  if (media.length > FACEBOOK_MULTI_PHOTO_MAX) return { success: false, externalPostId: null, error: { code: 'MEDIA_NOT_SUPPORTED', message: `A Facebook multi-photo post takes at most ${FACEBOOK_MULTI_PHOTO_MAX} images.` } };
+  if (media.some((m) => m?.type !== 'image')) return { success: false, externalPostId: null, error: { code: 'MEDIA_NOT_SUPPORTED', message: 'A multi-photo post takes images only.' } };
+  if (media.some((m) => !isPubliclyReachableUrl(m.url))) {
+    LoggerUtil.service('FacebookAdapter', 'publish', 'media_url_unreachable', { multiPhoto: true });
+    return { success: false, externalPostId: null, error: { code: 'FACEBOOK_MEDIA_URL_UNREACHABLE', message: 'Facebook could not access the uploaded media. Publishing requires a publicly reachable HTTPS media URL.' } };
+  }
+  const ids = [];
+  for (const item of media) {
+    // eslint-disable-next-line no-await-in-loop
+    const up = await metaApiService.request({
+      method: 'POST', path: `/${pageId}/photos`, params: { url: item.url, published: false },
+      accessToken: pageAccessToken, context: 'facebook_upload_unpublished_photo', timeoutMs: getPublishConfig().publishTimeoutMs,
+    });
+    if (!up.success) {
+      const c = classifyMetaFailure(up, { platform: 'facebook', finalPublishStep: false });
+      LoggerUtil.service('FacebookAdapter', 'upload_photo', 'failed', { status: up.status, category: c.category, code: c.code });
+      return { success: false, externalPostId: null, error: toAdapterError(c) };
+    }
+    if (!up.data?.id) return { success: false, externalPostId: null, error: { code: 'FACEBOOK_PUBLISH_FAILED', message: 'Meta accepted a photo but returned no ID.' } };
+    ids.push(up.data.id);
+  }
+  const attached = Object.fromEntries(ids.map((id, i) => [`attached_media[${i}]`, JSON.stringify({ media_fbid: id })]));
+  const result = await metaApiService.request({
+    method: 'POST', path: `/${pageId}/feed`, params: { message: content || '', ...attached },
+    accessToken: pageAccessToken, context: 'facebook_publish_multi_photo', timeoutMs: getPublishConfig().publishTimeoutMs,
+  });
+  return finalizeResult(result, ['id']);
+}
+
+/** What a publish WOULD send, in order, without calling Meta (dry run). No token, no caption text. */
+export function planPublish({ account, media }) {
+  const page = account?.pageId || account?.platformAccountId || '{page-id}';
+  const list = Array.isArray(media) ? media : [];
+  if (list.length > 1) {
+    return [
+      ...list.map((m, i) => ({ step: `upload_photo_${i + 1}`, method: 'POST', path: `/${page}/photos`, params: { url: m.url, published: false } })),
+      { step: 'publish', method: 'POST', path: `/${page}/feed`, params: { message: '{caption}', ...Object.fromEntries(list.map((_, i) => [`attached_media[${i}]`, `{"media_fbid":"{photo-${i + 1}-id}"}`])) } },
+    ];
+  }
+  const m = list[0];
+  if (!m) return [{ step: 'publish', method: 'POST', path: `/${page}/feed`, params: { message: '{caption}' } }];
+  return m.type === 'video'
+    ? [{ step: 'publish', method: 'POST', path: `/${page}/videos`, params: { file_url: m.url, description: '{caption}' } }]
+    : [{ step: 'publish', method: 'POST', path: `/${page}/photos`, params: { url: m.url, caption: '{caption}', published: true } }];
+}
+
 export async function publish({ account, content, media }) {
   if (Array.isArray(media) && media.length > 1) {
-    return { success: false, externalPostId: null, error: { code: 'MEDIA_NOT_SUPPORTED', message: 'Only a single image or video is supported per Facebook post in this phase — albums are not yet supported.' } };
+    return publishMultiPhoto({ pageId: account.pageId || account.platformAccountId, pageAccessToken: account.accessToken, content, media });
   }
 
   const pageId = account.pageId || account.platformAccountId;
@@ -294,4 +349,4 @@ export async function getPermalink({ account, externalPostId }) {
   return permalink ? { permalink, code: null } : { permalink: null, code: 'INVALID_PERMALINK' };
 }
 
-export default { publish, remove, reconcile, getPermalink };
+export default { publish, remove, reconcile, getPermalink, planPublish };

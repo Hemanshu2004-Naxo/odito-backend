@@ -12,8 +12,46 @@ const num = (v, dflt) => {
   return Number.isFinite(n) && n > 0 ? n : dflt;
 };
 
-/** Fallback only when SOCIAL_AI_DESIGN_MODEL is unset. Image models are retired/renamed often: set it explicitly in production. */
-export const DEFAULT_DESIGN_MODEL = 'gpt-image-1';
+/**
+ * Fallback only when SOCIAL_AI_DESIGN_MODEL is unset. Image models are retired/renamed often: set it explicitly in production.
+ * The startup check (imageModelCheck.js) warns when this model is not available to the key or is listed in IMAGE_MODEL_SHUTDOWNS.
+ */
+export const DEFAULT_DESIGN_MODEL = 'gpt-image-2.6-flare';
+/**
+ * The model used ONLY when the configured one is not available (retired / not enabled: "model not found") or the provider answers
+ * 5xx after its retries. Never on a content or safety refusal. Every use is logged as a warning. Set to "none" to disable.
+ */
+export const DEFAULT_FALLBACK_DESIGN_MODEL = 'gpt-image-2.5-flare';
+export const FALLBACK_DESIGN_MODEL = process.env.SOCIAL_AI_DESIGN_FALLBACK_MODEL === 'none' ? null : (process.env.SOCIAL_AI_DESIGN_FALLBACK_MODEL || DEFAULT_FALLBACK_DESIGN_MODEL);
+
+/**
+ * Concept designs (the creative-brief pipeline) are made at the platform's feed size. gpt-image models need both sides divisible by
+ * 16, so the provider is asked for the nearest 16-multiple of the exact ratio and the result is scaled to the delivered size.
+ *   portrait 4:5   request 1088x1360 -> deliver 1080x1350 (Facebook / Instagram feed default)
+ *   square   1:1   request 1088x1088 -> deliver 1080x1080 (when asked)
+ */
+export const CONCEPT_SIZES = Object.freeze({
+  portrait: Object.freeze({ request: '1088x1360', width: 1080, height: 1350 }),
+  square: Object.freeze({ request: '1088x1088', width: 1080, height: 1080 }),
+});
+
+/**
+ * OpenAI image-model shutdown dates, as published on the deprecations page:
+ *   https://developers.openai.com/api/docs/deprecations   (checked 2026-11-17)
+ * Update this list when OpenAI announces a new deprecation. The startup check logs a warning when the configured model is on it
+ * (and an error once the date has passed), so a retirement never fails silently again. Dates are the shutdown day (UTC).
+ */
+export const IMAGE_MODEL_SHUTDOWNS = Object.freeze([
+  { model: 'gpt-image-1', shutdown: '2026-10-23', replacement: 'gpt-image-2.5-flare / gpt-image-2.5-sunburst' },
+  { model: 'gpt-image-1-mini', shutdown: '2026-12-01', replacement: 'gpt-image-2.6-flare / gpt-image-2.6-sunburst' },
+  { model: 'gpt-image-1.5', shutdown: '2026-12-01', replacement: 'gpt-image-2.6-flare / gpt-image-2.6-sunburst' },
+  { model: 'gpt-image-1.5-2025-12-16', shutdown: '2026-12-01', replacement: 'gpt-image-2.6-flare / gpt-image-2.6-sunburst' },
+  { model: 'chatgpt-image-latest', shutdown: '2026-12-01', replacement: 'gpt-image-2.6-flare / gpt-image-2.6-sunburst' },
+  { model: 'gpt-image-2', shutdown: '2027-02-10', replacement: 'gpt-image-2.6-flare / gpt-image-2.6-sunburst' },
+  { model: 'gpt-image-2-2026-04-21', shutdown: '2027-02-10', replacement: 'gpt-image-2.6-flare / gpt-image-2.6-sunburst' },
+  { model: 'dall-e-2', shutdown: '2026-05-12', replacement: 'gpt-image-2' },
+  { model: 'dall-e-3', shutdown: '2026-05-12', replacement: 'gpt-image-2' },
+]);
 export const DESIGN_MODEL = process.env.SOCIAL_AI_DESIGN_MODEL || DEFAULT_DESIGN_MODEL;
 /** low | medium | high | auto. Medium is the cost/quality balance; the provider rejects anything else. */
 export const DESIGN_QUALITY = ['low', 'medium', 'high', 'auto'].includes(process.env.SOCIAL_AI_DESIGN_QUALITY) ? process.env.SOCIAL_AI_DESIGN_QUALITY : 'medium';

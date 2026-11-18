@@ -8,6 +8,7 @@ import SocialAIUsage from '../../model/SocialAIUsage.js';
 import { attemptRecord, flattenAttempts, describeProviderFailure } from '../aiStrategy/strategyDiagnostics.js';
 import { buildCalendarToolSchema, validateCalendarBatch, applyVariety, varietyCarryFromItems } from './calendarOutputSchema.js';
 import { buildSystemPrompt, buildUserPrompt } from './calendarPromptBuilder.js';
+import { strategyConformance } from './calendarPlanner.js';
 import {
   getProvider, planSlots, seedForCalendar, buildPlanningContext, finalizeItem, chunk, planSummaryOf, calendarFailureFor, CALENDAR_FAILURE_MESSAGES, MAX_REPAIR_FEEDBACK, toId, fail,
 } from './calendarPlanningContext.js';
@@ -289,8 +290,18 @@ async function execute(doc, lock, heartbeat) {
     }
 
     // Every slot saved? Then the calendar is ready: the summary is computed from the items, and "ready" is a conditional update by lock owner.
-    const items = await SocialContentCalendarItem.find({ calendar_id: calendarId, slot: { $type: 'number' } }).select('contentPillar platforms').lean();
+    const items = await SocialContentCalendarItem.find({ calendar_id: calendarId, slot: { $type: 'number' } }).select('slot contentDate contentPillar platforms').lean();
     if (items.length !== slots.length) throw coded('GENERATION_INCOMPLETE', `expected ${slots.length} posts, found ${items.length}`);
+    // The plan is enforced in code, not trusted to the prompt: every saved post must sit on its planned date and platform(s), and the whole
+    // calendar must follow the strategy's posting days and platform split. A calendar that does not is never shown as ready.
+    const bySlot = new Map(slots.map((s) => [s.index, s]));
+    const drifted = items.filter((it) => {
+      const s = bySlot.get(it.slot);
+      return !s || s.date !== it.contentDate || (s.platforms && (s.platforms.length !== it.platforms.length || s.platforms.some((p) => !it.platforms.includes(p))));
+    });
+    if (drifted.length) throw coded('GENERATION_FAILED', `${drifted.length} saved posts do not match the planned dates or platforms`);
+    const conformance = strategyConformance(items.map((it) => ({ date: it.contentDate, platforms: it.platforms })), { config: doc.config, strategy: ctx.strategy });
+    if (!conformance.follows) throw coded('GENERATION_FAILED', `calendar does not follow the strategy: ${conformance.issues.map((i) => i.code).join(', ')}`);
     const summary = planSummaryOf(items, distribution);
     await checkpoint();
     const finishedAt = new Date();

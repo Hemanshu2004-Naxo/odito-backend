@@ -1,11 +1,12 @@
 import crypto from 'crypto';
 import SocialContentCalendar from '../../model/SocialContentCalendar.js';
 import SocialContentCalendarItem from '../../model/SocialContentCalendarItem.js';
+import SocialAIStrategy from '../../model/SocialAIStrategy.js';
 import SeoProject from '../../../app_user/model/SeoProject.js';
 import { resolveSocialBusinessProfile } from '../socialBusinessProfileResolver.js';
 import { generationBlockers, buildProfileData } from '../aiStrategy/profileSnapshot.js';
 import { getLiveProfileHash } from '../aiStrategy/socialAIStrategyService.js';
-import { validateCalendarInput, previewCalendarPlan } from './calendarPlanner.js';
+import { validateCalendarInput, previewCalendarPlan, strategyConformance } from './calendarPlanner.js';
 import { CALENDAR_PROMPT_VERSION } from './calendarPromptBuilder.js';
 import {
   CALENDAR_LEASE_MS, CALENDAR_MIN_DAYS, CALENDAR_MAX_DAYS, CALENDAR_MIN_MONTHS, CALENDAR_MAX_MONTHS, CALENDAR_MAX_POSTS,
@@ -195,6 +196,7 @@ export async function getCalendarState(projectId, { now = new Date(), userId = n
 
   let items = [];
   let stale = null;
+  let conformance = null;
   if (current) {
     const docs = await SocialContentCalendarItem.find({ project_id: toId(projectId), calendar_id: current._id }).sort({ contentDate: 1, order: 1 }).lean();
     const publications = await loadPublicationSummaries(projectId, docs.flatMap((d) => d.publicationIds || []));
@@ -205,6 +207,9 @@ export async function getCalendarState(projectId, { now = new Date(), userId = n
       currentStrategyVersion: strategyDoc?.version || null,
       profileChanged: !!current.strategy.profileSnapshotHash && !!liveHash && liveHash !== current.strategy.profileSnapshotHash,
     };
+    // measured against the strategy the calendar was PLANNED from (not a newer one: that is what `stale` says)
+    const planStrategy = String(strategyDoc?._id) === String(current.strategy.id) ? strategyDoc : await SocialAIStrategy.findById(current.strategy.id).select('strategy').lean();
+    if (planStrategy?.strategy) conformance = strategyConformance(items, { config: current.config, strategy: planStrategy.strategy });
   }
 
   // An unfinished calendar (stopped after saving some posts) is shown as what it is: read-only posts, how far it got, and how to go on.
@@ -222,6 +227,8 @@ export async function getCalendarState(projectId, { now = new Date(), userId = n
     generation: attempt ? toApiGeneration(attempt) : null,
     partial,
     stale,
+    // does the current calendar follow its strategy's posting days and platform split? (null when there is no calendar)
+    conformance,
     strategy: strategy
       ? {
         available: true,
@@ -232,6 +239,8 @@ export async function getCalendarState(projectId, { now = new Date(), userId = n
         // the choice made when this strategy was created: the calendar form starts from it (null for a strategy saved before the wizard)
         planning: toApiPlanning(strategyDoc.planning),
         recommended: { postsPerWeek: strategy.postingStrategy?.postsPerWeek ?? null, range: strategy.postingStrategy?.postsPerWeekRange || null, days: strategy.postingStrategy?.recommendedDays || [] },
+        // posts per week per platform, as the calendar follows it
+        platformSplit: (strategy.platformStrategy || []).map((p) => ({ platform: p.platform, postsPerWeek: p.postsPerWeek })),
       }
       : { available: false },
     connectedPlatforms: connected,
@@ -272,7 +281,9 @@ async function withStrategyPlanning(projectId, input) {
 /** What a set of choices means (end date, exact post count, steps), with no AI call and no write. */
 export async function previewCalendar(rawInput, { today, userId = null, projectId = null } = {}) {
   const input = projectId ? await withStrategyPlanning(projectId, rawInput) : rawInput;
-  const result = previewCalendarPlan(input, today ? { today } : undefined);
+  // the count follows the strategy's posting days, exactly as the generation will
+  const strategyDoc = projectId ? await latestReadyStrategy(projectId) : null;
+  const result = previewCalendarPlan(input, { ...(today ? { today } : {}), recommendedDays: strategyDoc?.strategy?.postingStrategy?.recommendedDays || [] });
   if (result.error) return { success: false, error: result.error };
   if (!userId || !projectId) return { success: true, preview: result.value };
   // the same allowance /generate will enforce, read without reserving anything: the form can say so BEFORE the person clicks
@@ -329,7 +340,7 @@ export async function startCalendarGeneration(projectId, userId, rawInput = {}, 
 
   // The size of the calendar is known exactly BEFORE any AI call (the quota per week is the server's, not the model's): refuse
   // an empty or oversized one here, so an expensive run never starts for a request that could not be honoured.
-  const plannedSize = previewCalendarPlan(input, today ? { today } : undefined);
+  const plannedSize = previewCalendarPlan(input, { ...(today ? { today } : {}), recommendedDays: strategy.postingStrategy?.recommendedDays || [] });
   if (plannedSize.error) return { success: false, error: plannedSize.error };
 
   // A generation whose worker died is taken over (not reported as "running" forever): only a LIVE one blocks a new request.

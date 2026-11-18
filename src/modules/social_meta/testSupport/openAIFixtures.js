@@ -22,8 +22,8 @@ export const refusalBody = () => ({
 export const incompleteBody = () => ({ ...openAIResponseBody('{"cap'), status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } });
 
 /** An OpenAI-style error response. */
-export const openAIErrorResponse = (status, message, { code = null, type = 'invalid_request_error', headers = {} } = {}) => new Response(
-  JSON.stringify({ error: { message, type, code, param: null } }),
+export const openAIErrorResponse = (status, message, { code = null, type = 'invalid_request_error', param = null, headers = {} } = {}) => new Response(
+  JSON.stringify({ error: { message, type, code, param } }),
   { status, headers: { 'content-type': 'application/json', ...headers } },
 );
 

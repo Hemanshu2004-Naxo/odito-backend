@@ -20,6 +20,8 @@ import { DESIGN_RATE_LIMIT } from '../service/aiDesign/designConfig.js';
 import { CONTENT_RATE_LIMIT } from '../service/aiContent/contentConfig.js';
 import { mockImageProvider, removeProjectMedia } from '../testSupport/designFixtures.js';
 import { providerError } from '../testSupport/aiStrategyFixtures.js';
+import { asWaitingForDesign } from '../testSupport/approvalFixtures.js';
+import { getPublication } from '../service/socialPublishingService.js';
 
 /** HTTP layer of AI design generation: wiring, status codes, cross-project blocking, rate limiting, client-controlled fields. */
 
@@ -57,8 +59,12 @@ describe('AI design routes - wiring', () => {
     assert.equal(status.layers[2], getAIDesignStatusHandler);
   });
 
-  test('2: generate, status and the four Creative Studio routes - no approve / schedule / publish / edit route', () => {
-    assert.deepEqual(routes.map((r) => `${r.methods.join()} ${r.path}`).sort(), ['get /status', 'get /studio', 'post /generate', 'post /studio/generate', 'post /studio/regenerate', 'post /studio/select']);
+  test('2: generate, status, the Creative Studio routes, carousel slides, costs and jobs - no approve / schedule / publish / edit route', () => {
+    assert.deepEqual(routes.map((r) => `${r.methods.join()} ${r.path}`).sort(), [
+      'get /costs', 'get /jobs', 'get /slides', 'get /status', 'get /studio', 'post /generate', 'post /slides/delete', 'post /slides/regenerate', 'post /slides/reorder',
+      'post /studio/generate', 'post /studio/regenerate', 'post /studio/select',
+    ]);
+    for (const r of routes) assert.doesNotMatch(r.path, /approve|schedule|publish/);
   });
 
   test('3: mounted at /social/ai-design', () => {
@@ -115,7 +121,9 @@ describe('AI design endpoints (real MongoDB, real sharp/storage, scripted provid
     fb = await SocialAccount.create({ user_id: owner, project_id: project._id, platform: 'facebook', platformAccountId: 'pgdc', platformAccountName: 'P', accountType: 'page', pageId: 'pgdc', accessToken: 'FB-SECRET-TOKEN', status: 'active', isActive: true });
     const r = await createPublication(pid, owner, { platform: 'facebook', socialAccountId: fb._id.toString(), content: 'Owner private caption about teeth' });
     await submitContentForApproval(pid, r.publication.id, owner);
-    pub = (await approveContent(pid, r.publication.id, owner, 1)).publication;
+    await approveContent(pid, r.publication.id, owner, 1);
+    await asWaitingForDesign(r.publication.id); // a post waiting for its design (a text post is otherwise approved with its content)
+    pub = await getPublication(pid, r.publication.id);
   });
 
   afterEach(async () => {
@@ -197,15 +205,16 @@ describe('AI design endpoints (real MongoDB, real sharp/storage, scripted provid
     assert.equal(await SocialDesignGeneration.countDocuments({ project_id: project._id }), 0);
   });
 
-  test('8: a failed generation is reported with the safe failure; no provider detail, prompt, key or token in any response', async (t) => {
+  test('8: a failed photograph is reported with the safe reason (the first design falls back to a layout without one); no provider detail, prompt, key or token in any response', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     setDesignProviderOverride(mockImageProvider({ behavior: () => { throw providerError('AI_PROVIDER_AUTH', { message: 'sk-LEAK', bodySnippet: 'sk-LEAK' }); } }));
     await post();
     await settled();
     const res = await status();
-    assert.equal(res.body.data.status, 'failed');
-    assert.equal(res.body.data.generation.failure.code, 'AI_UNAVAILABLE');
-    assert.equal(res.body.data.publication.approval.state, 'content_approved');
+    assert.equal(res.body.data.status, 'ready');
+    assert.equal(res.body.data.generation.creative.fallback.code, 'AI_UNAVAILABLE');
+    assert.match(res.body.data.generation.creative.fallback.message, /layout without a photograph/);
+    assert.equal(res.body.data.publication.approval.state, 'design_review');
     const text = JSON.stringify(res.body);
     for (const leak of ['sk-LEAK', 'AI_PROVIDER_', 'OPENAI', 'FB-SECRET-TOKEN', 'accessToken', 'lockedBy', 'approved_caption', 'HARD RULES']) assert.equal(text.includes(leak), false, leak);
   });

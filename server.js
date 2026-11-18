@@ -704,6 +704,13 @@ const startServer = async () => {
 
     markStartupComplete(); // readiness turns green only once the database is connected, the schedulers are registered and the port is open
 
+    // Is the configured AI image model still available (and not about to be shut down)? One models-list call, never blocks the boot.
+    if (process.env.NODE_ENV !== 'test') {
+      import('./src/modules/social_meta/service/aiDesign/imageModelCheck.js')
+        .then(({ runImageModelStartupCheck }) => runImageModelStartupCheck())
+        .catch((error) => console.warn('[SOCIAL_AI_DESIGN] image model check could not run:', error?.message));
+    }
+
     console.log(`✓ Server is listening on port ${PORT}`);
 
     const serviceUrls = {

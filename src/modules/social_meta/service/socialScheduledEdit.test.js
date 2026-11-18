@@ -187,14 +187,14 @@ describe('editing a scheduled post (real MongoDB, Meta adapters counted)', () =>
   });
 
   // ── project approval settings decide whether anything is invalidated ─────
-  test('7: content approval OFF, design approval ON: a caption edit auto-re-approves the content but the design still needs approval -> schedule removed (content_approved)', async (t) => {
+  test('7: content approval OFF, design approval ON: a caption edit auto-re-approves the content but the design still needs approval -> schedule removed (back in design_review)', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await SocialApprovalSettings.create({ project_id: project._id, contentApprovalRequired: false, designApprovalRequired: true });
     const id = await scheduledPost();
     const r = await edit(id, { content: 'Edited under auto content approval' });
     assert.equal(r.scheduleCleared, true);
     const after = await row(id);
-    assert.equal(after.approvalState, 'content_approved');
+    assert.equal(after.approvalState, 'design_review', 'its media is re-submitted as the design: it needs design approval again');
     assert.equal(after.status, 'draft');
     assert.equal(after.scheduledAt ?? null, null);
   });
@@ -415,9 +415,10 @@ describe('editing a scheduled post (real MongoDB, Meta adapters counted)', () =>
     assert.equal((await schedulePublication(pid, id, userId, future())).error.code, 'APPROVAL_REQUIRED', 'cannot be scheduled while unapproved');
 
     const afterEdit = await row(id);
-    assert.equal((await approveContent(pid, id, reviewerId, afterEdit.contentVersion)).success, true);
-    assert.equal((await submitDesignForApproval(pid, id, userId)).success, true);
-    assert.equal((await approveDesign(pid, id, reviewerId, afterEdit.designVersion)).success, true);
+    const reApproved = await approveContent(pid, id, reviewerId, afterEdit.contentVersion);
+    assert.equal(reApproved.success, true);
+    if (reApproved.publication.approval.state === 'content_approved') assert.equal((await submitDesignForApproval(pid, id, userId)).success, true);
+    if ((await row(id)).approvalState === 'design_review') assert.equal((await approveDesign(pid, id, reviewerId, afterEdit.designVersion)).success, true);
     const when = future(72 * HOUR);
     const s = await schedulePublication(pid, id, userId, when, 'UTC');
     assert.equal(s.success, true);

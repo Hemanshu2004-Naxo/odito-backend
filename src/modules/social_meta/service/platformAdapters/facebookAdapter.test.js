@@ -71,11 +71,45 @@ describe('facebookAdapter.publish — image', () => {
     assert.equal(result.externalPostId, 'photo_only');
   });
 
-  test('more than one media item is rejected with MEDIA_NOT_SUPPORTED, never sent to Meta', async () => {
+  test('a multi-photo post with more than 10 images, or with a video, is rejected with MEDIA_NOT_SUPPORTED, never sent to Meta', async () => {
     let called = false;
-    const result = await withMockedRequest(async () => { called = true; return { success: true, data: {} }; }, () => publish({ account, content: '', media: [{ url: 'https://x/a.png', type: 'image' }, { url: 'https://x/b.png', type: 'image' }] }));
+    const eleven = Array.from({ length: 11 }, (_, i) => ({ url: `https://cdn.example.com/s${i}.jpg`, type: 'image' }));
+    const r1 = await withMockedRequest(async () => { called = true; return { success: true, data: {} }; }, () => publish({ account, content: '', media: eleven }));
+    const r2 = await withMockedRequest(async () => { called = true; return { success: true, data: {} }; }, () => publish({ account, content: '', media: [{ url: 'https://cdn.example.com/a.jpg', type: 'image' }, { url: 'https://cdn.example.com/b.mp4', type: 'video' }] }));
     assert.equal(called, false);
-    assert.equal(result.error.code, 'MEDIA_NOT_SUPPORTED');
+    assert.equal(r1.error.code, 'MEDIA_NOT_SUPPORTED');
+    assert.equal(r2.error.code, 'MEDIA_NOT_SUPPORTED');
+  });
+});
+
+describe('facebookAdapter.publish — MULTI-PHOTO post (unpublished photos, then one /feed post)', () => {
+  const slides = [1, 2, 3].map((n) => ({ url: `https://cdn.example.com/slide-${n}.jpg`, type: 'image' }));
+  test('every image uploaded UNPUBLISHED in order, then ONE /feed post with the caption and attached_media in the same order', async () => {
+    const calls = [];
+    let n = 0;
+    const result = await withMockedRequest(async (req) => {
+      calls.push(req);
+      if (req.context === 'facebook_upload_unpublished_photo') { n += 1; return { success: true, data: { id: `photo_${n}` } }; }
+      if (req.context === 'facebook_publish_multi_photo') return { success: true, data: { id: 'page_1_post_7' } };
+      throw new Error(req.context);
+    }, () => publish({ account, content: 'Five signs...', media: slides }));
+    assert.deepEqual(result, { success: true, externalPostId: 'page_1_post_7', error: null });
+    const uploads = calls.filter((c) => c.context === 'facebook_upload_unpublished_photo');
+    assert.deepEqual(uploads.map((c) => c.params), slides.map((s) => ({ url: s.url, published: false })));
+    const feed = calls.filter((c) => c.context === 'facebook_publish_multi_photo');
+    assert.equal(feed.length, 1);
+    assert.match(feed[0].path, /\/feed$/);
+    assert.deepEqual(feed[0].params, { message: 'Five signs...', 'attached_media[0]': '{"media_fbid":"photo_1"}', 'attached_media[1]': '{"media_fbid":"photo_2"}', 'attached_media[2]': '{"media_fbid":"photo_3"}' });
+  });
+
+  test('a failed upload stops before the /feed post (nothing visible was published, not unknown); a lost /feed answer IS unknown', async () => {
+    const calls = [];
+    const r1 = await withMockedRequest(async (req) => { calls.push(req); return req.context === 'facebook_upload_unpublished_photo' && calls.length === 2 ? { success: false, kind: 'http', status: 400, data: { error: { code: 324, message: 'bad' } } } : { success: true, data: { id: 'p' } }; }, () => publish({ account, content: 'x', media: slides }));
+    assert.equal(r1.success, false);
+    assert.notEqual(r1.error.outcome, 'unknown');
+    assert.equal(calls.some((c) => c.context === 'facebook_publish_multi_photo'), false);
+    const r2 = await withMockedRequest(async (req) => (req.context === 'facebook_publish_multi_photo' ? { success: false, kind: 'timeout', status: null, data: null } : { success: true, data: { id: 'p' } }), () => publish({ account, content: 'x', media: slides }));
+    assert.equal(r2.error.outcome, 'unknown');
   });
 });
 

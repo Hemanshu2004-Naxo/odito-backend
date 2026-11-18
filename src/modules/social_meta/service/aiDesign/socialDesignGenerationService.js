@@ -17,7 +17,9 @@ import { getDefaultImageProvider } from './providers/index.js';
 import { IMAGE_REFUSED } from './providers/openAIImageProvider.js';
 import { processAndStoreDesign, prepareReferenceImage, prepareLogo } from './designMedia.js';
 import { buildDesignRequest, DESIGN_PROMPT_VERSION } from './designBrief.js';
-import { produceDesign } from './designProducer.js';
+import { produceWithPhotoFallback } from './designProducer.js';
+import { conceptPipelineActive, conceptFallbackAllowed, produceConceptDesign, conceptRecordFields, recentConcepts, PIPELINE } from './concept/conceptDesign.js';
+import { imageCostUsd } from './concept/conceptConfig.js';
 import { CREATIVE_TYPES } from './designStrategy.js';
 import { DESIGN_STALE_MS, PLATFORM_DESIGN, MAX_REFERENCE_IMAGES } from './designConfig.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
@@ -58,6 +60,8 @@ let _providerOverride = null;
 /** Test seam only: substitute the image provider (same contract). Production never sets it. */
 export function setDesignProviderOverride(provider) { _providerOverride = provider || null; }
 export function resetDesignProviderOverride() { _providerOverride = null; }
+/** True while a test substitutes the image provider (the concept pipeline then needs a substituted brief provider too). */
+export const isDesignProviderOverridden = () => !!_providerOverride;
 const getProvider = () => _providerOverride || getDefaultImageProvider();
 /** The same provider (and the same test seam) for Creative Studio (socialDesignStudioService). */
 export const getDesignProvider = () => getProvider();
@@ -82,8 +86,15 @@ export const DESIGN_FAILURE_MESSAGES = Object.freeze({
   DESIGN_NEEDS_TEXT: 'This post has no clear sentence Odito can use as the design\'s headline. Add a short opening sentence of a few real words (the post will need approving again), or upload your own design.',
   // the layout could not show everything the post needs (a text missing, empty or not fitting), or the finished picture was blank: nothing was saved
   DESIGN_COMPOSE_FAILED: 'Odito could not lay this post out as a complete design, so nothing was saved and your current design is unchanged. Try again, or upload your own design.',
+  // the configured image model cannot be used by Odito's key (retired, renamed or not enabled): a setup problem, not the post's
+  DESIGN_IMAGE_MODEL_UNAVAILABLE: 'The AI image model Odito is set up to use is not available (it may have been retired), so no photograph could be made. Layouts without a photograph still work. An administrator needs to update the image model setting.',
+  // the image service refused or failed the request for another reason (details are in the server log)
+  DESIGN_IMAGE_FAILED: 'The AI image service could not make the photograph for this design. Layouts without a photograph still work. Please try again later.',
   GENERATION_FAILED: 'Design generation failed. Please try again.',
 });
+
+/** A design whose photograph could not be made was rendered in a layout without one: what the card says about it. */
+export const PHOTO_FALLBACK_NOTE = (failure) => `${failure.message.split('. ')[0]}. This option uses a layout without a photograph instead.`;
 
 /** Why a brief was refused, as a failure code: a missing headline has its own plain message; every other problem is the general one. */
 export const briefFailureCode = (problems) => ((problems || []).some((p) => p === 'no headline') ? 'DESIGN_NEEDS_TEXT' : 'DESIGN_BRIEF_INVALID');
@@ -92,8 +103,12 @@ export function designFailureFor(error) {
   const code = error?.code;
   let key = 'GENERATION_FAILED';
   if (code === IMAGE_REFUSED) key = 'DESIGN_REJECTED';
+  else if (error?.reason === 'model_not_found') key = 'DESIGN_IMAGE_MODEL_UNAVAILABLE';
+  // an image-provider failure is never the generic message: it says the photograph is what failed
+  else if (code === 'AI_PROVIDER_FAILED' || code === 'AI_PROVIDER_MISCONFIGURED') key = code === 'AI_PROVIDER_MISCONFIGURED' ? 'DESIGN_IMAGE_MODEL_UNAVAILABLE' : 'DESIGN_IMAGE_FAILED';
   else if (PROVIDER_FAILURE_CODE[code]) key = PROVIDER_FAILURE_CODE[code];
   else if (DESIGN_FAILURE_MESSAGES[code]) key = code;
+  else if (error?.provider === 'OPENAI' || error?.photoStep) key = 'DESIGN_IMAGE_FAILED';
   return { code: key, message: DESIGN_FAILURE_MESSAGES[key] };
 }
 
@@ -111,7 +126,14 @@ export function toApiGeneration(rec, { currentUrl = null } = {}) {
     // which creative direction was chosen, and which real assets were used (codes and counts only - never any text of the post)
     // Creative Studio: the candidate designs of this generation (files in project storage; NOT yet the post's design unless `attached`)
     candidates: rec.mode === 'studio' ? (rec.candidates || []).map((c) => toApiCandidate(c, { currentUrl })) : undefined,
-    creative: rec.creative?.type ? { type: rec.creative.type, label: rec.creative.label || null, layoutId: rec.creative.layoutId || null, logoApplied: !!rec.creative.logoApplied, referencePhotos: rec.creative.referencePhotos || 0, notes: [...(rec.creative.notes || [])] } : null,
+    creative: rec.creative?.type ? { type: rec.creative.type, label: rec.creative.label || null, layoutId: rec.creative.layoutId || null, logoApplied: !!rec.creative.logoApplied, referencePhotos: rec.creative.referencePhotos || 0, notes: [...(rec.creative.notes || [])], fallback: rec.creative.fallback?.code ? { code: rec.creative.fallback.code, message: rec.creative.fallback.message } : null,
+      pipeline: rec.creative.pipeline || null,
+      concept: rec.creative.concept?.layout ? { bigIdea: rec.creative.concept.big_idea || null, headline: rec.creative.concept.hook_headline || null, visualStyle: rec.creative.concept.visual_style, layout: rec.creative.concept.layout } : null,
+      qc: rec.creative.qc?.score != null ? { score: rec.creative.qc.score, passed: !!rec.creative.qc.passed, issues: [...(rec.creative.qc.issues || [])], retries: [...(rec.creative.qc.retries || [])], needsAttention: rec.creative.qc.needsAttention?.reasons ? { score: rec.creative.qc.needsAttention.score ?? null, failure: rec.creative.qc.needsAttention.failure || null, reasons: [...rec.creative.qc.needsAttention.reasons] } : null } : null,
+      imageModel: rec.creative.image?.modelReturned || rec.creative.image?.model || null } : null,
+    // progress while generating (concept -> image -> text -> quality), the cost of the version once it is made
+    stage: rec.status === 'generating' ? (rec.generation?.stage || null) : null,
+    costUsd: rec.cost?.usd ?? null,
     startedAt: iso(rec.generation?.startedAt),
     finishedAt: iso(rec.generation?.finishedAt),
     failure: rec.status === 'failed' ? { code: rec.failure?.code || 'GENERATION_FAILED', message: rec.failure?.message || DESIGN_FAILURE_MESSAGES.GENERATION_FAILED } : null,
@@ -134,6 +156,8 @@ export function toApiCandidate(c, { currentUrl = null } = {}) {
     logoApplied: !!c.logoApplied,
     referencePhotos: c.referencePhotos || 0,
     notes: [...(c.notes || [])],
+    // drawn without its planned photograph (the image step failed): the plain reason, shown on the card
+    fallback: c.fallback?.code ? { code: c.fallback.code, message: c.fallback.message } : null,
     instruction: c.instruction || null,
     failure: c.status === 'failed' ? { code: c.failure?.code || 'GENERATION_FAILED', message: c.failure?.message || DESIGN_FAILURE_MESSAGES.GENERATION_FAILED } : null,
     attached: !!c.attached,
@@ -276,14 +300,16 @@ export async function startDesignGeneration(projectId, userId, input = {}, { now
 
 /** The brief for the post's ONE design, from the approved caption + stored business/brand context + the real assets. Shared by the run and by the provider pre-flight, so the design type is decided in one place. */
 async function prepareDesignRequest(pub) {
-  const { snapshotData, strategy, liveProfile, prohibitedPhrases, services, contact } = await loadBriefContext(pub);
+  const context = await loadBriefContext(pub);
+  const { snapshotData, strategy, liveProfile, prohibitedPhrases, services, contact } = context;
   const assets = await loadDesignAssets(pub, liveProfile);
-  const request = buildDesignRequest({
+  // the same request with a chosen creative type: used to fall back to a layout without a photograph when the photograph cannot be made
+  const requestFor = (forceType) => buildDesignRequest({
     caption: pub.content, platform: pub.platform, pillar: pub.generation?.contentPillar || null, objective: pub.generation?.objective || null, snapshotData, strategy,
     planItem: assets.planItem, product: productFacts(assets.product), productAssetCount: assets.references.length, hasLogo: !!assets.logo,
-    services, contact, prohibitedPhrases, recentTypes: assets.recentTypes, seed: String(pub._id),
+    services, contact, prohibitedPhrases, recentTypes: assets.recentTypes, seed: String(pub._id), ...(forceType ? { forceType } : {}),
   });
-  return { request, assets };
+  return { request: requestFor(null), requestFor, assets, context };
 }
 
 /** Does the design this post would get carry an AI photograph? Only then is the image provider needed. If that cannot be worked out here, the run itself reports the real problem (and never calls an unavailable provider). */
@@ -401,22 +427,71 @@ export async function runDesignGeneration(generationId, lockedBy, userId = null)
     if (!account || String(account._id) !== String(pub.social_account_id)) throw Object.assign(new Error('account gone'), { code: 'PLATFORM_NOT_CONNECTED' });
 
     // 2. The brief: built on the server from the approved caption + stored business/brand context.
-    const { request, assets } = await prepareDesignRequest(pub);
-    const { brief, problems } = request;
-    // the deterministic quality check of the brief: nothing unsupported (a figure, a prohibited phrase, a list without points...) may reach the design
-    if (problems.length) {
-      LoggerUtil.warn(`${EVENT} design_brief_rejected`, { event: 'design_brief_rejected', ...ids, problemCount: problems.length });
-      throw Object.assign(new Error('brief invalid'), { code: briefFailureCode(problems) });
+    const { request: planned, requestFor, assets, context } = await prepareDesignRequest(pub);
+
+    // 3a. The CONCEPT design (creative brief -> image -> Odito's overlay -> quality check) for a post without real product photos.
+    //     If the concept cannot be made (brief, image or fit), the post gets the rule-based design below, and the log says why.
+    let concept = null;
+    let conceptFailure = null;
+    if (!assets.references.length && getProvider()?.isAvailable?.() && conceptPipelineActive({ imageProviderOverridden: !!_providerOverride })) {
+      try {
+        const recentRecords = await SocialDesignGeneration.find({ project_id: rec.project_id, status: 'ready', 'creative.pipeline': PIPELINE.CONCEPT }).sort({ createdAt: -1 }).limit(5).select('creative.concept').lean();
+        const made = await produceConceptDesign({
+          pub, snapshotData: context.snapshotData, liveProfile: context.liveProfile, recent: recentConcepts(recentRecords), provider: getProvider(), logo: assets.logo,
+          onStage: (stage) => SocialDesignGeneration.updateOne(lock, { $set: { 'generation.stage': stage } }),
+        });
+        concept = { ...made, fields: conceptRecordFields(made) };
+        const imageCalls = made.option.calls.filter((c) => c.kind === 'image');
+        providerResult = {
+          model: made.option.image?.model || null, attempts: imageCalls.length || 1, durationMs: made.option.durationMs,
+          usage: { inputTokens: imageCalls.reduce((s, c) => s + (c.usage?.inputTokens || 0), 0), outputTokens: imageCalls.reduce((s, c) => s + (c.usage?.outputTokens || 0), 0) },
+        };
+        LoggerUtil.info(`${EVENT} design_concept_ready`, { event: 'design_concept_ready', ...ids, layout: made.option.concept.layout, style: made.option.concept.visual_style, qcScore: made.option.qc.score, qcPassed: made.option.qc.passed, attempts: made.option.attempts.length, imageModel: made.option.image?.model || null, modelReturned: made.option.image?.modelReturned || null, costUsd: concept.fields.cost.usd });
+      } catch (error) {
+        if (!conceptFallbackAllowed(error)) throw error;
+        conceptFailure = error;
+        LoggerUtil.warn(`${EVENT} design_concept_fallback`, { event: 'design_concept_fallback', ...ids, providerCode: error?.code || null, reason: error?.reason || null, photoStep: !!error?.photoStep, costUsd: error?.costUsd ?? null, ...(error?.diagnostics || {}) });
+      }
     }
 
-    // 3. The design: the photograph (only when the layout carries one) from the image provider, then Odito's own composition of every
-    //    word, the real logo and the real product photos over it.
-    const produced = await produceDesign({ request, provider: getProvider(), generationId, logo: assets.logo, productImages: assets.references.map((r) => r.buffer) });
-    providerResult = produced.provider || { model: 'odito-composer', attempts: 1, durationMs: null, usage: { inputTokens: 0, outputTokens: 0 } };
+    let produced = null;
+    let brief = null;
+    let photoFallback = null;
+    if (!concept) {
+      const { problems } = planned;
+      // the deterministic quality check of the brief: nothing unsupported (a figure, a prohibited phrase, a list without points...) may reach the design
+      if (problems.length) {
+        LoggerUtil.warn(`${EVENT} design_brief_rejected`, { event: 'design_brief_rejected', ...ids, problemCount: problems.length });
+        throw Object.assign(new Error('brief invalid'), { code: briefFailureCode(problems) });
+      }
+
+      // 3b. The rule-based design: the photograph (only when the layout carries one) from the image provider, then Odito's own composition
+      //     of every word, the real logo and the real product photos over it.
+      //     If the PHOTOGRAPH cannot be made (retired model, refusal, outage, unusable picture) the post gets a layout without one, and is told why.
+      const firstDesign = !(pub.media || []).length;
+      produced = await produceWithPhotoFallback({ request: planned, rebuild: firstDesign ? requestFor : null, provider: getProvider(), generationId, logo: assets.logo, productImages: assets.references.map((r) => r.buffer) });
+      ({ brief } = produced.request);
+      photoFallback = produced.photoFailure ? designFailureFor(produced.photoFailure) : null;
+      if (photoFallback) LoggerUtil.warn(`${EVENT} design_photo_fallback`, { event: 'design_photo_fallback', ...ids, plannedLayout: planned.brief.layoutId, usedLayout: brief.layoutId, failureCode: photoFallback.code, providerCode: produced.photoFailure.code, reason: produced.photoFailure.reason || null, ...(produced.photoFailure.diagnostics || {}) });
+      providerResult = produced.provider || { model: 'odito-composer', attempts: 1, durationMs: null, usage: { inputTokens: 0, outputTokens: 0 } };
+    }
 
     // 4. Inspect -> re-encode -> validate -> store (the shared media services). The logo is already part of the composition.
-    const media = { ...(await processAndStoreDesign({ buffer: produced.png, projectId: String(rec.project_id), platform: rec.platform, logo: null })), logoApplied: produced.report.logoApplied };
+    const media = { ...(await processAndStoreDesign({ buffer: concept ? concept.png : produced.png, projectId: String(rec.project_id), platform: rec.platform, logo: null })), logoApplied: concept ? concept.fields.creative.logoApplied : produced.report.logoApplied };
     stored = media;
+
+    // what this version cost: the concept attempt (also when it fell back) + the rule-based photograph
+    const rulesImageUsd = produced?.provider?.usage ? imageCostUsd(produced.provider.usage) : 0;
+    const cost = concept ? concept.fields.cost : { usd: Math.round(((conceptFailure?.costUsd || 0) + rulesImageUsd) * 10_000) / 10_000, calls: produced?.provider?.usage ? [{ step: 'image', kind: 'image', model: providerResult.model || null, modelReturned: produced.provider.modelReturned || null, inputTokens: produced.provider.usage.inputTokens || 0, outputTokens: produced.provider.usage.outputTokens || 0, durationMs: produced.provider.durationMs ?? null, usd: rulesImageUsd }] : [] };
+    const creative = concept
+      ? { ...concept.fields.creative, fallback: { code: null, message: null } }
+      : {
+        pipeline: PIPELINE.RULES,
+        type: brief.creativeType, label: brief.label, layoutId: brief.layoutId, briefVersion: brief.version, logoApplied: !!media.logoApplied, referencePhotos: brief.productAssets.count,
+        notes: [...new Set([...brief.notes, ...produced.report.notes, ...(assets.logo && !media.logoApplied ? ['logo_not_applied'] : []), ...(photoFallback ? ['photo_fallback'] : []), ...(conceptFailure ? ['concept_fallback'] : [])])],
+        fallback: photoFallback ? { code: photoFallback.code, message: PHOTO_FALLBACK_NOTE(photoFallback) } : { code: null, message: null },
+        image: { model: produced.provider?.model || null, modelReturned: produced.provider?.modelReturned || null, fallbackUsed: !!produced.provider?.fallbackUsed, quality: produced.provider?.quality || null, size: produced.provider?.size || null, seed: null, referenceImages: assets.references.length },
+      };
 
     // 5. Still the active run? (a recovered/superseded run must not attach anything)
     const attaching = await SocialDesignGeneration.findOneAndUpdate(lock, {
@@ -424,10 +499,9 @@ export async function runDesignGeneration(generationId, lockedBy, userId = null)
         status: 'attaching', model: providerResult.model || null,
         'generation.attempts': providerResult.attempts || 1, 'generation.providerMs': providerResult.durationMs ?? null,
         'generation.usage': { inputTokens: providerResult.usage?.inputTokens || 0, outputTokens: providerResult.usage?.outputTokens || 0 },
-        creative: {
-          type: brief.creativeType, label: brief.label, layoutId: brief.layoutId, briefVersion: brief.version, logoApplied: !!media.logoApplied, referencePhotos: brief.productAssets.count,
-          notes: [...new Set([...brief.notes, ...produced.report.notes, ...(assets.logo && !media.logoApplied ? ['logo_not_applied'] : [])])],
-        },
+        'generation.stage': null,
+        creative,
+        cost,
       },
     }, { new: true }).lean();
     if (!attaching) {
@@ -469,6 +543,7 @@ export async function runDesignGeneration(generationId, lockedBy, userId = null)
     LoggerUtil.info(`${EVENT} design_generation_completed`, {
       event: 'design_generation_completed', ...ids, designVersion: result.designVersion, provider: 'openai', model: providerResult.model, platform: rec.platform,
       providerMs: providerResult.durationMs, attempts: providerResult.attempts, durationMs: Date.now() - started, inputUnits: providerResult.usage?.inputTokens || 0, outputUnits: providerResult.usage?.outputTokens || 0,
+      pipeline: creative.pipeline, costUsd: cost.usd,
     });
     return saved;
   } catch (error) {

@@ -186,6 +186,29 @@ export function weeklyQuota(validDays, postsPerWeek) {
   return Math.min(validDays, Math.round((postsPerWeek * validDays) / 7));
 }
 
+/** The strategy's posting days as Monday-first indexes (unknown values ignored). */
+export function recommendedIndexes(recommendedDays) {
+  if (!Array.isArray(recommendedDays)) return new Set();
+  return new Set(WEEKDAYS.map((d, i) => (recommendedDays.includes(d) ? i : -1)).filter((i) => i >= 0));
+}
+
+/**
+ * THE STRATEGY'S DAYS ARE A RULE. When the strategy names posting days ("Tuesday, Thursday, Saturday"):
+ *   - with at least as many days as posts per week, every post sits on one of them; a full week gets exactly `postsPerWeek`, and a partial
+ *     week gets its pro-rated share, capped only by how many of those days fall inside it (a week holding none of them has no post: that
+ *     is the reason, never "fewer for no reason");
+ *   - with fewer days than posts per week, every one of the strategy's days is used and the remaining posts go on other, well-spaced days.
+ * Without days (an old strategy) the planner varies weekdays freely, as before.
+ */
+export function weekTarget(week, postsPerWeek, recommended) {
+  const k = weeklyQuota(week.valid.length, postsPerWeek);
+  if (!recommended.size || recommended.size < postsPerWeek) return k;
+  return Math.min(k, week.valid.filter((d) => recommended.has(d)).length);
+}
+
+/** How many of a week's posts must be on the strategy's days. */
+const requiredPreferred = (week, k, recommended) => Math.min(k, week.valid.filter((d) => recommended.has(d)).length);
+
 function combinations(items, k) {
   const out = [];
   const pick = (from, chosen) => {
@@ -210,7 +233,8 @@ function allowedAdjacency(valid, k) {
 const minSpan = (k) => (k <= 1 ? 0 : k <= 3 ? k + 1 : Math.min(k, 5));
 
 function pickWeekCombo({ week, k, startMs, prevLastMs, history, usage, recommended, random }) {
-  const candidates = combinations(week.valid, k);
+  const need = requiredPreferred(week, k, recommended);
+  const candidates = combinations(week.valid, k).filter((c) => c.filter((d) => recommended.has(d)).length === need);
   if (candidates.length === 1) return candidates[0];
   const prev = history[history.length - 1] || null;
   const prev2 = history[history.length - 2] || null;
@@ -233,8 +257,7 @@ function pickWeekCombo({ week, k, startMs, prevLastMs, history, usage, recommend
     penalty += overlap(combo, prev) * 0.8 + overlap(combo, prev2) * 0.3;
     // rotate weekday usage across the whole period
     penalty += combo.reduce((s, d) => s + usage[d], 0) * 0.9;
-    // the strategy's best days are a mild preference, not a rule
-    penalty -= combo.filter((d) => recommended.has(d)).length * 0.8;
+    // (the strategy's days are already a rule: every candidate holds as many of them as the week allows)
     penalty += random() * 2.5; // controlled (seeded) randomness
     if (best === null || penalty < best.penalty) best = { combo, penalty };
   }
@@ -246,7 +269,8 @@ function pickWeekCombo({ week, k, startMs, prevLastMs, history, usage, recommend
  * valid, unique, in-range dates; the right number of posts in every week; no week repeating the previous week's days;
  * varied days across the period; sensible spacing; posts spread over the week rather than huddled at one end.
  */
-export function validateSlotPlan(slots, { startDate, endDate, postsPerWeek }) {
+export function validateSlotPlan(slots, { startDate, endDate, postsPerWeek, recommendedDays = [] }) {
+  const recommended = recommendedIndexes(recommendedDays);
   const problems = [];
   const start = parseDate(startDate);
   const end = parseDate(endDate);
@@ -274,9 +298,15 @@ export function validateSlotPlan(slots, { startDate, endDate, postsPerWeek }) {
   const fullCombos = [];
   for (const week of weeks) {
     const combo = byWeek.get(week.start);
-    const k = weeklyQuota(week.valid.length, postsPerWeek);
+    const k = weekTarget(week, postsPerWeek, recommended);
     if (combo.length !== k) problems.push(`week of ${formatDate(week.start)} has ${combo.length} posts, expected ${k}`);
     if (k === 0) { previousFull = null; continue; }
+    if (recommended.size) {
+      // the strategy's days decide; the spacing and variety rules below are for plans without them
+      const onDays = combo.filter((d) => recommended.has(d)).length;
+      if (onDays !== requiredPreferred(week, k, recommended)) problems.push(`week of ${formatDate(week.start)} does not use the strategy's posting days`);
+      continue;
+    }
     const full = week.valid.length === 7;
     if (k < week.valid.length && adjacentPairs(combo) > allowedAdjacency(week.valid, k)) problems.push(`week of ${formatDate(week.start)} posts on too many consecutive days`);
     if (full && k >= 2 && k < 7 && combo[combo.length - 1] - combo[0] < minSpan(k)) problems.push(`week of ${formatDate(week.start)} is clustered`);
@@ -286,7 +316,7 @@ export function validateSlotPlan(slots, { startDate, endDate, postsPerWeek }) {
     }
     previousFull = full ? combo : null;
   }
-  if (postsPerWeek < 7 && fullCombos.length >= 3 && new Set(fullCombos).size < Math.min(fullCombos.length, 3)) problems.push('the weekday pattern is not varied enough');
+  if (!recommended.size && postsPerWeek < 7 && fullCombos.length >= 3 && new Set(fullCombos).size < Math.min(fullCombos.length, 3)) problems.push('the weekday pattern is not varied enough');
   return problems;
 }
 
@@ -298,7 +328,7 @@ function planWeekdays({ start, end, postsPerWeek, recommended, seed }) {
   const slots = [];
   let prevLastMs = null;
   for (const week of weeks) {
-    const k = weeklyQuota(week.valid.length, postsPerWeek);
+    const k = weekTarget(week, postsPerWeek, recommended);
     if (k === 0) continue;
     const combo = pickWeekCombo({ week, k, startMs: week.start, prevLastMs, history, usage, recommended, random });
     for (const d of combo) {
@@ -321,11 +351,11 @@ export function buildSlots({ startDate, endDate, postsPerWeek, recommendedDays =
   const start = parseDate(startDate);
   const end = parseDate(endDate);
   if (start === null || end === null || end < start) return [];
-  const recommended = new Set(WEEKDAYS.map((d, i) => (Array.isArray(recommendedDays) && recommendedDays.includes(d) ? i : -1)).filter((i) => i >= 0));
+  const recommended = recommendedIndexes(recommendedDays);
   let best = null;
   for (let attempt = 0; attempt < SLOT_ATTEMPTS; attempt += 1) {
     const slots = planWeekdays({ start, end, postsPerWeek, recommended, seed: seedFromParts(seed, attempt) });
-    const problems = validateSlotPlan(slots, { startDate, endDate, postsPerWeek });
+    const problems = validateSlotPlan(slots, { startDate, endDate, postsPerWeek, recommendedDays });
     if (!problems.length) return slots;
     if (!best || problems.length < best.problems) best = { slots, problems: problems.length };
   }
@@ -383,33 +413,102 @@ export function allocatePillars(slots, pillars) {
   };
 }
 
+/** The strategy's posts per week for each selected platform, or null when the strategy has no usable per-platform plan for them. */
+export function strategyPlatformSplit(platforms, strategyPlatforms = []) {
+  const recs = platforms.map((platform) => (strategyPlatforms || []).find((p) => p.platform === platform)?.postsPerWeek);
+  if (!recs.every((r) => Number.isInteger(r) && r >= 0) || recs.reduce((s, r) => s + r, 0) <= 0) return null;
+  return recs;
+}
+
 /**
- * Platform per slot for the modes that fix it; null for ai_optimized (the model chooses per slot, validated later).
- *   balanced           one platform per slot, shared evenly (counts differ by at most one)
- *   platform_specific  one platform per slot, shared in proportion to the strategy's recommended posts per platform
- * With a single selected platform every mode is simply that platform.
+ * Platform per slot, decided PER WEEK so every week follows the plan (not just the period's total):
+ *   ai_optimized / platform_specific  one platform per slot, in the proportions of the strategy's posts per platform. A full week of a
+ *                                     strategy with "Facebook 2, Instagram 1" at 3 posts a week is exactly 2 Facebook + 1 Instagram posts;
+ *                                     a partial week gets its share, and the shortfall carries to the next partial week so the totals stay fair.
+ *   balanced                          one platform per slot, shared evenly (the same carry keeps the totals within one of each other)
+ * ai_optimized with a strategy that has no per-platform plan (an old strategy) returns null: the model chooses per slot, validated later.
+ * With a single selected platform every mode is simply that platform. Deterministic for a seed; the order inside a week is shuffled with
+ * it, so a weekday is not tied to a platform.
  */
 export function assignPlatforms(slots, platforms, mode, strategyPlatforms = [], seed = '') {
   if (platforms.length === 1) return slots.map(() => [platforms[0]]);
-  if (mode === 'ai_optimized') return null;
-  const weights = platforms.map((platform) => {
-    if (mode === 'balanced') return { key: platform, weight: 1 };
-    const rec = (strategyPlatforms || []).find((p) => p.platform === platform)?.postsPerWeek;
-    return { key: platform, weight: Number.isFinite(rec) && rec > 0 ? rec : 1 };
+  const split = mode === 'balanced' ? null : strategyPlatformSplit(platforms, strategyPlatforms);
+  if (mode === 'ai_optimized' && !split) return null;
+  const weights = mode === 'balanced' ? platforms.map(() => 1) : (split || platforms.map(() => 1));
+  const sum = weights.reduce((s, w) => s + w, 0);
+
+  const byWeek = new Map();
+  slots.forEach((slot, i) => {
+    const ms = parseDate(slot.date);
+    const key = ms === null ? `i${i}` : ms - dayIndexOf(ms) * DAY_MS;
+    if (!byWeek.has(key)) byWeek.set(key, []);
+    byWeek.get(key).push(i);
   });
-  const sequence = weightedSequence(weights, slots.length);
-  // The even interleave would tie a platform to a position in the week (and so often to a weekday). Shuffling inside small
-  // windows, with the calendar's seed, breaks that without changing the totals or letting one platform run for long.
+
   const random = seededRandom(seedFromParts(seed, 'platforms'));
-  const window = mode === 'balanced' ? platforms.length : 4;
-  for (let from = 0; from < sequence.length; from += window) {
-    const end = Math.min(sequence.length, from + window);
-    for (let i = end - 1; i > from; i -= 1) {
-      const j = from + Math.floor(random() * (i - from + 1));
-      [sequence[i], sequence[j]] = [sequence[j], sequence[i]];
+  const out = new Array(slots.length);
+  const ideal = platforms.map(() => 0);
+  const actual = platforms.map(() => 0);
+  const tail = []; // the last few platforms assigned, to avoid long runs across weeks
+  for (const indexes of byWeek.values()) {
+    const k = indexes.length;
+    const exact = weights.map((w) => (w / sum) * k);
+    const counts = exact.map(Math.floor);
+    let left = k - counts.reduce((s, n) => s + n, 0);
+    // the remainder goes to the platform furthest behind (its fraction this week + what it is owed from earlier weeks)
+    const order = platforms.map((_, p) => p).sort((a, b) => ((exact[b] - counts[b]) + (ideal[b] - actual[b])) - ((exact[a] - counts[a]) + (ideal[a] - actual[a])) || a - b);
+    for (let j = 0; left > 0; j = (j + 1) % order.length, left -= 1) counts[order[j]] += 1;
+    const base = counts.flatMap((n, p) => Array.from({ length: n }, () => platforms[p]));
+    // a seeded shuffle; a few are tried so a platform does not run more than three posts in a row across the week boundary
+    let week = base;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const candidate = [...base];
+      for (let i = candidate.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(random() * (i + 1));
+        [candidate[i], candidate[j]] = [candidate[j], candidate[i]];
+      }
+      week = candidate;
+      const joined = [...tail, ...candidate];
+      if (!joined.some((p, i) => i >= 3 && p === joined[i - 1] && p === joined[i - 2] && p === joined[i - 3])) break;
+    }
+    tail.push(...week);
+    tail.splice(0, Math.max(0, tail.length - 3));
+    indexes.forEach((slotIndex, j) => { out[slotIndex] = [week[j]]; });
+    platforms.forEach((_, p) => { ideal[p] += exact[p]; actual[p] += counts[p]; });
+  }
+  return out;
+}
+
+/**
+ * Does a calendar follow the strategy it was planned from? Checked on the server after generation (the run refuses to mark a calendar ready
+ * when its saved posts drift from the plan) and on read (so a calendar made before these rules, or edited since, says so instead of
+ * silently contradicting the strategy). Only generated posts count: a post the person added by hand is their decision.
+ * Returns { follows, issues: [{ code, message }] }.
+ */
+export function strategyConformance(items, { config, strategy }) {
+  const issues = [];
+  const generated = (items || []).filter((i) => !i.isManual);
+  const recommendedDays = strategy?.postingStrategy?.recommendedDays || [];
+  const recommended = recommendedIndexes(recommendedDays);
+  const dayName = (d) => d.charAt(0).toUpperCase() + d.slice(1);
+  if (recommended.size >= (config?.postsPerWeek || 0) && recommended.size) {
+    const off = generated.filter((i) => { const ms = parseDate(i.date || i.contentDate); return ms !== null && !recommended.has(dayIndexOf(ms)); });
+    if (off.length) issues.push({ code: 'OFF_DAYS', count: off.length, message: `${off.length} post${off.length === 1 ? ' is' : 's are'} on days outside your strategy's posting days (${recommendedDays.map(dayName).join(', ')}).` });
+  }
+  const platforms = config?.platforms || [];
+  const split = platforms.length > 1 && config?.distributionMode !== 'balanced' ? strategyPlatformSplit(platforms, strategy?.platformStrategy) : null;
+  if (split) {
+    const both = generated.filter((i) => (i.platforms || []).length > 1).length;
+    const totals = platforms.map((p) => generated.filter((i) => (i.platforms || []).length === 1 && i.platforms[0] === p).length);
+    const sum = split.reduce((s, n) => s + n, 0);
+    const expected = platforms.map((_, p) => Math.round((split[p] / sum) * generated.length));
+    const drift = platforms.some((_, p) => Math.abs(totals[p] - expected[p]) > 1);
+    if (both || drift) {
+      const plan = platforms.map((p, j) => `${p === 'facebook' ? 'Facebook' : 'Instagram'} ${split[j]}`).join(', ');
+      issues.push({ code: 'PLATFORM_SPLIT', message: `The platform split does not match your strategy (${plan} per week)${both ? `: ${both} post${both === 1 ? ' goes' : 's go'} to both platforms` : ''}.` });
     }
   }
-  return sequence.map((p) => [p]);
+  return { follows: issues.length === 0, issues };
 }
 
 /**
@@ -418,17 +517,20 @@ export function assignPlatforms(slots, platforms, mode, strategyPlatforms = [], 
  * because the server's quota per week does not depend on the seed or on the AI. Refuses a calendar larger than
  * CALENDAR_MAX_POSTS before anything expensive starts. Returns { value } or { error: { code, message } }.
  */
-export function previewCalendarPlan(body, options) {
-  const checked = validateCalendarInput(body, options);
+export function previewCalendarPlan(body, options = {}) {
+  const { recommendedDays = [], ...validateOptions } = options || {};
+  const checked = validateCalendarInput(body, validateOptions);
   if (checked.error) return checked;
   const { startDate, endDate, months, postsPerWeek, days } = checked.value;
-  const slots = buildSlots({ startDate, endDate, postsPerWeek });
+  // the strategy's posting days can lower a partial week's share (a week that holds none of them has no post), so they are part of the count
+  const recommended = recommendedIndexes(recommendedDays);
+  const slots = buildSlots({ startDate, endDate, postsPerWeek, recommendedDays });
   if (!slots.length) return bad('INVALID_DATE_RANGE', 'That date range has no posting days. Choose a longer range.');
   if (slots.length > CALENDAR_MAX_POSTS) return bad('CALENDAR_TOO_LARGE', `That would be ${slots.length} posts; a calendar can hold at most ${CALENDAR_MAX_POSTS}. Choose fewer posts per week or a shorter calendar.`);
   const partialWeeks = splitWeeks(parseDate(startDate), parseDate(endDate))
     .filter((w) => w.valid.length < 7)
-    .map((w) => ({ weekStart: formatDate(w.start), days: w.valid.length, posts: weeklyQuota(w.valid.length, postsPerWeek) }));
+    .map((w) => ({ weekStart: formatDate(w.start), days: w.valid.length, posts: weekTarget(w, postsPerWeek, recommended) }));
   return { value: { ...checked.value, months, days, totalPosts: slots.length, partialWeeks, steps: Math.ceil(slots.length / CALENDAR_BATCH_SIZE) } };
 }
 
-export default { validateCalendarInput, previewCalendarPlan, periodEndDate, addMonthsClamped, buildSlots, validateSlotPlan, calendarSeed, weeklyQuota, splitWeeks, weightedSequence, allocatePillars, assignPlatforms, parseDate, formatDate };
+export default { validateCalendarInput, previewCalendarPlan, periodEndDate, addMonthsClamped, buildSlots, validateSlotPlan, calendarSeed, weeklyQuota, weekTarget, splitWeeks, weightedSequence, allocatePillars, assignPlatforms, strategyPlatformSplit, strategyConformance, parseDate, formatDate };

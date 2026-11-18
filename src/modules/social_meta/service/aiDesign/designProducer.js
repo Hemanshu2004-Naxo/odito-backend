@@ -45,7 +45,12 @@ export async function produceDesign({ request, provider, generationId, logo = nu
     } else {
       // The provider is needed ONLY here. If it is not configured the design fails before any request is made - there is no stand-in picture.
       if (typeof provider?.isAvailable === 'function' && !provider.isAvailable()) throw Object.assign(new Error('AI_UNAVAILABLE'), { code: 'AI_UNAVAILABLE' });
-      providerResult = await provider.generateImage({ prompt: visualPrompt, size: visualSize, generationId: String(generationId), referenceImages: [] });
+      try {
+        providerResult = await provider.generateImage({ prompt: visualPrompt, size: visualSize, generationId: String(generationId), referenceImages: [] });
+      } catch (error) {
+        // whatever the image request threw, it was the PHOTOGRAPH that failed (a layout without one can still be drawn)
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { photoStep: true });
+      }
       try { visual = await normalizeVisual(providerResult.buffer); } catch { throw Object.assign(new Error('MEDIA_INVALID'), { code: 'MEDIA_INVALID', reason: 'visual_not_decodable' }); }
       // a picture that decodes but shows nothing (blank / one colour) is not a photograph: it is refused here, before it is composed and before it is saved
       if ((await assessRaster(visual)).blank) throw Object.assign(new Error('MEDIA_INVALID'), { code: 'MEDIA_INVALID', reason: 'visual_blank' });
@@ -63,4 +68,32 @@ export async function produceDesign({ request, provider, generationId, logo = nu
   return { png: composed.buffer, visual, report: { ...composed.report, quality: { stdev: finished.stdev, flatShare: finished.flatShare } }, provider: providerResult };
 }
 
-export default { produceDesign };
+/**
+ * The photograph step failed in a way a layout WITHOUT a photograph avoids: the image provider answered with an error (any code,
+ * including a refusal or a retired model) or returned a picture that cannot be used. A failure of the composition itself is not one.
+ */
+export function isPhotoStepFailure(error) {
+  return error?.photoStep === true || error?.provider === 'OPENAI' || (error?.code === 'MEDIA_INVALID' && /^visual_/.test(String(error?.reason || '')));
+}
+
+/** The creative type a design falls back to when its photograph cannot be made: a typographic statement, which needs no picture. */
+export const PHOTO_FALLBACK_TYPE = 'statement';
+
+/**
+ * produceDesign, and when the PHOTOGRAPH step fails, the same post in a layout without one (`rebuild(PHOTO_FALLBACK_TYPE)` builds that
+ * request). The person gets a finished design and is told why it has no photograph (`photoFailure`), never a generic error. Returns the
+ * request actually used, so the caller records the brief that was really drawn.
+ */
+export async function produceWithPhotoFallback({ request, rebuild, ...rest }) {
+  try {
+    return { ...(await produceDesign({ request, ...rest })), request, photoFailure: null };
+  } catch (error) {
+    if (!request.brief.photography?.required || !isPhotoStepFailure(error) || typeof rebuild !== 'function') throw error;
+    const fallbackRequest = rebuild(PHOTO_FALLBACK_TYPE);
+    if (!fallbackRequest || fallbackRequest.problems?.length || fallbackRequest.brief.photography?.required) throw error;
+    const produced = await produceDesign({ ...rest, request: fallbackRequest, visualBuffer: null });
+    return { ...produced, request: fallbackRequest, photoFailure: error };
+  }
+}
+
+export default { produceDesign, produceWithPhotoFallback, isPhotoStepFailure, PHOTO_FALLBACK_TYPE };

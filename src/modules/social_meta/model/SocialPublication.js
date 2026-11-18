@@ -311,6 +311,8 @@ const socialPublicationSchema = new mongoose.Schema({
   // on and the API stops reporting it (see toApiDesign). A design uploaded by hand never sets it.
   design: {
     source: { type: String, enum: ['ai', null], default: null },
+    // 'single' | 'carousel' (additive): a carousel's slides are the ordered `media` items
+    format: { type: String, enum: ['single', 'carousel', null], default: null },
     generationId: { type: mongoose.Schema.Types.ObjectId, default: null },
     contentVersion: { type: Number, default: null },
     designVersion: { type: Number, default: null },

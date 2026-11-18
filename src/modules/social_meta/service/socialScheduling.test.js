@@ -20,6 +20,7 @@ import {
 } from './socialPublishingService.js';
 import '../testSupport/stubPermalinkLookup.js';
 import { storedTestMediaUrl, removeStoredTestMedia } from '../testSupport/storedMedia.js';
+import { asWaitingForDesign, asInDesignReview } from '../testSupport/approvalFixtures.js';
 
 /**
  * Scheduling a design-approved post - the EXISTING schedulePublication + the EXISTING scheduler, real MongoDB,
@@ -94,8 +95,12 @@ describe('scheduling design-approved posts (real MongoDB, Meta adapters counted)
     const target = steps.indexOf(upTo);
     if (target >= 1) assert.equal((await submitContentForApproval(pid, pub.id, userId)).success, true);
     if (target >= 2) assert.equal((await approveContent(pid, pub.id, reviewerId, 1)).success, true);
-    if (target >= 3) assert.equal((await submitDesignForApproval(pid, pub.id, userId)).success, true);
-    if (target >= 4) assert.equal((await approveDesign(pid, pub.id, reviewerId, 1)).success, true);
+    // a text post is approved with its content; an earlier stage of one is built directly (see approvalFixtures)
+    if (target === 2) await asWaitingForDesign(pub.id);
+    if (target === 3) await asInDesignReview(pub.id, userId);
+    const state = (await SocialPublication.findById(pub.id).lean()).approvalState;
+    if (target >= 3 && state === 'content_approved') assert.equal((await submitDesignForApproval(pid, pub.id, userId)).success, true);
+    if (target >= 4 && (await SocialPublication.findById(pub.id).lean()).approvalState === 'design_review') assert.equal((await approveDesign(pid, pub.id, reviewerId, 1)).success, true);
     pub = (await SocialPublication.findById(pub.id).lean());
     return { id: String(pub._id), row: pub };
   }
@@ -221,12 +226,16 @@ describe('scheduling design-approved posts (real MongoDB, Meta adapters counted)
     assert.equal((await row(p.id)).status, 'scheduled');
   });
 
-  test('11: Facebook follows its adapter: text-only is fine, one image is fine, more than one is refused', async (t) => {
+  test('11: Facebook follows its adapter: text-only, one image and a multi-photo post (2-10 images) are fine; 11 images or a video in a multi-photo post are refused', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     assert.equal((await sched((await post()).id)).success, true);
     assert.equal((await sched((await post({ media: [{ url: mediaUrl('b'), type: 'image' }] })).id)).success, true);
     const two = await post({ media: [{ url: mediaUrl('c'), type: 'image' }, { url: mediaUrl('d'), type: 'image' }] });
-    assert.equal((await sched(two.id)).error.code, 'MEDIA_NOT_SUPPORTED');
+    assert.equal((await sched(two.id)).success, true);
+    const eleven = await post({ media: Array.from({ length: 11 }, (_, i) => ({ url: mediaUrl(`e${i}`), type: 'image' })) });
+    assert.equal((await sched(eleven.id)).error.code, 'MEDIA_NOT_SUPPORTED');
+    const mixed = await post({ media: [{ url: mediaUrl('f'), type: 'image' }, { url: mediaUrl('g'), type: 'video' }] });
+    assert.equal((await sched(mixed.id)).error.code, 'MEDIA_NOT_SUPPORTED');
   });
 
   test('12: the media rule also applies to scheduling through an edit (PATCH), judged on the media AFTER the edit', async (t) => {

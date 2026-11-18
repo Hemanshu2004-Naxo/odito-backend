@@ -1,4 +1,5 @@
 import os from 'os';
+import { mergeGaps } from './strategyGaps.js';
 import crypto from 'crypto';
 import mongoose from 'mongoose';
 import SocialAIStrategy from '../../model/SocialAIStrategy.js';
@@ -86,7 +87,8 @@ function toApiStrategy(doc) {
     status: doc.status,
     generatedAt: iso(doc.generation?.finishedAt),
     strategy: doc.strategy,
-    strategyGaps: doc.strategyGaps || [],
+    // deduplicated on read as well, so a strategy saved before the merge rule lists each gap once
+    strategyGaps: mergeGaps((doc.strategyGaps || []).filter((g) => g.source === 'profile'), (doc.strategyGaps || []).filter((g) => g.source !== 'profile')),
     // the planning choice this version was created with (null for a version saved before the wizard)
     planning: toApiPlanning(doc.planning),
     // the exact business facts the AI was given (no tokens, no Google ids)
@@ -313,8 +315,8 @@ function assemble(validated, snapshotData, profileGaps, planning = null) {
   strategy.brandRules = { visualGuidelines: strategy.brandRules.visualGuidelines, messagingRules: strategy.brandRules.messagingRules, prohibitedPhrases: [...snapshotData.prohibitedPhrases] };
 
   // Gaps: the server's own findings win; the AI may add ones the server cannot know.
-  const known = new Set(profileGaps.map((g) => g.field));
-  const gaps = [...profileGaps, ...validated.gaps.filter((g) => !known.has(g.field))];
+  // (one entry per missing thing: "Service catalog" from the AI and `services` from the server are the same gap)
+  const gaps = mergeGaps(profileGaps, validated.gaps);
   return { strategy, gaps };
 }
 

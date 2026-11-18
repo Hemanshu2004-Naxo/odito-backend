@@ -1,7 +1,8 @@
 import OpenAI, { toFile } from 'openai';
 import { PROVIDER_ERROR, RETRYABLE_PROVIDER_ERRORS, providerError } from '../../aiContent/providers/contentProviderErrors.js';
 import { classifyOpenAIError } from '../../aiContent/providers/openAIContentProvider.js';
-import { DESIGN_MODEL, DESIGN_QUALITY, DESIGN_TIMEOUT_MS, DESIGN_PROVIDER_RETRIES, MAX_PROVIDER_B64_CHARS, MAX_REFERENCE_IMAGES } from '../designConfig.js';
+import { DESIGN_MODEL, FALLBACK_DESIGN_MODEL, DESIGN_QUALITY, DESIGN_TIMEOUT_MS, DESIGN_PROVIDER_RETRIES, MAX_PROVIDER_B64_CHARS, MAX_REFERENCE_IMAGES } from '../designConfig.js';
+import { LoggerUtil } from '../../../../../utils/LoggerUtil.js';
 
 /**
  * OpenAIImageProvider - the ONLY place that talks to OpenAI for design images.
@@ -37,12 +38,33 @@ function retryDelayMs(error, attempt) {
   return Math.min(1_000 * attempt, RETRY_AFTER_CAP_MS);
 }
 
-/** SDK error -> code-only error. A safety refusal is its own category (the user should change the request, not retry). */
+/** An OpenAI message as it may be LOGGED (server-side only, never returned): keys masked, bounded. */
+export const safeProviderMessage = (message) => String(message || '').replace(/sk-[A-Za-z0-9_-]{6,}/g, 'sk-***').replace(/Bearer\s+\S+/gi, 'Bearer ***').slice(0, 300);
+
+/** What OpenAI said about a failed request, for the logs and the stored diagnostics (codes and status, no message text). */
+export const providerDiagnostics = (raw) => ({
+  status: Number.isInteger(raw?.status) ? raw.status : null,
+  providerCode: typeof raw?.code === 'string' ? raw.code.slice(0, 60) : null,
+  providerType: typeof raw?.type === 'string' ? raw.type.slice(0, 60) : null,
+  param: typeof raw?.param === 'string' ? raw.param.slice(0, 60) : null,
+});
+
+/**
+ * SDK error -> code-only error. A safety refusal is its own category (the user should change the request, not retry). A model the key
+ * cannot use - retired, renamed, or not enabled for the organisation (OpenAI answers 400 "The model '...' does not exist", param "model")
+ * - is a CONFIGURATION problem (MISCONFIGURED, reason model_not_found), not a generic failure. The diagnostics travel on the error for
+ * logging; nothing of the provider's text does.
+ */
 export function classifyImageError(error) {
   if (error?.provider === 'OPENAI' && error.code) return error;
+  let classified;
   const refusal = error?.status === 400 && (REFUSAL_CODES.has(error?.code) || REFUSAL_CODES.has(error?.error?.code) || /safety system/i.test(String(error?.message || '')));
-  if (refusal) return providerError(IMAGE_REFUSED, { status: 400 });
-  return classifyOpenAIError(error);
+  const modelMissing = (error?.status === 400 || error?.status === 404) && (error?.param === 'model' || /model .* does not exist|does not have access to model/i.test(String(error?.message || '')));
+  if (refusal) classified = providerError(IMAGE_REFUSED, { status: 400 });
+  else if (modelMissing) classified = providerError(PROVIDER_ERROR.MISCONFIGURED, { status: error.status, reason: 'model_not_found' });
+  else classified = classifyOpenAIError(error);
+  Object.defineProperty(classified, 'diagnostics', { value: providerDiagnostics(error), enumerable: false });
+  return classified;
 }
 
 /** The image bytes from an Images API response, or a BAD_OUTPUT error. */
@@ -57,6 +79,17 @@ export function extractImage(response) {
   return buffer;
 }
 
+/**
+ * Dated snapshots pinned at boot (imageModelCheck): when the models list shows "gpt-image-2.6-flare-2026-12-01" for the configured
+ * "gpt-image-2.6-flare", requests use the snapshot, so a silent upgrade of the alias cannot change the look of the designs.
+ */
+const pinnedSnapshots = new Map();
+export function pinImageModelSnapshot(alias, snapshot) { if (alias && snapshot) pinnedSnapshots.set(alias, snapshot); else if (alias) pinnedSnapshots.delete(alias); }
+export const pinnedSnapshotFor = (alias) => pinnedSnapshots.get(alias) || null;
+
+/** Errors that the FALLBACK model may answer instead: the model is not available, or the provider failed (5xx). Never a refusal. */
+export const fallbackAllowedFor = (error) => error?.reason === 'model_not_found' || error?.code === PROVIDER_ERROR.UNAVAILABLE;
+
 export class OpenAIImageProvider {
   /**
    * @param {object} [options]  all optional; defaults come from designConfig + the environment
@@ -65,9 +98,10 @@ export class OpenAIImageProvider {
    * @param {(apiKey:string)=>object} [options.clientFactory]  builds the SDK client (tests inject a stubbed fetch)
    * @param {(ms:number)=>Promise<void>} [options.sleep]
    */
-  constructor({ apiKey, model, quality, timeoutMs, retries, clientFactory, sleep } = {}) {
+  constructor({ apiKey, model, fallbackModel, quality, timeoutMs, retries, clientFactory, sleep } = {}) {
     this._apiKey = apiKey;
     this._model = model;
+    this._fallbackModel = fallbackModel;
     this._quality = quality;
     this._timeoutMs = timeoutMs;
     this._retries = retries;
@@ -78,6 +112,9 @@ export class OpenAIImageProvider {
   }
 
   get model() { return this._model || DESIGN_MODEL; }
+  /** The id actually requested: the pinned dated snapshot of the configured model when there is one. */
+  get requestModel() { return pinnedSnapshotFor(this.model) || this.model; }
+  get fallbackModel() { const f = this._fallbackModel === undefined ? FALLBACK_DESIGN_MODEL : this._fallbackModel; return f && f !== this.model ? f : null; }
   get quality() { return this._quality || DESIGN_QUALITY; }
   get timeoutMs() { return this._timeoutMs ?? DESIGN_TIMEOUT_MS; }
   get retries() { return this._retries ?? DESIGN_PROVIDER_RETRIES; }
@@ -100,16 +137,36 @@ export class OpenAIImageProvider {
     return this._client;
   }
 
-  async generateImage({ prompt, size, referenceImages = [] }) {
+  /**
+   * One image. The configured model first (its pinned snapshot when there is one); when it is NOT AVAILABLE or the provider fails (5xx)
+   * after the retries, the fallback model once - logged as a warning. A refusal or any other failure is never answered by the fallback.
+   * `quality` overrides the configured quality for this call (low previews, medium finals).
+   * Returns { buffer, usage: { inputTokens, outputTokens, textInputTokens, imageInputTokens, imageOutputTokens }, model, modelReturned,
+   * fallbackUsed, quality, size, durationMs, attempts }.
+   */
+  async generateImage({ prompt, size, referenceImages = [], quality = null }) {
+    try {
+      return await this._generateWith(this.requestModel, { prompt, size, referenceImages, quality });
+    } catch (error) {
+      const fallback = this.fallbackModel;
+      if (!fallback || !fallbackAllowedFor(error)) throw error;
+      LoggerUtil.warn('[SOCIAL_AI_DESIGN] image_model_fallback_used', { event: 'image_model_fallback_used', model: this.requestModel, fallbackModel: fallback, failureCode: error.code, reason: error.reason || null, ...(error.diagnostics || {}) });
+      const result = await this._generateWith(fallback, { prompt, size, referenceImages, quality });
+      return { ...result, fallbackUsed: true, fallbackFrom: this.requestModel };
+    }
+  }
+
+  async _generateWith(model, { prompt, size, referenceImages = [], quality = null }) {
     const client = this._getClient();
+    const q = quality || this.quality;
     const references = (Array.isArray(referenceImages) ? referenceImages : []).filter((r) => Buffer.isBuffer(r?.buffer) && r.buffer.length).slice(0, MAX_REFERENCE_IMAGES);
-    const request = { model: this.model, prompt, size, quality: this.quality, n: 1, output_format: 'jpeg', moderation: 'auto' };
-    // editing from the real product photo: the same model and options, plus the files (and high input fidelity where the model supports it)
+    const request = { model, prompt, size, quality: q, n: 1, output_format: 'jpeg', moderation: 'auto' };
+    // editing from reference photos (a real product, or a carousel's hook slide): the same model and options, plus the files
     const editRequest = references.length
       ? {
-        model: this.model, prompt, size, quality: this.quality, n: 1, output_format: 'jpeg',
+        model, prompt, size, quality: q, n: 1, output_format: 'jpeg',
         image: await Promise.all(references.map((r, i) => toFile(r.buffer, `reference-${i + 1}.${/png/.test(r.mimeType || '') ? 'png' : 'jpg'}`, { type: r.mimeType || 'image/jpeg' }))),
-        ...(/^gpt-image-1$/.test(this.model) ? { input_fidelity: 'high' } : {}),
+        ...(/^gpt-image-1$/.test(model) ? { input_fidelity: 'high' } : {}),
       }
       : null;
 
@@ -121,16 +178,30 @@ export class OpenAIImageProvider {
         const response = editRequest
           ? await client.images.edit(editRequest, { timeout: this.timeoutMs, maxRetries: 0 })
           : await client.images.generate(request, { timeout: this.timeoutMs, maxRetries: 0 });
+        const u = response?.usage || {};
         return {
           buffer: extractImage(response),
-          usage: { inputTokens: response?.usage?.input_tokens || 0, outputTokens: response?.usage?.output_tokens || 0 },
-          model: this.model,
+          usage: {
+            inputTokens: u.input_tokens || 0, outputTokens: u.output_tokens || 0,
+            textInputTokens: u.input_tokens_details?.text_tokens ?? (u.input_tokens || 0), imageInputTokens: u.input_tokens_details?.image_tokens || 0,
+            imageOutputTokens: u.output_tokens_details?.image_tokens ?? (u.output_tokens || 0),
+          },
+          // the id requested, and the one the response names (if it names one): recorded so a change of style can be traced
+          model, modelReturned: typeof response?.model === 'string' ? response.model : null, fallbackUsed: false,
+          quality: q, size, references: references.length,
           durationMs: Date.now() - started,
           attempts: attempt,
         };
       } catch (raw) {
         const error = classifyImageError(raw);
         lastError = error;
+        // every failed image request is logged with what is needed to act on it (server-side only; the user sees a plain message)
+        LoggerUtil.error('[SOCIAL_AI_DESIGN] image_request_failed', {
+          event: 'image_request_failed', provider: 'openai', model, quality: q, size, promptLength: String(prompt || '').length,
+          references: references.length, attempt, maxAttempts, durationMs: Date.now() - started, failureCode: error.code, reason: error.reason || null,
+          ...error.diagnostics, message: safeProviderMessage(raw?.message),
+          ...(error.reason === 'model_not_found' ? { hint: `Set SOCIAL_AI_DESIGN_MODEL to an image model this key can use (current: ${model}).` } : {}),
+        });
         if (!RETRYABLE_PROVIDER_ERRORS.has(error.code) || attempt >= maxAttempts) throw error;
         await this._sleep(retryDelayMs(raw, attempt));
       }

@@ -211,7 +211,7 @@ describe('single-post AI content generation (real MongoDB, scripted provider)', 
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     await SocialApprovalSettings.create({ project_id: project._id, contentApprovalRequired: false, designApprovalRequired: true });
     await gen(mockContentProvider());
-    assert.equal((await lastDraft()).approvalState, 'content_approved');
+    assert.equal((await lastDraft()).approvalState, 'design_approved', 'a text draft: auto-approved content has no design to wait for');
     assert.equal((await lastDraft()).status, 'draft', 'auto-approved content is still a draft - nothing is scheduled or published');
   });
 
@@ -224,7 +224,7 @@ describe('single-post AI content generation (real MongoDB, scripted provider)', 
     assert.equal(stale.success, false, 'a wrong content version is refused');
     const ok = await approveContent(pid, String(pub._id), reviewer, 1);
     assert.equal(ok.success, true);
-    assert.equal((await lastDraft()).approvalState, 'content_approved');
+    assert.equal((await lastDraft()).approvalState, 'design_approved', 'a text draft is approved with its content');
   });
 
   // ── request validation: nothing is claimed, the AI is never called ─────────

@@ -89,9 +89,9 @@ describe('scheduler -> real Facebook adapter -> published -> permalink (Meta HTT
     const r = await createPublication(pid, userId, { platform: 'facebook', socialAccountId: fb._id.toString(), content });
     const id = r.publication.id;
     await submitContentForApproval(pid, id, userId);
-    assert.equal((await approveContent(pid, id, reviewerId, 1)).success, true);
-    assert.equal((await submitDesignForApproval(pid, id, userId)).success, true);
-    assert.equal((await approveDesign(pid, id, reviewerId, 1)).success, true);
+    const approved = await approveContent(pid, id, reviewerId, 1);
+    assert.equal(approved.success, true);
+    assert.equal(approved.publication.approval.state, 'design_approved', 'a text post is approved with its content');
     assert.equal((await schedulePublication(pid, id, userId, future(), 'UTC')).success, true);
     return id;
   }
@@ -363,8 +363,9 @@ describe('scheduler -> real Facebook adapter -> published -> permalink (Meta HTT
     assert.equal(r.success, true, JSON.stringify(r));
     const id = r.publication.id;
     await submitContentForApproval(pid, id, userId);
-    assert.equal((await approveContent(pid, id, reviewerId, 1)).success, true);
-    assert.equal((await submitDesignForApproval(pid, id, userId)).success, true);
+    const approved = await approveContent(pid, id, reviewerId, 1);
+    assert.equal(approved.success, true);
+    assert.equal(approved.publication.approval.state, 'design_review', 'a post with an image: approving the words submits its design');
     assert.equal((await approveDesign(pid, id, reviewerId, 1)).success, true);
     const s = await schedulePublication(pid, id, userId, future(), 'UTC');
     assert.equal(s.success, true, JSON.stringify(s));

@@ -55,10 +55,10 @@ describe('social business profile — route wiring', () => {
     const mounts = mainRouter.stack.filter((l) => !l.route && l.handle === router).map((l) => String(l.regexp));
     assert.equal(mounts.length, 1);
     assert.match(mounts[0], /social\\\/business-profile/);
-    // the profile itself (GET / PUT) plus the user's brand logo (POST / DELETE /logo) — nothing else
+    // the profile itself (GET / PUT), the user's brand logo (POST / DELETE /logo) and brand font files (POST / DELETE /font) — nothing else
     assert.deepEqual(
       routes.map((r) => `${r.methods.join(',')} ${r.path}`).sort(),
-      ['delete /logo', 'get /', 'post /logo', 'put /'],
+      ['delete /font', 'delete /logo', 'get /', 'post /font', 'post /logo', 'put /'],
     );
   });
 

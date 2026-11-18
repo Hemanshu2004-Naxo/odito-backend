@@ -2,7 +2,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  validateCalendarInput, buildSlots, validateSlotPlan, calendarSeed, weeklyQuota, splitWeeks, weightedSequence, allocatePillars, assignPlatforms, parseDate, formatDate,
+  validateCalendarInput, buildSlots, validateSlotPlan, calendarSeed, weeklyQuota, splitWeeks, weightedSequence, allocatePillars, assignPlatforms, strategyConformance, parseDate, formatDate,
 } from './calendarPlanner.js';
 import { WEEKDAYS } from '../aiStrategy/strategyOutputSchema.js';
 import { buildCalendarToolSchema, validateCalendarBatch, applyVariety, ALL_KPIS, CALENDAR_LIMITS } from './calendarOutputSchema.js';
@@ -144,19 +144,26 @@ describe('buildSlots — the dates that carry a post', () => {
     for (const [d, n] of total.entries()) assert.ok(n > mean * 0.55 && n < mean * 1.6, `weekday ${d} used ${n} times (mean ${mean.toFixed(0)})`);
   });
 
-  test('10d: the strategy\'s recommended days are a mild preference, never a fixed pattern', () => {
-    const recommended = ['tuesday', 'thursday'];
-    let preferred = 0;
-    let all = 0;
-    const combos = new Set();
-    for (let seed = 0; seed < 60; seed += 1) {
-      const slots = buildSlots({ startDate: '2026-10-05', endDate: '2026-11-01', postsPerWeek: 2, recommendedDays: recommended, seed: `rec|${seed}` });
-      slots.forEach((s) => { all += 1; if (recommended.includes(s.dayOfWeek)) preferred += 1; });
-      weeksOf(slots).forEach((w) => combos.add(w.join()));
+  test('10d: the strategy\'s posting days are a RULE: every post sits on them, full weeks get exactly postsPerWeek, partial weeks their share', () => {
+    const recommended = ['tuesday', 'thursday', 'saturday'];
+    for (let seed = 0; seed < 30; seed += 1) {
+      // Wed Oct 14 - Fri Nov 13: a Wed-Sun first week (Thu, Sat), three full weeks, a Mon-Fri last week (Tue, Thu) = 13
+      const slots = buildSlots({ startDate: '2026-10-14', endDate: '2026-11-13', postsPerWeek: 3, recommendedDays: recommended, seed: `rec|${seed}` });
+      assert.equal(slots.length, 13);
+      assert.ok(slots.every((s) => recommended.includes(s.dayOfWeek)), `seed ${seed}: ${slots.map((s) => s.dayOfWeek).join(',')}`);
+      assert.deepEqual(weeksOf(slots).map((w) => w.length), [2, 3, 3, 3, 2]);
+      assert.deepEqual(validateSlotPlan(slots, { startDate: '2026-10-14', endDate: '2026-11-13', postsPerWeek: 3, recommendedDays: recommended }), []);
     }
-    assert.ok(preferred / all > 2 / 7 + 0.05,`recommended days are favoured: ${(100 * preferred / all).toFixed(0)}% vs 29% by chance`);
-    assert.ok(preferred / all < 0.8, 'but they are not used every week');
-    assert.ok(combos.size >= 6, `${combos.size} different weekday pairs`);
+    // fewer posts than days: a subset of the strategy's days, rotating; more posts than days: all of them plus other days
+    const two = buildSlots({ startDate: '2026-10-05', endDate: '2026-11-01', postsPerWeek: 2, recommendedDays: recommended, seed: 'two' });
+    assert.ok(two.every((s) => recommended.includes(s.dayOfWeek)));
+    assert.ok(weeksOf(two).every((w) => w.length === 2));
+    const five = buildSlots({ startDate: '2026-10-05', endDate: '2026-11-01', postsPerWeek: 5, recommendedDays: recommended, seed: 'five' });
+    for (const w of weeksOf(five)) assert.equal(w.length, 5);
+    assert.equal(five.filter((s) => recommended.includes(s.dayOfWeek)).length, 12, 'all three strategy days in each of the four weeks');
+    // a hand-made plan off the strategy's days is refused by the validator
+    const off = [{ date: '2026-10-05' }, { date: '2026-10-07' }, { date: '2026-10-09' }];
+    assert.ok(validateSlotPlan(off, { startDate: '2026-10-05', endDate: '2026-10-11', postsPerWeek: 3, recommendedDays: recommended }).some((p) => p.includes("strategy's posting days")));
     for (const junk of [['nonsense', 'x'], 'tuesday', null, undefined, 7]) {
       assert.equal(buildSlots({ ...week, postsPerWeek: 3, recommendedDays: junk, seed: 'j' }).length, 3, `ignores ${JSON.stringify(junk)}`);
     }
@@ -343,8 +350,40 @@ describe('platform assignment — frequency is total posts, not posts per platfo
     assert.ok(Math.abs(fallback.filter((p) => p[0] === 'facebook').length - 4.5) <= 0.5, 'no recommendation -> an even split');
   });
 
-  test('22: ai_optimized leaves the choice to the model (null) — validated later, per slot', () => {
+  test('22: ai_optimized leaves the choice to the model (null) only for a strategy with no per-platform plan', () => {
     assert.equal(assignPlatforms(slots, ['facebook', 'instagram'], 'ai_optimized'), null);
+  });
+
+  test('22b: with the strategy\'s split (Facebook 2, Instagram 1) EVERY full week is exactly 2 + 1, partial weeks get a fair share, never both', () => {
+    const split = [{ platform: 'facebook', postsPerWeek: 2 }, { platform: 'instagram', postsPerWeek: 1 }];
+    for (let seed = 0; seed < 20; seed += 1) {
+      const dated = buildSlots({ startDate: '2026-10-14', endDate: '2026-11-13', postsPerWeek: 3, recommendedDays: ['tuesday', 'thursday', 'saturday'], seed: `p|${seed}` });
+      for (const mode of ['ai_optimized', 'platform_specific']) {
+        const out = assignPlatforms(dated, ['facebook', 'instagram'], mode, split, `p|${seed}`);
+        assert.ok(out.every((p) => p.length === 1), 'one platform per post');
+        const weeks = new Map();
+        dated.forEach((s, i) => { const k = Math.floor((parseDate(s.date) / 86400000 + 3) / 7); /* Monday-first week number */ weeks.set(k, [...(weeks.get(k) || []), out[i][0]]); });
+        for (const list of weeks.values()) {
+          if (list.length === 3) assert.deepEqual([...list].sort(), ['facebook', 'facebook', 'instagram'], `seed ${seed} ${mode}: a full week`);
+        }
+        const fb = out.filter((p) => p[0] === 'facebook').length;
+        assert.ok(fb >= 8 && fb <= 9, `seed ${seed}: ${fb} of 13 on Facebook`);
+        const items = dated.map((s, i) => ({ date: s.date, platforms: out[i] }));
+        assert.equal(strategyConformance(items, { config: { postsPerWeek: 3, platforms: ['facebook', 'instagram'], distributionMode: mode }, strategy: { postingStrategy: { recommendedDays: ['tuesday', 'thursday', 'saturday'] }, platformStrategy: split } }).follows, true);
+      }
+    }
+  });
+
+  test('22c: strategyConformance names what a calendar made before these rules gets wrong', () => {
+    const items = [
+      { date: '2026-10-15', platforms: ['facebook'] }, { date: '2026-10-20', platforms: ['facebook', 'instagram'] }, { date: '2026-10-25', platforms: ['instagram'] },
+      { date: '2026-10-28', platforms: ['facebook'] }, { date: '2026-11-01', platforms: ['facebook', 'instagram'] }, { date: '2026-10-29', platforms: ['facebook'], isManual: true },
+    ];
+    const r = strategyConformance(items, { config: { postsPerWeek: 3, platforms: ['facebook', 'instagram'], distributionMode: 'ai_optimized' }, strategy: { postingStrategy: { recommendedDays: ['tuesday', 'thursday', 'saturday'] }, platformStrategy: [{ platform: 'facebook', postsPerWeek: 2 }, { platform: 'instagram', postsPerWeek: 1 }] } });
+    assert.equal(r.follows, false);
+    assert.deepEqual(r.issues.map((i) => i.code), ['OFF_DAYS', 'PLATFORM_SPLIT']);
+    assert.match(r.issues[0].message, /^3 posts are on days outside/, 'Sun, Wed, Sun - the manual post is not counted');
+    assert.match(r.issues[1].message, /2 posts go to both platforms/);
   });
 });
 

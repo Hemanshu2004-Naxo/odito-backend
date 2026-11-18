@@ -102,13 +102,27 @@ describe('content approval workflow', () => {
     assert.equal(r.success, true, 'seed approve content');
     return r.publication;
   }
-  async function inDesignReview(fields) {
-    const p = await inContentApproved(fields);
-    const r = await submitDesignForApproval(pid, p.id, userId);
-    assert.equal(r.success, true, 'seed submit design');
-    return r.publication;
+  // content approved, waiting for a design that does not exist yet (an Instagram post without media is the real case). Built directly:
+  // the fixture account is a Facebook Page, where a post without media is a complete text post.
+  async function waitingForDesign(fields) {
+    const p = await inContentReview(fields);
+    await SocialPublication.updateOne({ _id: p.id }, { $set: { approvalState: 'content_approved', contentApprovedAt: new Date(), contentApprovedBy: reviewerId, contentApprovedVersion: 1 } });
+    return getPublication(pid, p.id);
   }
-  async function fullyApproved(fields) {
+  // a post with media: approving its content submits that media as the design
+  const IMAGE = () => [{ url: mediaUrl('default'), type: 'image' }];
+  async function inDesignReview(fields = {}) {
+    const p = await inContentApproved({ media: IMAGE(), ...fields });
+    assert.equal(p.approval.state, 'design_review', 'approving content with media submits its design');
+    return p;
+  }
+  // fully approved: through design review when the post has media; a text post is approved with its content
+  async function fullyApproved(fields = {}) {
+    if (!fields.media?.length) {
+      const p = await inContentApproved(fields);
+      assert.equal(p.approval.state, 'design_approved', 'a text post is approved with its content');
+      return p;
+    }
     const p = await inDesignReview(fields);
     const r = await approveDesign(pid, p.id, reviewerId, p.approval.designVersion);
     assert.equal(r.success, true, 'seed approve design');
@@ -128,14 +142,53 @@ describe('content approval workflow', () => {
     assert.equal(p.status, 'draft');
   });
 
-  test('2: approving content records approver/time/version and moves to content_approved (design still required)', async (t) => {
+  test('2: approving content of a post WITH media records approver/time/version and moves it to design_review', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    const p = await inContentApproved();
-    assert.equal(p.approval.state, 'content_approved');
+    const p = await inContentApproved({ media: IMAGE() });
+    assert.equal(p.approval.state, 'design_review');
     assert.equal(p.approval.contentApprovedBy, reviewerId.toString());
     assert.equal(p.approval.contentApprovedVersion, 1);
     assert.ok(p.approval.contentApprovedAt);
+    assert.equal(p.approval.designSubmittedBy, reviewerId.toString());
     assert.equal(p.approval.publishable, false);
+  });
+
+  test('2b: approving content of a TEXT post (Facebook, no media) makes it approved: there is no design to review', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const p = await inContentApproved({ media: [] });
+    assert.equal(p.approval.state, 'design_approved');
+    assert.equal(p.approval.stage, 'ready_to_schedule');
+    assert.equal(p.approval.publishable, true);
+    assert.equal(p.approval.contentApprovedBy, reviewerId.toString(), 'the person who approved the words is recorded');
+    assert.ok(p.approval.contentApprovedAt);
+    assert.equal(p.approval.designApprovedBy, null, 'no design approval is claimed for a person');
+    const stored = await SocialPublication.findById(p.id).lean();
+    assert.equal(stored.approvalState, 'design_approved');
+  });
+
+  test('2c: a text post left in content_approved (approved before this rule) completes on "submit design" without a design review', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const p = await inContentReview({ media: [] });
+    await SocialPublication.updateOne({ _id: p.id }, { $set: { approvalState: 'content_approved', contentApprovedAt: new Date(), contentApprovedBy: reviewerId, contentApprovedVersion: 1 } });
+    const r = await submitDesignForApproval(pid, p.id, userId);
+    assert.equal(r.success, true);
+    assert.equal(r.publication.approval.state, 'design_approved');
+  });
+
+  test('2d: saving an UNCHANGED caption (even with different line endings / trailing spaces) keeps the approval; a real edit sends it back to content_review', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const p = await inContentApproved({ media: [], content: 'Line one\nLine two' });
+    assert.equal(p.approval.state, 'design_approved');
+    const same = await updatePublication(pid, p.id, userId, { content: 'Line one\r\nLine two  \n' });
+    assert.equal(same.success, true);
+    assert.equal(same.publication.approval.state, 'design_approved', 'the approval stays');
+    assert.equal(same.publication.approval.contentVersion, 1, 'no version bump');
+    assert.equal(same.publication.content, 'Line one\nLine two', 'the stored caption is untouched');
+    const edited = await updatePublication(pid, p.id, userId, { content: 'Line one\nLine two, edited' });
+    assert.equal(edited.success, true);
+    assert.equal(edited.publication.approval.state, 'content_review');
+    assert.equal(edited.publication.approval.contentVersion, 2);
+    assert.equal(edited.publication.approval.contentApprovedAt, null);
   });
 
   test('3: request-changes keeps the SAME review state and persists actor, time, reason and version', async (t) => {
@@ -167,7 +220,7 @@ describe('content approval workflow', () => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const p = await inDesignReview();
     assert.equal(p.approval.state, 'design_review');
-    assert.equal(p.approval.designSubmittedBy, userId.toString());
+    assert.equal(p.approval.designSubmittedBy, reviewerId.toString(), 'submitted by the content approval itself');
 
     const rc = await requestDesignChanges(pid, p.id, reviewerId, { version: 1, reason: 'Logo is cropped' });
     assert.equal(rc.success, true);
@@ -189,7 +242,7 @@ describe('content approval workflow', () => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const unmanaged = await draft();
     const review = await inContentReview();
-    const approvedContent = await inContentApproved();
+    const approvedContent = await waitingForDesign();
     const designReview = await inDesignReview();
 
     const cases = [
@@ -252,11 +305,11 @@ describe('content approval workflow', () => {
     assert.equal(await SocialApprovalSettings.countDocuments({ project_id: project._id }), 0);
   });
 
-  test('10: content approval not required -> submit auto-approves content (approvedBy null) and waits for design', async (t) => {
+  test('10: content approval not required -> submit auto-approves content (approvedBy null) and its media goes to design review', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     assert.equal((await updateApprovalSettings(pid, userId, { contentApprovalRequired: false })).success, true);
-    const p = await inContentReview();
-    assert.equal(p.approval.state, 'content_approved');
+    const p = await inContentReview({ media: IMAGE() });
+    assert.equal(p.approval.state, 'design_review');
     assert.equal(p.approval.contentApprovedBy, null);
     assert.equal(p.approval.contentApprovedVersion, 1);
   });
@@ -379,7 +432,7 @@ describe('content approval workflow', () => {
   test('21: publishNow on a post in review returns APPROVAL_REQUIRED and NEVER calls Meta', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const inReview = await inContentReview();
-    const contentOk = await inContentApproved();
+    const contentOk = await waitingForDesign();
     const designReview = await inDesignReview();
     await withAdapter(OK, async (calls) => {
       for (const p of [inReview, contentOk, designReview]) {
@@ -503,9 +556,7 @@ describe('content approval workflow', () => {
     await SocialPublication.updateOne({ _id: approved.id }, { $set: { status: 'draft' } }); // review actions apply to pre-publication posts
     const c = await approveContent(pid, approved.id, reviewerId, blocked.approval.contentVersion);
     assert.equal(c.success, true);
-    const sd = await submitDesignForApproval(pid, approved.id, userId);
-    assert.equal(sd.success, true);
-    assert.equal((await approveDesign(pid, approved.id, reviewerId, sd.publication.approval.designVersion)).success, true);
+    assert.equal(c.publication.approval.state, 'design_approved', 'a text post: approving the words approves the post');
     await SocialPublication.updateOne({ _id: approved.id }, { $set: { status: 'failed' } });
     assert.equal((await getPublication(pid, approved.id)).canRetry, true);
     await withAdapter(OK, async (calls) => {
@@ -538,7 +589,7 @@ describe('content approval workflow', () => {
     assert.equal(results.filter((r) => r.success).length, 1);
     const loser = results.find((r) => !r.success);
     assert.ok(['INVALID_APPROVAL_STATE', 'APPROVAL_CONFLICT'].includes(loser.error.code), loser.error.code);
-    assert.equal((await getPublication(pid, p.id)).approval.state, 'content_approved');
+    assert.equal((await getPublication(pid, p.id)).approval.state, 'design_approved');
   });
 
   test('30: approve vs request-changes racing — never both applied', async (t) => {
@@ -551,7 +602,7 @@ describe('content approval workflow', () => {
       ]);
       const final = await getPublication(pid, p.id);
       if (a.success) {
-        assert.equal(final.approval.state, 'content_approved');
+        assert.equal(final.approval.state, 'design_approved');
         // a change request that landed first is cleared by the approval; one that lost is rejected
         assert.equal(final.approval.changesRequested, null);
       } else {
@@ -586,7 +637,7 @@ describe('content approval workflow', () => {
     await inContentReview();
     const second = await inContentReview();
     await requestContentChanges(pid, second.id, reviewerId, { version: 1, reason: 'again' });
-    await inContentApproved();
+    await waitingForDesign();
     await inDesignReview();
     await fullyApproved();
     const published = await inContentReview();
@@ -605,13 +656,13 @@ describe('content approval workflow', () => {
       await draft();
       const a = await inContentReview();
       const b = await inContentReview();
-      await approveContent(pid, b.id, actorId, 1);
+      await approveContent(pid, b.id, actorId, 1); // a text post: approved straight through
 
       assert.equal((await listPublications(pid, { approval: 'managed' })).data.length, 2);
       assert.equal((await listPublications(pid, { approval: 'unmanaged' })).data.length, 1);
       const inReview = await listPublications(pid, { approval: 'content_review' });
       assert.deepEqual(inReview.data.map((p) => p.id), [a.id]);
-      const approvedList = await listPublications(pid, { approval: 'content_approved' });
+      const approvedList = await listPublications(pid, { approval: 'design_approved' });
       assert.equal(approvedList.data.length, 1);
       if (reviewer) assert.equal(approvedList.data[0].approval.contentApprovedByName, 'Riya Shah');
       assert.equal(approvedList.data[0].approval.submittedByName, null, 'unknown actor -> null name, never a made-up one');

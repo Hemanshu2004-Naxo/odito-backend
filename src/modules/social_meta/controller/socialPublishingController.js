@@ -28,6 +28,7 @@ const VALID_APPROVAL_FILTERS = new Set(['managed', 'unmanaged', ...APPROVAL_STAT
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const ERROR_STATUS = {
+  DESIGN_NEEDS_ATTENTION: 409,
   PLATFORM_NOT_SUPPORTED: 400,
   ACCOUNT_NOT_FOUND: 404,
   ACCOUNT_NOT_CONNECTED: 409,
@@ -206,11 +207,14 @@ export async function schedulePublicationHandler(req, res) {
   if (!scheduledAt) return res.status(400).json(ResponseUtil.error('scheduledAt is required.', 400, { code: 'SCHEDULED_AT_REQUIRED' }));
 
   try {
-    const result = await schedulePublication(projectId, publicationId, userId, scheduledAt, timezone);
-    if (!result.success) {
+    // dryRun: every scheduling check, nothing written, the planned Graph calls returned (never published)
+    const dryRun = req.body?.dryRun === true;
+    const result = await schedulePublication(projectId, publicationId, userId, scheduledAt, timezone, { dryRun });
+    if (!result.success && !result.dryRun) {
       const status = statusFor(result.error.code);
       return res.status(status).json(ResponseUtil.error(result.error.message, status, { code: result.error.code }));
     }
+    if (result.dryRun) return res.json(ResponseUtil.success({ dryRun: true, schedulable: result.success, blockers: result.blockers, checks: result.checks, wouldSchedule: result.wouldSchedule, publishPlan: result.publishPlan }));
     return res.json(ResponseUtil.success({ publication: result.publication }));
   } catch (error) {
     LoggerUtil.error('[SOCIAL_PUBLISHING] Failed to schedule publication', { message: error.message }, { projectId, publicationId });
@@ -300,7 +304,7 @@ function approvalAction(label, run) {
       const result = await run({ projectId, userId, publicationId, body: req.body || {} });
       if (!result.success) {
         const status = statusFor(result.error.code);
-        return res.status(status).json(ResponseUtil.error(result.error.message, status, { code: result.error.code }));
+        return res.status(status).json(ResponseUtil.error(result.error.message, status, { code: result.error.code, ...(result.error.attention ? { attention: result.error.attention } : {}) }));
       }
       return res.json(ResponseUtil.success({ publication: result.publication }));
     } catch (error) {
@@ -314,7 +318,7 @@ export const submitContentHandler = approvalAction('submit the post for review',
 export const approveContentHandler = approvalAction('approve the content', ({ projectId, userId, publicationId, body }) => approveContent(projectId, publicationId, userId, body.version));
 export const requestContentChangesHandler = approvalAction('request content changes', ({ projectId, userId, publicationId, body }) => requestContentChanges(projectId, publicationId, userId, { version: body.version, reason: body.reason }));
 export const submitDesignHandler = approvalAction('submit the design for review', ({ projectId, userId, publicationId }) => submitDesignForApproval(projectId, publicationId, userId));
-export const approveDesignHandler = approvalAction('approve the design', ({ projectId, userId, publicationId, body }) => approveDesign(projectId, publicationId, userId, body.version));
+export const approveDesignHandler = approvalAction('approve the design', ({ projectId, userId, publicationId, body }) => approveDesign(projectId, publicationId, userId, body.version, { acknowledgeAttention: body.acknowledgeAttention === true }));
 export const requestDesignChangesHandler = approvalAction('request design changes', ({ projectId, userId, publicationId, body }) => requestDesignChanges(projectId, publicationId, userId, { version: body.version, reason: body.reason }));
 
 export async function approvalSummaryHandler(req, res) {

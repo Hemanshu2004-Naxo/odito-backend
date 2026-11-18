@@ -1,4 +1,5 @@
 import { resolveSocialBusinessProfile } from '../service/socialBusinessProfileResolver.js';
+import { uploadBrandFont, deleteBrandFont } from '../service/brandFontService.js';
 import { updateProfile, setBrandLogo, clearBrandLogo } from '../service/socialBusinessProfileService.js';
 import { processAndStoreCatalogImage } from '../service/media/catalogMedia.js';
 import mediaStorageService from '../service/media/mediaStorageService.js';
@@ -81,6 +82,38 @@ export async function uploadBrandLogoHandler(req, res) {
   } catch (error) {
     LoggerUtil.error('[SOCIAL_BUSINESS_PROFILE] Failed to save logo', { message: error.message }, { projectId });
     return res.status(500).json(ResponseUtil.error('Failed to save the logo', 500, { code: 'SOCIAL_BUSINESS_PROFILE_FAILED' }));
+  }
+}
+
+/** POST /font?role&weight — one brand font file (validated, test-rendered, stored privately). Returns the re-resolved profile. */
+export async function uploadBrandFontHandler(req, res) {
+  const projectId = req.projectId;
+  if (!req.file || !Buffer.isBuffer(req.file.buffer)) return res.status(400).json(ResponseUtil.error('No file was uploaded.', 400, { code: 'MEDIA_REQUIRED' }));
+  try {
+    const role = String(req.query?.role || req.body?.role || '');
+    const weight = String(req.query?.weight || req.body?.weight || '');
+    const r = await uploadBrandFont({ projectId, userId: req.userId, role, weight, buffer: req.file.buffer });
+    if (!r.success) return res.status(r.error.status || 400).json(ResponseUtil.error(r.error.message, r.error.status || 400, { code: r.error.code }));
+    const result = await resolveSocialBusinessProfile(projectId);
+    if (!result) return res.status(404).json(ResponseUtil.error('Project not found.', 404, { code: 'NOT_FOUND' }));
+    return res.status(201).json(ResponseUtil.success(result));
+  } catch (error) {
+    LoggerUtil.error('[SOCIAL_BUSINESS_PROFILE] Failed to save a brand font', { message: error.message }, { projectId });
+    return res.status(500).json(ResponseUtil.error('Failed to save the font', 500, { code: 'SOCIAL_BUSINESS_PROFILE_FAILED' }));
+  }
+}
+
+/** DELETE /font { role, weight } — removes one uploaded brand font file. */
+export async function deleteBrandFontHandler(req, res) {
+  const projectId = req.projectId;
+  try {
+    const r = await deleteBrandFont({ projectId, userId: req.userId, role: String(req.body?.role || req.query?.role || ''), weight: String(req.body?.weight || req.query?.weight || '') });
+    if (!r.success) return res.status(r.error.status || 400).json(ResponseUtil.error(r.error.message, r.error.status || 400, { code: r.error.code }));
+    const result = await resolveSocialBusinessProfile(projectId);
+    return res.json(ResponseUtil.success(result));
+  } catch (error) {
+    LoggerUtil.error('[SOCIAL_BUSINESS_PROFILE] Failed to remove a brand font', { message: error.message }, { projectId });
+    return res.status(500).json(ResponseUtil.error('Failed to remove the font', 500, { code: 'SOCIAL_BUSINESS_PROFILE_FAILED' }));
   }
 }
 

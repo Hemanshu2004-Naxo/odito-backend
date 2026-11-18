@@ -26,6 +26,8 @@ import { PROVIDER_ERROR } from '../aiContent/providers/contentProviderErrors.js'
 import { validRawStrategy, providerError } from '../../testSupport/aiStrategyFixtures.js';
 import { mockImageProvider, makeImage, removeProjectMedia, listProjectMedia } from '../../testSupport/designFixtures.js';
 import { setDesignComposerOverride } from './designProducer.js';
+import { asWaitingForDesign } from '../../testSupport/approvalFixtures.js';
+import { getPublication } from '../socialPublishingService.js';
 
 /**
  * Creative Studio, for real: real MongoDB, real sharp, real files under storage/social_media/, a scripted image provider. Proves that the
@@ -68,7 +70,9 @@ describe('Creative Studio (real MongoDB + sharp + storage, scripted provider)', 
       assert.equal((await submitContentForApproval(pid, pub.id, userId)).success, true);
       const a = await approveContent(pid, pub.id, reviewerId, 1);
       assert.equal(a.success, true, JSON.stringify(a));
-      pub = a.publication;
+      // a text post is approved with its content; these tests are about a post WAITING for its design (see approvalFixtures)
+      await asWaitingForDesign(pub.id);
+      pub = await getPublication(pid, pub.id);
     }
     return pub;
   }
@@ -197,14 +201,14 @@ describe('Creative Studio (real MongoDB + sharp + storage, scripted provider)', 
     assert.equal(s.brand.businessName, 'Acme Dental');
     assert.deepEqual(s.brand.colors, { primary: '#1d4ed8', secondary: '#f59e0b', accent: null, configured: true });
     assert.deepEqual(s.brand.logo, { available: false, url: null });
-    assert.deepEqual(s.brand.fonts, { heading: null, body: null, isDefault: true });
+    assert.deepEqual(s.brand.fonts, { heading: null, body: null, isDefault: true, headingUploaded: false, bodyUploaded: false, unavailable: [] });
     assert.deepEqual(s.brand.visualGuidelines, ['Bright, clean photography']);
     assert.equal(s.brand.tone, 'Warm');
     const logo = await uploadFile(await sharp({ create: { width: 200, height: 100, channels: 4, background: '#101820' } }).png().toBuffer(), '.png');
     await SocialBusinessProfile.updateOne({ project_id: project._id }, { $set: { 'brand.logo': { url: logo.url, storageKey: logo.key, mimeType: 'image/png' }, 'brand.fontHeading': 'Poppins', 'brand.fontBody': 'Inter', 'brand.primaryColor': '#0f766e' } }, { upsert: true });
     s = await getStudioState(pid, pub.id);
     assert.deepEqual(s.brand.logo, { available: true, url: logo.url });
-    assert.deepEqual(s.brand.fonts, { heading: 'Poppins', body: 'Inter', isDefault: false });
+    assert.deepEqual(s.brand.fonts, { heading: 'Poppins', body: 'Inter', isDefault: false, headingUploaded: false, bodyUploaded: false, unavailable: [] });
     assert.equal(s.brand.colors.primary, '#0f766e', 'the CURRENT brand kit wins over the frozen snapshot');
     assert.equal(JSON.stringify(s.brand).includes('storageKey'), false, 'the internal storage key is never returned');
   });
@@ -291,43 +295,56 @@ describe('Creative Studio (real MongoDB + sharp + storage, scripted provider)', 
     }
   });
 
-  test('10: one failing photograph does not lose the others: that card reports its failure, the designs that did not need it are real', async (t) => {
+  test('10: one failing photograph does not lose the others: that card is drawn without a photograph and says why; the others are real', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const pub = await seedPost({ content: LIST_CAPTION });
     let failedOnce = false;
     use(mockImageProvider({ behavior: async () => { if (!failedOnce) { failedOnce = true; throw providerError(PROVIDER_ERROR.TIMEOUT, { message: 'sk-SECRET-KEY upstream' }); } return makeImage({ width: 1536, height: 1024 }); } }));
     const r = await gen(pub);
     assert.equal(r.generation.status, 'ready');
-    const failed = r.generation.candidates.filter((c) => c.status === 'failed');
-    assert.equal(failed.length, 1);
-    assert.equal(failed[0].failure.code, 'AI_TIMEOUT');
-    assert.equal(failed[0].failure.message, STUDIO_FAILURE_MESSAGES.AI_TIMEOUT);
-    assert.equal(failed[0].imageUrl, null);
-    assert.ok(['premium_editorial', 'announcement', 'team_story', 'brand_awareness', 'service_promotion', 'lead_generation', 'service_expertise'].includes(failed[0].creativeType), 'only a photographic design can fail on the photograph');
-    assert.equal(r.generation.candidates.filter((c) => c.status === 'ready').length, 2);
+    const fell = r.generation.candidates.filter((c) => c.fallback);
+    assert.equal(fell.length, 1);
+    assert.equal(fell[0].status, 'ready');
+    assert.equal(fell[0].fallback.code, 'AI_TIMEOUT');
+    assert.match(fell[0].fallback.message, /This option uses a layout without a photograph instead\.$/);
+    assert.equal(fell[0].layoutId, 'statement_quote');
+    assert.ok(['premium_editorial', 'announcement', 'team_story', 'brand_awareness', 'service_promotion', 'lead_generation', 'service_expertise'].includes(fell[0].creativeType), 'only a photographic design falls back, and it keeps its planned direction for "Try again"');
+    assert.equal(r.generation.candidates.filter((c) => c.status === 'ready').length, 3);
     assert.equal(JSON.stringify(r).includes('SECRET'), false);
   });
 
-  test('11: when the photographs fail, only those cards fail (with a safe message); the infographic is still produced, nothing is stored for the failures and there is NO stand-in picture', async (t) => {
+  test('11: when the photographs fail, those cards are drawn WITHOUT a photograph and say why (never a generic error); no stand-in picture is stored; "Try again" tries the photograph again', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
     const pub = await seedPost({ content: LIST_CAPTION });
-    use(mockImageProvider({ behavior: () => { throw providerError(PROVIDER_ERROR.AUTH, { message: 'sk-LEAK-KEY and the prompt text' }); } }));
+    use(mockImageProvider({ behavior: () => { throw Object.assign(providerError(PROVIDER_ERROR.MISCONFIGURED, { status: 400, reason: 'model_not_found' }), { secret: 'sk-LEAK-KEY and the prompt text' }); } }));
     const r = await gen(pub);
-    assert.equal(r.generation.status, 'ready', 'a design that needs no photograph does not fail with the photographs');
-    const failed = r.generation.candidates.filter((c) => c.status === 'failed');
-    const ok = r.generation.candidates.filter((c) => c.status === 'ready');
-    assert.equal(failed.length, 2);
-    assert.equal(ok.length, 1);
-    assert.equal(ok[0].layoutId, 'infographic_points');
-    for (const c of failed) { assert.equal(c.imageUrl, null); assert.equal(c.failure.message.includes('sk-'), false); }
-    assert.equal((await listProjectMedia(pid)).length, 1, 'only the infographic was stored: no placeholder for the failed photographs');
+    assert.equal(r.generation.status, 'ready');
+    const cards = r.generation.candidates;
+    assert.ok(cards.every((c) => c.status === 'ready'), 'no card fails because a photograph could not be made');
+    const fellBack = cards.filter((c) => c.fallback);
+    assert.equal(fellBack.length, 2, 'the two photo directions fell back');
+    for (const c of fellBack) {
+      assert.equal(c.fallback.code, 'DESIGN_IMAGE_MODEL_UNAVAILABLE');
+      assert.match(c.fallback.message, /image model Odito is set up to use is not available .*This option uses a layout without a photograph instead\.$/);
+      assert.equal(c.layoutId, 'statement_quote');
+      assert.ok(c.notes.includes('photo_fallback'));
+      assert.equal(JSON.stringify(c).includes('sk-'), false);
+    }
+    assert.equal(cards.find((c) => !c.fallback).layoutId, 'infographic_points');
+    assert.equal((await listProjectMedia(pid)).length, 3, 'three finished designs, and no photograph file for the failed ones');
     assert.deepEqual((await row(pub.id)).media, []);
     assert.equal((await rec(r.generation.id)).active, false);
-    assert.equal(captured.join('\n').includes('sk-LEAK-KEY'), false, 'the provider text is never logged');
+    const log = captured.join('\n');
+    assert.equal(log.includes('sk-LEAK-KEY'), false, 'no key or prompt text in the logs');
+    assert.match(log, /design_photo_fallback/, 'the fallback is logged');
     const retry = mockImageProvider();
     use(retry);
-    const again = await regen(pub, r.generation.id, failed[0].id);
-    assert.equal(again.generation.candidates.find((c) => c.id === failed[0].id).status, 'ready', 'try again on the failed card works');
+    const again = await regen(pub, r.generation.id, fellBack[0].id);
+    const tried = again.generation.candidates.find((c) => c.id === fellBack[0].id);
+    assert.equal(tried.status, 'ready');
+    assert.equal(tried.fallback, null, 'try again made the photograph this time');
+    assert.notEqual(tried.layoutId, 'statement_quote');
+    assert.equal(retry.calls.length, 1, 'the photograph was requested again');
   });
 
   test('12: the generation is a single in-flight job per post: a second request while one runs gets the running one, and the photographs are made once', async (t) => {

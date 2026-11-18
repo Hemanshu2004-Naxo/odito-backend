@@ -248,9 +248,23 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     assert.deepEqual(new Set(state.items.map((i) => i.platforms[0])), new Set(['facebook', 'instagram']));
   });
 
-  test('10: ai_optimized lets the model put an item on both platforms — still ONE item, counted once', async (t) => {
+  test('10: ai_optimized follows the strategy\'s per-platform split: one platform per post, fixed by the server, and a "both" answer is refused', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    await seedStrategy();
+    await seedStrategy(pid, userId, { platformStrategy: validRawStrategy().platformStrategy.map((p) => ({ ...p, postsPerWeek: p.platform === 'facebook' ? 2 : 1 })) });
+    const provider = mockCalendarProvider({ behavior: ({ slots, callNumber }) => ({ items: slots.map((s) => validRawCalendarItem(s, callNumber === 1 ? { platforms: ['facebook', 'instagram'] } : {})) }) });
+    const r = await generate(provider, { postsPerWeek: 3, distributionMode: 'ai_optimized', startDate: addDays(1), endDate: addDays(28) });
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r));
+    assert.equal(provider.calls.length >= 2, true, 'the first answer (both platforms on fixed slots) was refused and repaired');
+    const state = await current();
+    assert.ok(state.items.every((i) => i.platforms.length === 1));
+    assert.ok(state.items.every((i) => ['tuesday', 'thursday', 'saturday'].includes(i.dayOfWeek)), 'only on the strategy\'s days');
+    assert.equal(state.conformance.follows, true);
+  });
+
+  test('10b: an old strategy with no per-platform plan still lets the model put an item on both platforms — still ONE item, counted once', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const s = await seedStrategy();
+    await SocialAIStrategy.updateOne({ _id: s._id }, { $unset: { 'strategy.platformStrategy.$[].postsPerWeek': '' } });
     const provider = mockCalendarProvider({ behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, { platforms: s.index === 0 ? ['facebook', 'instagram'] : ['instagram'] })) }) });
     await generate(provider, { postsPerWeek: 3, distributionMode: 'ai_optimized' });
     const state = await current();
@@ -608,7 +622,7 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     const s = await seedStrategy();
     const state = await current();
     assert.deepEqual(state.connectedPlatforms, { facebook: true, instagram: false });
-    assert.deepEqual(state.strategy, { available: true, id: String(s._id), version: s.version, platforms: ['facebook', 'instagram'], hasHooks: true, planning: null, recommended: { postsPerWeek: 4, range: { min: 3, max: 5 }, days: ['tuesday', 'thursday', 'saturday'] } });
+    assert.deepEqual(state.strategy, { available: true, id: String(s._id), version: s.version, platforms: ['facebook', 'instagram'], hasHooks: true, planning: null, recommended: { postsPerWeek: 4, range: { min: 3, max: 5 }, days: ['tuesday', 'thursday', 'saturday'] }, platformSplit: [{ platform: 'facebook', postsPerWeek: 3 }, { platform: 'instagram', postsPerWeek: 3 }] });
     assert.deepEqual(state.limits, { minDays: 7, maxDays: 184, minMonths: 1, maxMonths: 6, maxPostsPerWeek: 7, maxPosts: 200 });
   });
 
@@ -639,7 +653,7 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     assert.deepEqual(state.items.map((i) => i.date), planned);
     assert.equal(new Set(planned).size, planned.length, 'no date twice');
     assert.ok(planned.every((d) => d >= doc.config.startDate && d <= doc.config.endDate));
-    assert.deepEqual(validateSlotPlan(planned.map((date, index) => ({ index, date })), { startDate: doc.config.startDate, endDate: doc.config.endDate, postsPerWeek: 3 }), []);
+    assert.deepEqual(validateSlotPlan(planned.map((date, index) => ({ index, date })), { startDate: doc.config.startDate, endDate: doc.config.endDate, postsPerWeek: 3, recommendedDays: strategy.strategy.postingStrategy.recommendedDays }), []);
 
     // one AI call per batch, every item pinned to the strategy it came from
     assert.equal(provider.calls.length, Math.ceil(expected.value.totalPosts / CALENDAR_BATCH_SIZE));
@@ -702,32 +716,38 @@ describe('Content Calendar generation (real MongoDB, scripted providers)', () =>
     assert.equal((await generate(mockCalendarProvider(), { platforms: ['facebook'], postsPerWeek: 2 })).generation.status, 'ready');
   });
 
-  test('34: weekdays vary from week to week (not a recurring scheduler), every week has the requested count, nothing is outside the range, and a regeneration gets a different valid plan', async (t) => {
+  test('34: posts follow the strategy\'s posting days, every whole week has the requested count, nothing is outside the range; without days the weekdays vary', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const days = ['tuesday', 'thursday', 'saturday'];
     await seedStrategy();
     const range = { postsPerWeek: 3, startDate: addDays(1), endDate: addDays(30) };
     await generate(mockCalendarProvider(), range);
     const first = (await current()).items;
     const asSlots = (list) => list.map((i, index) => ({ index, date: i.date, dayOfWeek: i.dayOfWeek }));
-    assert.deepEqual(validateSlotPlan(asSlots(first), range), [], 'passes the same quality check the planner runs');
+    assert.deepEqual(validateSlotPlan(asSlots(first), { ...range, recommendedDays: days }), [], 'passes the same quality check the planner runs');
     assert.ok(first.every((i) => i.date >= range.startDate && i.date <= range.endDate), 'never outside the requested range');
-
-    const weekdayCombos = new Set();
+    assert.ok(first.every((i) => days.includes(i.dayOfWeek)), `only the strategy's days: ${first.map((i) => i.dayOfWeek).join(',')}`);
     for (const week of splitWeeks(parseDate(range.startDate), parseDate(range.endDate))) {
-      if (week.valid.length === 7) weekdayCombos.add(first.filter((i) => { const ms = parseDate(i.date); return ms >= week.start && ms < week.start + 7 * 86400000; }).map((i) => i.dayOfWeek).join(','));
+      if (week.valid.length === 7) assert.equal(first.filter((i) => { const ms = parseDate(i.date); return ms >= week.start && ms < week.start + 7 * 86400000; }).length, 3);
     }
-    assert.ok(weekdayCombos.size >= 2, `the whole weeks do not all use the same weekdays: ${[...weekdayCombos].join(' | ')}`);
 
+    // a strategy without posting days: the planner varies the weekdays (and a regeneration gets a different valid plan)
+    const s2 = await seedStrategy();
+    await SocialAIStrategy.updateOne({ _id: s2._id }, { $set: { 'strategy.postingStrategy.recommendedDays': [] } });
     await generate(mockCalendarProvider(), range);
-    const state = await current();
-    assert.equal(state.calendar.version, 2);
-    assert.notDeepEqual(state.items.map((i) => i.date), first.map((i) => i.date), 'a new version is planned with a new seed');
-    assert.deepEqual(validateSlotPlan(asSlots(state.items), range), []);
+    const varied = (await current()).items;
+    assert.deepEqual(validateSlotPlan(asSlots(varied), range), []);
+    await generate(mockCalendarProvider(), range);
+    const again = (await current()).items;
+    assert.notDeepEqual(again.map((i) => i.date), varied.map((i) => i.date), 'a new version is planned with a new seed');
+    assert.deepEqual(validateSlotPlan(asSlots(again), range), []);
   });
 
   test('37: a post for BOTH platforms is stored with its own adapted copy per platform; a one-platform post has none; nothing is left blank', async (t) => {
     if (!mongoAvailable) return t.skip('local MongoDB not reachable');
-    await seedStrategy();
+    // a cross-post exists only when the strategy has no per-platform plan (the model then chooses per slot)
+    const seeded = await seedStrategy();
+    await SocialAIStrategy.updateOne({ _id: seeded._id }, { $unset: { 'strategy.platformStrategy.$[].postsPerWeek': '' } });
     const both = ['facebook', 'instagram'];
     const provider = mockCalendarProvider({ behavior: ({ slots }) => ({ items: slots.map((s) => validRawCalendarItem(s, s.index % 2 === 0 ? { platforms: both } : { platforms: ['instagram'] })) }) });
     const r = await generate(provider, { postsPerWeek: 4, startDate: addDays(1), endDate: addDays(7), distributionMode: 'ai_optimized' });

@@ -1,7 +1,7 @@
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import metaApiService from '../metaApiService.js';
-import { publish } from './instagramAdapter.js';
+import { publish, planPublish } from './instagramAdapter.js';
 
 async function withMockedRequest(request, fn) {
   const original = metaApiService.request;
@@ -28,9 +28,72 @@ describe('instagramAdapter.publish — validation', () => {
     assert.equal(result.error.code, 'MEDIA_REQUIRED');
   });
 
-  test('more than one media item is rejected with MEDIA_NOT_SUPPORTED', async () => {
-    const result = await publish({ account, content: '', media: [{ url: 'https://x/a.png', type: 'image' }, { url: 'https://x/b.png', type: 'image' }] });
-    assert.equal(result.error.code, 'MEDIA_NOT_SUPPORTED');
+  test('a carousel of more than 10 items, or with a video, is rejected with MEDIA_NOT_SUPPORTED, never sent to Meta', async () => {
+    let called = false;
+    const eleven = Array.from({ length: 11 }, (_, i) => ({ url: `https://cdn.example.com/s${i}.jpg`, type: 'image' }));
+    const r1 = await withMockedRequest(async () => { called = true; return { success: true, data: {} }; }, () => publish({ account, content: '', media: eleven }));
+    const r2 = await withMockedRequest(async () => { called = true; return { success: true, data: {} }; }, () => publish({ account, content: '', media: [{ url: 'https://cdn.example.com/a.jpg', type: 'image' }, { url: 'https://cdn.example.com/b.mp4', type: 'video' }] }));
+    assert.equal(called, false);
+    assert.equal(r1.error.code, 'MEDIA_NOT_SUPPORTED');
+    assert.equal(r2.error.code, 'MEDIA_NOT_SUPPORTED');
+  });
+});
+
+describe('instagramAdapter.publish — CAROUSEL (child containers, then the parent, then media_publish)', () => {
+  const slides = [1, 2, 3].map((n) => ({ url: `https://cdn.example.com/slide-${n}.jpg`, type: 'image' }));
+  const scripted = (overrides = {}) => {
+    const calls = [];
+    let child = 0;
+    const fn = async (req) => {
+      calls.push(req);
+      if (overrides[req.context]) return overrides[req.context](req, calls);
+      if (req.context === 'instagram_create_carousel_item') { child += 1; return { success: true, data: { id: `child_${child}` } }; }
+      if (req.context === 'instagram_check_container_status') return { success: true, data: { status_code: 'FINISHED' } };
+      if (req.context === 'instagram_create_carousel_container') return { success: true, data: { id: 'parent_1' } };
+      if (req.context === 'instagram_publish_media') return { success: true, data: { id: 'ig_media_99' } };
+      throw new Error(`unexpected ${req.context}`);
+    };
+    return { calls, fn };
+  };
+
+  test('one child container per image (is_carousel_item, in order), the parent CAROUSEL with the children and the caption, then media_publish of the parent', async () => {
+    const { calls, fn } = scripted();
+    const result = await withMockedRequest(fn, () => publish({ account, content: 'Five signs...', media: slides }));
+    assert.deepEqual(result, { success: true, externalPostId: 'ig_media_99', error: null });
+    const children = calls.filter((c) => c.context === 'instagram_create_carousel_item');
+    assert.deepEqual(children.map((c) => c.params), slides.map((s) => ({ image_url: s.url, is_carousel_item: true })));
+    assert.ok(children.every((c) => c.path === '/ig_1/media' && c.method === 'POST' && c.accessToken === 'token_1'));
+    const parent = calls.find((c) => c.context === 'instagram_create_carousel_container');
+    assert.deepEqual(parent.params, { media_type: 'CAROUSEL', children: 'child_1,child_2,child_3', caption: 'Five signs...' });
+    const pub = calls.filter((c) => c.context === 'instagram_publish_media');
+    assert.equal(pub.length, 1);
+    assert.deepEqual(pub[0].params, { creation_id: 'parent_1' });
+    // every container is checked ready before it is used (3 children + the parent)
+    assert.equal(calls.filter((c) => c.context === 'instagram_check_container_status').length, 4);
+    assert.ok(calls.indexOf(parent) > calls.lastIndexOf(children[2]));
+  });
+
+  test('a failed child container stops BEFORE the parent and media_publish: nothing published, not an unknown outcome', async () => {
+    const { calls, fn } = scripted({ instagram_create_carousel_item: (req, all) => (all.filter((c) => c.context === 'instagram_create_carousel_item').length === 2 ? { success: false, kind: 'http', status: 400, data: { error: { code: 100, message: 'bad image' } } } : { success: true, data: { id: 'c' } }) });
+    const result = await withMockedRequest(fn, () => publish({ account, content: 'x', media: slides }));
+    assert.equal(result.success, false);
+    assert.notEqual(result.error.outcome, 'unknown');
+    assert.equal(calls.some((c) => c.context === 'instagram_create_carousel_container' || c.context === 'instagram_publish_media'), false);
+  });
+
+  test('a lost answer from media_publish is an UNKNOWN outcome (it may exist): never a plain failure', async () => {
+    const { fn } = scripted({ instagram_publish_media: () => ({ success: false, kind: 'timeout', status: null, data: null }) });
+    const result = await withMockedRequest(fn, () => publish({ account, content: 'x', media: slides }));
+    assert.equal(result.success, false);
+    assert.equal(result.error.outcome, 'unknown');
+  });
+
+  test('planPublish (dry run) lists the same calls in order without calling Meta', async () => {
+    let called = false;
+    const plan = await withMockedRequest(async () => { called = true; return {}; }, () => planPublish({ account, media: slides }));
+    assert.equal(called, false);
+    assert.deepEqual(plan.map((s) => s.step), ['carousel_item_1', 'carousel_item_2', 'carousel_item_3', 'wait_item_1', 'wait_item_2', 'wait_item_3', 'carousel_container', 'wait_container', 'publish']);
+    assert.equal(JSON.stringify(plan).includes('token_1'), false);
   });
 });
 

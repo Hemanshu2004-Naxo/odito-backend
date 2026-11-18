@@ -45,7 +45,7 @@ describe('Creative Studio routes - wiring', () => {
   const routes = router.stack.filter((l) => l.route).map((l) => ({ path: l.route.path, methods: Object.keys(l.route.methods), layers: l.route.stack.map((s) => s.handle) }));
   const find = (path, method) => routes.find((r) => r.path === path && r.methods.includes(method));
 
-  test('1: every studio route is behind auth + project access; the two AI routes also share the design rate limiter; select does not call the AI', () => {
+  test('1: every studio route is behind auth + project access; the AI routes (generate, regenerate, select = render the picked concept) share the design rate limiter', () => {
     assert.equal(find('/studio', 'get').layers.length, 3);
     assert.equal(find('/studio', 'get').layers[2], getStudioHandler);
     for (const [path, handler] of [['/studio/generate', studioGenerateHandler], ['/studio/regenerate', studioRegenerateHandler]]) {
@@ -54,9 +54,11 @@ describe('Creative Studio routes - wiring', () => {
       assert.equal(r.layers[2], socialAIDesignGenerateRateLimiter, path);
       assert.equal(r.layers[3], handler, path);
     }
+    // picking a concept RENDERS it (medium images + QC): it is an AI call and shares the design rate limit
     const select = find('/studio/select', 'post');
-    assert.equal(select.layers.length, 3);
-    assert.equal(select.layers[2], studioSelectHandler);
+    assert.equal(select.layers.length, 4);
+    assert.equal(select.layers[2], socialAIDesignGenerateRateLimiter);
+    assert.equal(select.layers[3], studioSelectHandler);
   });
 });
 

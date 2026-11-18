@@ -47,13 +47,16 @@ const near = (a, hex, tol = 30) => { const c = parseColor(hex); return Math.hypo
 describe('fonts and palette', () => {
   test('1: the shipped font files are all present, and a brand font name resolves to a shipped family (or falls back and says so)', () => {
     assert.equal(fontsInstalled(), true);
-    assert.deepEqual([...AVAILABLE_FAMILIES].sort(), ['Inter', 'Manrope', 'Montserrat', 'Poppins', 'Sora']);
+    assert.deepEqual([...AVAILABLE_FAMILIES].sort(), ['DM Sans', 'Inter', 'Manrope', 'Montserrat', 'Open Sans', 'Poppins', 'Sora']);
+    assert.equal(matchFamily('Open Sans'), 'Open Sans');
+    assert.equal(matchFamily('DM Sans'), 'DM Sans');
+    assert.match(fontSpec('DM Sans', 700).fontfile, /DMSans-Bold.ttf$/);
     assert.equal(matchFamily('Poppins'), 'Poppins');
     assert.equal(matchFamily('inter, sans-serif'), 'Inter');
     assert.equal(matchFamily('Poppins SemiBold'), 'Poppins');
     assert.equal(matchFamily('Comic Sans'), null);
     assert.equal(matchFamily(''), null);
-    assert.deepEqual(resolveTypography({ heading: 'Montserrat', body: 'Inter' }), { heading: 'Montserrat', body: 'Inter', headingFromBrand: true, bodyFromBrand: true, brandFontUnavailable: false });
+    assert.deepEqual(resolveTypography({ heading: 'Montserrat', body: 'Inter' }), { heading: 'Montserrat', body: 'Inter', headingFromBrand: true, bodyFromBrand: true, headingUploaded: false, bodyUploaded: false, brandFontUnavailable: false });
     assert.equal(resolveTypography({ heading: 'Papyrus' }).heading, 'Poppins');
     assert.equal(resolveTypography({ heading: 'Papyrus' }).brandFontUnavailable, true);
     assert.match(fontSpec('Poppins', 800).fontfile, /Poppins-ExtraBold\.ttf$/);

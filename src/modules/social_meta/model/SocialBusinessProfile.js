@@ -98,6 +98,18 @@ const socialBusinessProfileSchema = new mongoose.Schema({
     additionalInstructions: { type: String, default: null, maxlength: 1000 },
     // The logo the user uploaded (written only by the logo upload endpoint, never by the profile PUT). The file
     // lives in the shared social media storage; `storageKey` is internal and is never returned by the API.
+    // The brand's OWN font files (Brand Kit upload; additive). Private storage key (never returned by the API), the family name read from
+    // the file, its format and size. Regular + bold per role.
+    fonts: {
+      heading: {
+        regular: { storageKey: { type: String, default: null, maxlength: 200 }, family: { type: String, default: null, maxlength: 80 }, format: { type: String, default: null, maxlength: 10 }, size: { type: Number, default: null }, uploadedAt: { type: Date, default: null } },
+        bold: { storageKey: { type: String, default: null, maxlength: 200 }, family: { type: String, default: null, maxlength: 80 }, format: { type: String, default: null, maxlength: 10 }, size: { type: Number, default: null }, uploadedAt: { type: Date, default: null } },
+      },
+      body: {
+        regular: { storageKey: { type: String, default: null, maxlength: 200 }, family: { type: String, default: null, maxlength: 80 }, format: { type: String, default: null, maxlength: 10 }, size: { type: Number, default: null }, uploadedAt: { type: Date, default: null } },
+        bold: { storageKey: { type: String, default: null, maxlength: 200 }, family: { type: String, default: null, maxlength: 80 }, format: { type: String, default: null, maxlength: 10 }, size: { type: Number, default: null }, uploadedAt: { type: Date, default: null } },
+      },
+    },
     logo: {
       url: { type: String, default: null, maxlength: 600 },
       storageKey: { type: String, default: null, maxlength: 200 },

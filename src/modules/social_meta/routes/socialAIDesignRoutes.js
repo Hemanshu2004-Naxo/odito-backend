@@ -3,6 +3,7 @@ import auth from '../../user/middleware/auth.js';
 import { validateProjectAccess } from '../../../middleware/auth.middleware.js';
 import {
   generateAIDesignHandler, getAIDesignStatusHandler, getStudioHandler, studioGenerateHandler, studioRegenerateHandler, studioSelectHandler,
+  getSlidesHandler, slideRegenerateHandler, slideReorderHandler, slideDeleteHandler, getCostsHandler, getJobsHandler,
 } from '../controller/socialAIDesignController.js';
 import { socialAIDesignGenerateRateLimiter } from '../middleware/socialAIStrategyRateLimiter.js';
 
@@ -21,6 +22,16 @@ router.get('/status', auth, validateProjectAccess(), getAIDesignStatusHandler);
 router.get('/studio', auth, validateProjectAccess(), getStudioHandler);
 router.post('/studio/generate', auth, validateProjectAccess(), socialAIDesignGenerateRateLimiter, studioGenerateHandler);
 router.post('/studio/regenerate', auth, validateProjectAccess(), socialAIDesignGenerateRateLimiter, studioRegenerateHandler);
-router.post('/studio/select', auth, validateProjectAccess(), studioSelectHandler);
+router.post('/studio/select', auth, validateProjectAccess(), socialAIDesignGenerateRateLimiter, studioSelectHandler);
+
+// Carousel slides of a post (Concept Studio): read, regenerate one (AI, rate-limited), reorder, remove. Every change is a new design version
+// through the versioned attach, so an approved carousel goes back to Design Review. Still no approve / schedule / publish route here.
+router.get('/slides', auth, validateProjectAccess(), getSlidesHandler);
+router.post('/slides/regenerate', auth, validateProjectAccess(), socialAIDesignGenerateRateLimiter, slideRegenerateHandler);
+router.post('/slides/reorder', auth, validateProjectAccess(), slideReorderHandler);
+router.post('/slides/delete', auth, validateProjectAccess(), slideDeleteHandler);
+// Design costs (post + brand this month) and the project's design jobs (progress + "done" notification)
+router.get('/costs', auth, validateProjectAccess(), getCostsHandler);
+router.get('/jobs', auth, validateProjectAccess(), getJobsHandler);
 
 export default router;

@@ -375,7 +375,7 @@ describe('strategy text limits - a near miss is fitted, not thrown away (a secon
   test('16: text a little over its limit is fitted at a sentence, clause or word boundary and the strategy is accepted', () => {
     const s = validRawStrategy();
     s.overview.platformFocus = 'Instagram for discovery and Facebook for community, with LinkedIn reserved for authority content later on in the year';
-    s.platformStrategy[0].role = 'Primary discovery channel for short-form visuals and carousels that explain one idea at a time. It also drives profile visits and saves from people who have never heard of the brand yet.';
+    s.platformStrategy[0].role = 'Primary discovery channel for short-form visuals and carousels that explain one idea at a time. It also drives profile visits and saves from people who have never heard of the brand yet, and it keeps existing followers coming back each week for more.';
     s.hashtagStrategy.categories[0] = 'Branded and campaign specific tags';
     const r = validateStrategyOutput(s);
     assert.equal(r.ok, true, JSON.stringify(r.errors));
@@ -384,18 +384,18 @@ describe('strategy text limits - a near miss is fitted, not thrown away (a secon
       assert.ok(text.length >= max * 0.5);
       assert.equal(/[\s,;:-]$/.test(text), false, 'no dangling punctuation');
     }
-    assert.equal(r.strategy.platformStrategy[0].role, 'Primary discovery channel for short-form visuals and carousels that explain one idea at a time.', 'cut at the sentence end');
+    assert.ok(r.strategy.platformStrategy[0].role.endsWith('…'), 'a fragment (no sentence end late enough) is marked as shortened');
   });
 
-  test('17: fitText never cuts a word, never adds words and never exceeds the limit', async () => {
+  test('17: fitText never cuts a word, never adds words, marks a fragment with an ellipsis and never exceeds the limit', async () => {
     const { fitText } = await import('./strategyOutputSchema.js');
     assert.equal(fitText('short', 20), 'short');
-    assert.equal(fitText('alpha beta gamma delta epsilon', 18), 'alpha beta gamma');
-    assert.equal(fitText('alpha beta, gamma delta epsilon zeta', 22), 'alpha beta, gamma', 'a clause break too early to keep half the text is skipped');
-    assert.equal(fitText('alpha beta gamma, delta epsilon zeta eta', 24), 'alpha beta gamma', 'cut at the clause break');
+    assert.equal(fitText('alpha beta gamma delta epsilon', 18), 'alpha beta gamma…');
+    assert.equal(fitText('alpha beta, gamma delta epsilon zeta', 22), 'alpha beta, gamma…', 'a clause break too early to keep half the text is skipped');
+    assert.equal(fitText('alpha beta gamma, delta epsilon zeta eta', 24), 'alpha beta gamma…', 'cut at the clause break');
     assert.equal(fitText('Strong first sentence here. And a second one that runs on', 40), 'Strong first sentence here.');
-    assert.equal(fitText('one two three and', 14), 'one two three');
-    assert.equal(fitText('x'.repeat(50), 20), 'x'.repeat(20), 'one unbroken token is cut at the limit');
+    assert.equal(fitText('one two three and', 14), 'one two three…');
+    assert.equal(fitText('x'.repeat(50), 20), `${'x'.repeat(19)}…`, 'one unbroken token is cut at the limit');
     for (const max of [10, 17, 31, 64]) assert.ok(fitText('lorem ipsum dolor sit amet consectetur adipiscing elit sed do', max).length <= max);
   });
 

@@ -60,6 +60,9 @@ function toObjectId(id) {
 
 const fail = (code, message) => ({ success: false, error: { code, message } });
 
+/** A filter clause pinning "has media" / "has none" to what the decision was made from (the media itself is pinned by designVersion). */
+const mediaPin = (doc) => ((Array.isArray(doc?.media) && doc.media.length > 0) ? { 'media.0': { $exists: true } } : { 'media.0': { $exists: false } });
+
 const CLEAR_CONTENT_APPROVAL = { contentApprovedAt: null, contentApprovedBy: null, contentApprovedVersion: null };
 const CLEAR_DESIGN_APPROVAL = { designApprovedAt: null, designApprovedBy: null, designApprovedVersion: null, designSubmittedAt: null, designSubmittedBy: null };
 const CLEAR_CHANGES = { changesRequestedAt: null, changesRequestedBy: null, changesRequestedReason: null, changesRequestedStage: null, changesRequestedForVersion: null };
@@ -100,10 +103,31 @@ export function needsChanges(doc) {
   return false;
 }
 
-function afterContentApproved(settings, { contentVersion, designVersion }, now, approvedBy) {
+/**
+ * What a post needs after its content is approved, from what it IS:
+ *   'none'    a text-only post on a platform that allows text (Facebook): there is no design to review
+ *   'review'  it already has its media: that design goes straight into design review
+ *   'missing' it needs media it does not have yet (Instagram has no text-only post): it waits for a design
+ */
+export function designNeedOf(doc) {
+  const hasMedia = Array.isArray(doc?.media) && doc.media.length > 0;
+  if (hasMedia) return 'review';
+  return doc?.platform === 'instagram' ? 'missing' : 'none';
+}
+
+/**
+ * The fields of an approved-content transition. Who approved and when is recorded on the post (contentApprovedBy/At/Version, and the
+ * same for the design); a stage that is skipped or auto-approved records approvedBy: null, so it is never claimed as a person's approval.
+ */
+function afterContentApproved(settings, { contentVersion, designVersion }, now, approvedBy, need = 'missing') {
   const base = { contentApprovedAt: now, contentApprovedBy: approvedBy, contentApprovedVersion: contentVersion, ...CLEAR_CHANGES };
-  if (!settings.designApprovalRequired) {
+  // no design required by the project, or nothing to design (a text post): fully approved, ready to schedule
+  if (!settings.designApprovalRequired || need === 'none') {
     return { ...base, approvalState: 'design_approved', designApprovedAt: now, designApprovedBy: null, designApprovedVersion: designVersion, designSubmittedAt: null, designSubmittedBy: null };
+  }
+  // the media is already attached: it IS the design, so it goes straight to design review
+  if (need === 'review') {
+    return { ...base, approvalState: 'design_review', designSubmittedAt: now, designSubmittedBy: approvedBy, designApprovedAt: null, designApprovedBy: null, designApprovedVersion: null };
   }
   return { ...base, approvalState: 'content_approved', ...CLEAR_DESIGN_APPROVAL };
 }
@@ -139,7 +163,7 @@ export function planEditEffects(existing, { contentChanged, mediaChanged }, sett
     if (settings.contentApprovalRequired) {
       Object.assign(set, { approvalState: 'content_review', submittedForReviewAt: now, submittedBy: userId, ...CLEAR_CONTENT_APPROVAL, ...CLEAR_DESIGN_APPROVAL, ...CLEAR_CHANGES });
     } else {
-      Object.assign(set, afterContentApproved(settings, newVersions, now, null));
+      Object.assign(set, afterContentApproved(settings, newVersions, now, null, mediaChanged ? 'missing' : designNeedOf(existing)));
     }
   } else if (mediaChanged && !contentChanged && state === 'design_approved') {
     if (settings.designApprovalRequired) {
@@ -234,11 +258,11 @@ export async function submitContent(projectId, publicationId, userId) {
   const entry = { submittedForReviewAt: now, submittedBy: userId, ...CLEAR_CONTENT_APPROVAL, ...CLEAR_DESIGN_APPROVAL, ...CLEAR_CHANGES };
   const set = settings.contentApprovalRequired
     ? { ...entry, approvalState: 'content_review' }
-    : { ...entry, ...afterContentApproved(settings, versions, now, null) };
+    : { ...entry, ...afterContentApproved(settings, versions, now, null, designNeedOf(cur)) };
 
   return guarded(projectId, publicationId, 'submit this post for review', {
-    // only a DRAFT that is not yet in the workflow can enter it
-    filter: { status: 'draft', approvalState: null },
+    // only a DRAFT that is not yet in the workflow can enter it (and, when the next state depends on its media, with that media)
+    filter: { status: 'draft', approvalState: null, ...(settings.contentApprovalRequired ? {} : mediaPin(cur)) },
     update: { $set: set, $max: { contentVersion: 1, designVersion: 1 } },
     expectedStates: [null],
     event: 'CONTENT_SUBMITTED',
@@ -251,11 +275,12 @@ export async function approveContent(projectId, publicationId, userId, version) 
   const cur = await loadForAction(projectId, publicationId);
   if (!cur) return fail('NOT_FOUND', 'That publication was not found.');
   const settings = await getApprovalSettings(projectId);
-  const set = afterContentApproved(settings, { contentVersion: v, designVersion: cur.designVersion || 1 }, new Date(), userId);
+  const set = afterContentApproved(settings, { contentVersion: v, designVersion: cur.designVersion || 1 }, new Date(), userId, designNeedOf(cur));
 
+  // ONE conditional write: the state, the approved content version, and the design version (+ whether media exists) the next state was
+  // decided from - an edit racing this approval makes it match nothing instead of approving something else.
   return guarded(projectId, publicationId, 'approve content', {
-    // designVersion is pinned only when the design is auto-approved here (its version is recorded then).
-    filter: { approvalState: 'content_review', contentVersion: v, ...(settings.designApprovalRequired ? {} : { designVersion: cur.designVersion || 1 }) },
+    filter: { approvalState: 'content_review', contentVersion: v, designVersion: cur.designVersion || 1, ...mediaPin(cur) },
     update: { $set: set },
     expectedStates: ['content_review'], versionField: 'contentVersion', version: v,
     event: 'CONTENT_APPROVED',
@@ -284,12 +309,13 @@ export async function submitDesign(projectId, publicationId, userId) {
   const settings = await getApprovalSettings(projectId);
   const now = new Date();
   const dv = cur.designVersion || 1;
-  const set = settings.designApprovalRequired
+  // a text post has no design to review: "submitting" it (a post approved before text posts skipped this step) completes the approval
+  const set = settings.designApprovalRequired && designNeedOf(cur) !== 'none'
     ? { approvalState: 'design_review', designSubmittedAt: now, designSubmittedBy: userId, designApprovedAt: null, designApprovedBy: null, designApprovedVersion: null, ...CLEAR_CHANGES }
     : { approvalState: 'design_approved', designSubmittedAt: now, designSubmittedBy: userId, designApprovedAt: now, designApprovedBy: null, designApprovedVersion: dv, ...CLEAR_CHANGES };
 
   return guarded(projectId, publicationId, 'submit the design for review', {
-    filter: { approvalState: 'content_approved', designVersion: dv },
+    filter: { approvalState: 'content_approved', designVersion: dv, ...mediaPin(cur) },
     update: { $set: set },
     expectedStates: ['content_approved'],
     event: 'DESIGN_SUBMITTED',

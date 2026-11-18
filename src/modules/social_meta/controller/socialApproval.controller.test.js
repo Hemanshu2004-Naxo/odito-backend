@@ -8,6 +8,7 @@ dotenv.config();
 import SeoProject from '../../app_user/model/SeoProject.js';
 import SocialAccount from '../model/SocialAccount.js';
 import SocialPublication from '../model/SocialPublication.js';
+import { asWaitingForDesign } from '../testSupport/approvalFixtures.js';
 import SocialApprovalSettings from '../model/SocialApprovalSettings.js';
 import adapters from '../service/platformAdapters/index.js';
 import router from '../routes/socialPublishingRoutes.js';
@@ -132,13 +133,21 @@ describe('approval endpoints — real MongoDB', () => {
 
     const ok = await call(approveContentHandler, { params: { publicationId: d.id }, body: { version: 1 } });
     assert.equal(ok.statusCode, 200);
-    assert.equal(ok.body.data.publication.approval.state, 'content_approved');
+    // a text post (no media) has no design to review: approving its content makes it ready to schedule
+    assert.equal(ok.body.data.publication.approval.state, 'design_approved');
+    assert.equal(ok.body.data.publication.approval.stage, 'ready_to_schedule');
 
-    const sd = await call(submitDesignHandler, { params: { publicationId: d.id } });
+    // the design handlers, on a post waiting for its design (an Instagram post without media, built directly)
+    const d2 = await newDraft();
+    await call(submitContentHandler, { params: { publicationId: d2.id } });
+    await call(approveContentHandler, { params: { publicationId: d2.id }, body: { version: 1 } });
+    await asWaitingForDesign(d2.id);
+    await SocialPublication.updateOne({ _id: d2.id }, { $set: { platform: 'instagram' } });
+    const sd = await call(submitDesignHandler, { params: { publicationId: d2.id } });
     assert.equal(sd.body.data.publication.approval.state, 'design_review');
-    const drc = await call(requestDesignChangesHandler, { params: { publicationId: d.id }, body: { version: 1, reason: 'Wrong crop' } });
+    const drc = await call(requestDesignChangesHandler, { params: { publicationId: d2.id }, body: { version: 1, reason: 'Wrong crop' } });
     assert.equal(drc.statusCode, 200);
-    const da = await call(approveDesignHandler, { params: { publicationId: d.id }, body: { version: 1 } });
+    const da = await call(approveDesignHandler, { params: { publicationId: d2.id }, body: { version: 1 } });
     assert.equal(da.body.data.publication.approval.stage, 'ready_to_schedule');
   });
 
@@ -211,6 +220,6 @@ describe('approval endpoints — real MongoDB', () => {
 
     const d2 = await newDraft();
     const submit2 = await call(submitContentHandler, { params: { publicationId: d2.id } });
-    assert.equal(submit2.body.data.publication.approval.state, 'content_approved', 'the BACKEND setting routed the post past content review');
+    assert.equal(submit2.body.data.publication.approval.state, 'design_approved', 'the BACKEND setting routed the post past content review (a text post: past design too)');
   });
 });

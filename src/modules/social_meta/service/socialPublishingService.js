@@ -1,5 +1,7 @@
+import sharp from 'sharp';
 import mongoose from 'mongoose';
 import SocialPublication from '../model/SocialPublication.js';
+import SocialDesignGeneration from '../model/SocialDesignGeneration.js';
 import { isPublishingReady } from '../model/SocialAccount.js';
 import adapters from './platformAdapters/index.js';
 import mediaStorageService from './media/mediaStorageService.js';
@@ -64,7 +66,59 @@ function validateMedia(media) {
  * in this phase. Checked when a post is SCHEDULED so a post that could never go out is refused now, with a clear
  * message, instead of failing at its publish time. The adapters stay the final authority.
  */
-const MEDIA_REQUIREMENTS = { instagram: { min: 1, max: 1 }, facebook: { min: 0, max: 1 } };
+const MEDIA_REQUIREMENTS = { instagram: { min: 1, max: 10 }, facebook: { min: 0, max: 10 } };
+
+/**
+ * Per-platform IMAGE rules, checked on the stored file before scheduling (Meta stays the final authority):
+ *   Instagram: aspect ratio 4:5 (0.8) to 1.91:1, at least 320 px wide, at most 8 MB; a carousel takes 2-10 images, all the SAME shape
+ *              (Instagram crops every item to the first one's shape)
+ *   Facebook:  at most 10 MB per image; a multi-photo post takes up to 10 images
+ *   Both:      a post with more than one item is images only (Odito carousels / multi-photo posts are images)
+ */
+export const PLATFORM_IMAGE_RULES = Object.freeze({
+  instagram: Object.freeze({ minAspect: 0.8, maxAspect: 1.91, minWidth: 320, maxBytes: 8 * 1024 * 1024, carouselMin: 2, carouselMax: 10 }),
+  facebook: Object.freeze({ minAspect: null, maxAspect: null, minWidth: null, maxBytes: 10 * 1024 * 1024, carouselMin: 2, carouselMax: 10 }),
+});
+
+/** Reads the stored image's size (never trusts the client): { width, height, bytes } or null. */
+async function storedImageInfo(projectId, url) {
+  try {
+    const file = String(url).split('?')[0].split('/').pop();
+    const bytes = await mediaStorageService.readByKey(`${projectId}/${file}`, { projectId: String(projectId) });
+    if (!bytes) return null;
+    const meta = await sharp(bytes).metadata();
+    return { width: meta.width || 0, height: meta.height || 0, bytes: bytes.length };
+  } catch { return null; }
+}
+
+/** The platform's image / count rules for this media list, or null when it is publishable. */
+export async function platformMediaProblem(projectId, platform, media) {
+  const rules = PLATFORM_IMAGE_RULES[platform];
+  const list = Array.isArray(media) ? media : [];
+  if (!rules || !list.length) return null;
+  const name = platform === 'instagram' ? 'Instagram' : 'Facebook';
+  if (list.length > 1) {
+    if (list.some((m) => m?.type !== 'image')) return { code: 'MEDIA_NOT_SUPPORTED', message: `A ${name} ${platform === 'instagram' ? 'carousel' : 'multi-photo post'} takes images only.` };
+    if (list.length < rules.carouselMin || list.length > rules.carouselMax) return { code: 'MEDIA_NOT_SUPPORTED', message: `A ${name} ${platform === 'instagram' ? 'carousel' : 'multi-photo post'} takes ${rules.carouselMin} to ${rules.carouselMax} images (this post has ${list.length}).` };
+  }
+  let firstAspect = null;
+  for (const [i, item] of list.entries()) {
+    if (item?.type !== 'image') continue;
+    // eslint-disable-next-line no-await-in-loop
+    const info = await storedImageInfo(projectId, item.url);
+    if (!info || !info.width || !info.height) return { code: 'MEDIA_FILE_MISSING', message: 'An image of this post could not be read from storage. Upload or generate the design again.' };
+    const label = list.length > 1 ? `Slide ${i + 1}` : 'The image';
+    const aspect = info.width / info.height;
+    if (rules.minAspect && (aspect < rules.minAspect - 0.005 || aspect > rules.maxAspect + 0.005)) return { code: 'MEDIA_SIZE_NOT_SUPPORTED', message: `${label} is ${info.width}×${info.height}: ${name} needs a shape between 4:5 and 1.91:1.` };
+    if (rules.minWidth && info.width < rules.minWidth) return { code: 'MEDIA_SIZE_NOT_SUPPORTED', message: `${label} is only ${info.width} px wide: ${name} needs at least ${rules.minWidth} px.` };
+    if (info.bytes > rules.maxBytes) return { code: 'MEDIA_TOO_LARGE', message: `${label} is larger than ${Math.round(rules.maxBytes / 1024 / 1024)} MB, the ${name} limit.` };
+    if (platform === 'instagram' && list.length > 1) {
+      if (firstAspect == null) firstAspect = aspect;
+      else if (Math.abs(aspect - firstAspect) > 0.01) return { code: 'MEDIA_SIZE_NOT_SUPPORTED', message: `${label} has a different shape from slide 1: every slide of an Instagram carousel must have the same shape.` };
+    }
+  }
+  return null;
+}
 
 function mediaRequirementError(platform, media) {
   const rule = MEDIA_REQUIREMENTS[platform];
@@ -74,7 +128,7 @@ function mediaRequirementError(platform, media) {
     return { code: 'MEDIA_REQUIRED', message: `${platform === 'instagram' ? 'Instagram' : 'This platform'} posts need an image or video. Add or generate a design before scheduling.` };
   }
   if (count > rule.max) {
-    return { code: 'MEDIA_NOT_SUPPORTED', message: 'Only a single image or video is supported per post in this phase.' };
+    return { code: 'MEDIA_NOT_SUPPORTED', message: `A post takes at most ${rule.max} images.` };
   }
   return null;
 }
@@ -99,6 +153,8 @@ async function schedulingReadinessError(doc, media) {
       return { code: 'MEDIA_FILE_MISSING', message: 'The media file for this post is missing from storage. Upload or generate the design again.' };
     }
   }
+  const platformProblem = await platformMediaProblem(doc.project_id, doc.platform, media);
+  if (platformProblem) return platformProblem;
   const resolved = await resolveAccount(doc.project_id, doc.platform, String(doc.social_account_id));
   return resolved.error || null;
 }
@@ -116,6 +172,11 @@ function logSchedule(event, doc, extra = {}) {
   };
   if (event.endsWith('rejected')) LoggerUtil.warn('[SOCIAL_SCHEDULE]', fields);
   else LoggerUtil.info('[SOCIAL_SCHEDULE]', fields);
+}
+
+/** What "the caption changed" means: the text, ignoring line-ending style and trailing whitespace on lines and at the end. */
+export function sameCaptionKey(text) {
+  return String(text ?? '').replace(/\r\n?/g, '\n').replace(/[ \t]+$/gm, '').trimEnd();
 }
 
 /** Order-sensitive identity of a media list - what "the design changed" means. */
@@ -285,7 +346,7 @@ function toApiGeneration(doc) {
 function toApiDesign(doc) {
   const d = doc.design;
   if (!d || d.source !== 'ai' || d.designVersion !== doc.designVersion) return null;
-  return { source: 'ai', designVersion: d.designVersion, contentVersion: d.contentVersion ?? null, generatedAt: d.generatedAt || null };
+  return { source: 'ai', designVersion: d.designVersion, contentVersion: d.contentVersion ?? null, generatedAt: d.generatedAt || null, format: d.format || ((doc.media || []).length > 1 ? 'carousel' : 'single'), generationId: d.generationId ? String(d.generationId) : null };
 }
 
 function toApiPublication(doc) {
@@ -503,7 +564,10 @@ export async function updatePublication(projectId, publicationId, userId, { cont
     const approvalFilter = { approvalState: existing.approvalState || null };
     let inc = null;
     if (existing.approvalState) {
-      const contentChanged = content !== undefined && content !== existing.content;
+      // "Changed" means the words changed: a save of the same caption (or one that differs only in line endings / trailing spaces, which a
+      // browser textarea rewrites) never withdraws an approval.
+      const contentChanged = content !== undefined && sameCaptionKey(content) !== sameCaptionKey(existing.content);
+      if (content !== undefined && !contentChanged) delete set.content;
       const mediaChanged = media !== undefined && mediaSignature(media) !== mediaSignature(existing.media);
       const settings = await workflow.getApprovalSettings(projectId);
       const effects = planEditEffects(existing, { contentChanged, mediaChanged }, settings, { userId });
@@ -597,7 +661,7 @@ export async function attachGeneratedDesign(projectId, publicationId, userId, { 
         ...effects.set,
         updatedBy: userId,
         media,
-        design: { source: 'ai', generationId: design.generationId, contentVersion, designVersion: nextDesignVersion, model: design.model || null, generatedAt: new Date() },
+        design: { source: 'ai', generationId: design.generationId, contentVersion, designVersion: nextDesignVersion, model: design.model || null, generatedAt: new Date(), format: design.format || (media.length > 1 ? 'carousel' : 'single') },
       },
       $inc: effects.inc,
     },
@@ -761,7 +825,7 @@ export async function deletePublication(projectId, publicationId, { historyOnly 
   return removed;
 }
 
-export async function schedulePublication(projectId, publicationId, userId, scheduledAt, timezone = null) {
+export async function schedulePublication(projectId, publicationId, userId, scheduledAt, timezone = null, { dryRun = false } = {}) {
   const existing = await findOwned(projectId, publicationId);
   if (!existing) return { success: false, error: { code: 'NOT_FOUND', message: 'That publication was not found.' } };
   const reject = (error) => {
@@ -781,6 +845,31 @@ export async function schedulePublication(projectId, publicationId, userId, sche
   const tzValidation = validateTimezone(timezone);
   if (tzValidation.error) return reject(tzValidation.error);
   const notReady = await schedulingReadinessError(existing, existing.media);
+
+  // DRY RUN: nothing is written and nothing is sent. The answer lists EVERY readiness check (not only the first that fails), what WOULD be
+  // scheduled and the Graph calls the publisher would make at that time (no token, no caption text). success = it could be scheduled now.
+  if (dryRun) {
+    const media = existing.media || [];
+    const publicProblem = media.map((m) => mediaStorageService.publishableMediaProblem(m.url)).find(Boolean) || null;
+    const platformProblem = await platformMediaProblem(existing.project_id, existing.platform, media);
+    const countProblem = mediaRequirementError(existing.platform, media);
+    const resolved = await resolveAccount(existing.project_id, existing.platform, String(existing.social_account_id));
+    const checks = {
+      approval: 'ok',
+      slideCount: countProblem ? countProblem.message : 'ok',
+      platformImageRules: platformProblem ? platformProblem.message : 'ok',
+      publicMediaUrls: publicProblem ? 'This environment serves media from an address Meta cannot fetch (not public HTTPS).' : 'ok',
+      account: resolved.error ? resolved.error.message : 'ok',
+    };
+    const adapter = adapters[existing.platform];
+    const plan = adapter?.planPublish ? adapter.planPublish({ account: resolved.account || {}, media }) : [];
+    logSchedule('publication_schedule_dry_run', existing, { scheduledAt: parsed.scheduledDate.toISOString(), items: media.length, blocked: notReady?.code || null });
+    return {
+      success: !notReady, dryRun: true, blockers: notReady ? [notReady] : [], checks,
+      wouldSchedule: { publicationId: String(existing._id), platform: existing.platform, scheduledAt: parsed.scheduledDate.toISOString(), timezone: timezone || null, media: media.length, format: media.length > 1 ? 'carousel' : 'single', designVersion: existing.designVersion, approvalState: existing.approvalState },
+      publishPlan: plan,
+    };
+  }
   if (notReady) return reject(notReady);
 
   // Conditional (status in EDITABLE AND approval still satisfied), same reason as updatePublication. For a post in the
@@ -1197,7 +1286,50 @@ export const submitContentForApproval = async (projectId, publicationId, userId)
 export const approveContent = async (projectId, publicationId, userId, version) => toApprovalResult(await workflow.approveContent(projectId, publicationId, userId, version));
 export const requestContentChanges = async (projectId, publicationId, userId, input) => toApprovalResult(await workflow.requestContentChanges(projectId, publicationId, userId, input));
 export const submitDesignForApproval = async (projectId, publicationId, userId) => toApprovalResult(await workflow.submitDesign(projectId, publicationId, userId));
-export const approveDesign = async (projectId, publicationId, userId, version) => toApprovalResult(await workflow.approveDesign(projectId, publicationId, userId, version));
+/**
+ * What of the post's CURRENT design is below the quality bar ("needs attention"): the carousel slides in the post (1-based position) or the
+ * single image, with the QC score and reasons. Only an AI design of the current design version can carry it. [] when nothing needs attention.
+ */
+export async function designAttention(projectId, publicationId) {
+  const pub = await SocialPublication.findOne({ _id: publicationId, project_id: toObjectId(projectId) }).select('media design designVersion').lean();
+  if (!pub?.design?.generationId || pub.design.source !== 'ai' || pub.design.designVersion !== pub.designVersion) return [];
+  const rec = await SocialDesignGeneration.findOne({ _id: pub.design.generationId, project_id: toObjectId(projectId) }).select('slides creative.qc').lean();
+  if (!rec) return [];
+  const urls = (pub.media || []).map((m) => m.url);
+  if (rec.slides?.length) {
+    return urls.map((url, i) => ({ s: rec.slides.find((x) => x.media?.url === url), i }))
+      .filter(({ s }) => s?.qc?.needsAttention)
+      .map(({ s, i }) => ({ slide: i + 1, key: s.key, score: s.qc.needsAttention.score ?? null, reasons: (s.qc.needsAttention.reasons || []).slice(0, 3) }));
+  }
+  const na = rec.creative?.qc?.needsAttention;
+  return na?.reasons?.length ? [{ slide: null, key: null, score: na.score ?? null, reasons: na.reasons.slice(0, 3) }] : [];
+}
+
+/**
+ * Approving the design approves EVERY slide. When any slide (or the single image) needs attention, the approval is refused with
+ * DESIGN_NEEDS_ATTENTION and the list, unless the reviewer explicitly approves anyway (`acknowledgeAttention`) - which is logged with who did
+ * it and recorded on the design.
+ */
+export async function approveDesign(projectId, publicationId, userId, version, { acknowledgeAttention = false } = {}) {
+  const attention = await designAttention(projectId, publicationId).catch(() => []);
+  if (attention.length && !acknowledgeAttention) {
+    const n = attention.length;
+    const what = attention[0].slide == null ? 'The design needs attention' : `${n} slide${n === 1 ? ' needs' : 's need'} attention`;
+    return { success: false, error: { code: 'DESIGN_NEEDS_ATTENTION', message: `${what}: ${attention.map((a) => `${a.slide == null ? '' : `slide ${a.slide}: `}${a.reasons[0] || 'below the quality bar'}`).join(' | ')}`, attention } };
+  }
+  const result = await toApprovalResult(await workflow.approveDesign(projectId, publicationId, userId, version));
+  if (result.success && attention.length) {
+    const pub = await SocialPublication.findById(publicationId).select('design designVersion').lean();
+    LoggerUtil.warn('[SOCIAL_APPROVAL] design_approved_with_attention', {
+      event: 'design_approved_with_attention', projectId: String(projectId), publicationId: String(publicationId), userId: userId ? String(userId) : null,
+      designVersion: pub?.designVersion ?? null, slides: attention.map((a) => a.slide), count: attention.length,
+    });
+    if (pub?.design?.generationId) {
+      await SocialDesignGeneration.updateOne({ _id: pub.design.generationId }, { $push: { approvedWithAttention: { userId: mongoose.Types.ObjectId.isValid(String(userId)) ? userId : null, at: new Date(), designVersion: pub.designVersion, slides: attention.map((a) => a.slide).filter((x) => x != null), count: attention.length } } });
+    }
+  }
+  return result;
+}
 export const requestDesignChanges = async (projectId, publicationId, userId, input) => toApprovalResult(await workflow.requestDesignChanges(projectId, publicationId, userId, input));
 export const getApprovalSummary = (projectId) => workflow.getApprovalSummary(projectId);
 export const getApprovalSettings = (projectId) => workflow.getApprovalSettings(projectId);
