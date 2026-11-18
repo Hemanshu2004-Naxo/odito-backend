@@ -428,7 +428,7 @@ export async function selectMetaPage(req, res) {
     // Pages from an earlier, separate connection that aren't part of THIS
     // batch are left completely untouched (union, not replace — see
     // persistDiscoveredFacebookPages's own comment).
-    const { savedCount, activeAccount } = await persistDiscoveredFacebookPages({
+    const { savedCount, expiredCount, activeAccount } = await persistDiscoveredFacebookPages({
       userId,
       projectId,
       pages: pending.pages,
@@ -447,7 +447,7 @@ export async function selectMetaPage(req, res) {
 
     await PendingMetaConnection.deleteOne({ _id: pending._id });
 
-    LoggerUtil.service('MetaPageSelect', 'select', 'completed', { projectId, pageId, pagesPersisted: savedCount });
+    LoggerUtil.service('MetaPageSelect', 'select', 'completed', { projectId, pageId, pagesPersisted: savedCount, pagesExpired: expiredCount || 0 });
     // Safe diagnostic — confirms, independent of the HTTP response the
     // frontend receives, that the write this request just performed is
     // actually the document a later status lookup will find (same

@@ -1,5 +1,5 @@
 import SocialAccount, { isPublishingReady } from '../model/SocialAccount.js';
-import { getActiveFacebookAccount, getActiveInstagramAccount, getExpiredFacebookAccount, getExpiredInstagramAccount } from '../service/facebookAccountService.js';
+import { getActiveFacebookAccount, getActiveInstagramAccount, getExpiredFacebookAccount, getExpiredInstagramAccount, verifyActiveFacebookIfStale } from '../service/facebookAccountService.js';
 import { verifyProjectAccounts } from '../service/metaTokenService.js';
 import { ResponseUtil } from '../../../utils/ResponseUtil.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
@@ -44,6 +44,12 @@ export async function getSocialAccountsStatus(req, res) {
   const projectId = req.projectId;
 
   try {
+    // Re-check the active Page's token with Meta when the last check is
+    // stale (throttled, see verifyActiveFacebookIfStale) — a token Meta has
+    // killed flips to 'expired' here, so the lookups below report "reconnect
+    // required" instead of "connected". An outage changes nothing.
+    await verifyActiveFacebookIfStale(projectId);
+
     // Facebook: the ACTIVE Page specifically (a project can have several
     // connected — see facebookAccountService.js) — never just "the first
     // one found", which would be ambiguous/wrong once more than one Page

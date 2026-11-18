@@ -10,6 +10,7 @@ import SocialAccount from '../model/SocialAccount.js';
 import { mintState } from '../testSupport/metaState.js';
 import { handleMetaCallback } from './metaOAuthController.js';
 import { getSocialAccountsStatus } from './socialAccountController.js';
+import { installDebugTokenStub } from '../testSupport/metaDebugTokenStub.js';
 
 /**
  * Backend support the Social Media AI frontend integration relies on:
@@ -20,7 +21,10 @@ import { getSocialAccountsStatus } from './socialAccountController.js';
  */
 
 let mongoAvailable = false;
+// The status API re-verifies a stale active Page with Meta (debug_token); keep this offline.
+let restoreDebugToken = () => {};
 before(async () => {
+  restoreDebugToken = installDebugTokenStub();
   try {
     await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 1500 });
     mongoAvailable = true;
@@ -28,7 +32,7 @@ before(async () => {
     mongoAvailable = false;
   }
 });
-after(async () => { if (mongoAvailable) await mongoose.connection.close(); });
+after(async () => { restoreDebugToken(); if (mongoAvailable) await mongoose.connection.close(); });
 
 const mockRes = () => ({
   statusCode: null, body: null, redirectedTo: null,

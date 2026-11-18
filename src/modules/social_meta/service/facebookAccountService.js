@@ -1,5 +1,6 @@
 import SocialAccount from '../model/SocialAccount.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
+import { inspectToken, markAccountExpired, applyInspection, verifyAccount } from './metaTokenService.js';
 
 /**
  * FacebookAccountService — connected-Facebook-Page LIST and ACTIVE-Page
@@ -259,7 +260,93 @@ export async function persistDiscoveredFacebookPages({ userId, projectId, pages,
   }
 
   const activeResult = await setActiveFacebookAccount({ projectId, socialAccountId: savedAccounts.find((a) => a.platformAccountId === selectedPageId)._id.toString() });
-  return { savedCount: savedAccounts.length, activeAccount: activeResult.success ? activeResult.account : null };
+  const { expiredCount } = await reconcileMissingFacebookPages({ projectId, returnedPageIds: pages.map((p) => p.id) });
+  return { savedCount: savedAccounts.length, expiredCount, activeAccount: activeResult.success ? activeResult.account : null };
+}
+
+export const REASON_PAGE_NOT_ACCESSIBLE = 'META_PAGE_NOT_ACCESSIBLE';
+
+/**
+ * A reconnect only ever ADDS/updates the Pages Meta returned this time
+ * (union, not replace — a second Facebook login's Pages must survive a
+ * reconnect through the first login, which never lists them). But a Page
+ * this login lost access to (role removed, Page restricted/merged) used to
+ * stay status:'active' forever, so the project kept reporting "connected"
+ * on a token Meta rejects ("This Page access token belongs to a Page that
+ * is not accessible", code 190).
+ *
+ * So every still-active Page of this project that Meta did NOT return is
+ * checked with debug_token: expired only when Meta CONFIRMS its stored
+ * token is dead (its Instagram copy goes with it — markAccountExpired), left
+ * untouched when the token is still valid (another login's Page) or when the
+ * check itself could not run (an outage never expires a connection).
+ */
+export async function reconcileMissingFacebookPages({ projectId, returnedPageIds }) {
+  const missing = await SocialAccount.find({
+    project_id: projectId,
+    platform: 'facebook',
+    status: 'active',
+    platformAccountId: { $nin: returnedPageIds },
+  });
+
+  let expiredCount = 0;
+  let unverifiedCount = 0;
+  for (const account of missing) {
+    const inspection = await inspectToken(account.accessToken); // decrypted by the schema getter, never logged
+    if (!inspection.success) { unverifiedCount += 1; continue; }
+    if (!inspection.valid) {
+      await markAccountExpired(account, { reason: REASON_PAGE_NOT_ACCESSIBLE });
+      expiredCount += 1;
+    } else {
+      await applyInspection(account, inspection);
+    }
+  }
+
+  if (missing.length > 0) {
+    LoggerUtil.info('META_PAGES_RECONCILED', {
+      projectId: String(projectId),
+      notReturned: missing.length,
+      expired: expiredCount,
+      stillValid: missing.length - expiredCount - unverifiedCount,
+      unverified: unverifiedCount,
+      expiredPageIds: missing.filter((a) => a.status === 'expired').map((a) => a.platformAccountId),
+    });
+  }
+  return { expiredCount };
+}
+
+// The status endpoint used to report "connected" straight from MongoDB, so a
+// Page token Meta had already killed still showed connected until some data
+// load or publish happened to fail. It now re-checks the ACTIVE Page's token
+// (one debug_token call; its Instagram row shares the token) when the last
+// successful check is older than this — and never re-attempts within the
+// same window after an attempt, so an outage can't turn every status poll
+// into a Meta call.
+export const STATUS_VERIFY_MAX_AGE_MS = 15 * 60 * 1000;
+const lastStatusVerifyAttempt = new Map(); // socialAccountId -> epoch ms
+
+export async function verifyActiveFacebookIfStale(projectId, { now = Date.now(), maxAgeMs = STATUS_VERIFY_MAX_AGE_MS } = {}) {
+  if (process.env.SOCIAL_STATUS_VERIFY === 'off') return null;
+  const account = await getActiveFacebookAccount(projectId);
+  if (!account) return null;
+
+  const key = account._id.toString();
+  const verifiedAt = account.lastVerifiedAt ? new Date(account.lastVerifiedAt).getTime() : 0;
+  if (now - verifiedAt < maxAgeMs) return null;
+  if (now - (lastStatusVerifyAttempt.get(key) || 0) < maxAgeMs) return null;
+  lastStatusVerifyAttempt.set(key, now);
+
+  try {
+    return await verifyAccount(account);
+  } catch (error) {
+    LoggerUtil.error('[SOCIAL_ACCOUNT_STATUS] Could not re-verify the active Page', { message: error.message }, { projectId: String(projectId) });
+    return null;
+  }
+}
+
+/** Test-only: forget the per-account attempt throttle. */
+export function resetStatusVerifyThrottle() {
+  lastStatusVerifyAttempt.clear();
 }
 
 /**
@@ -305,4 +392,5 @@ export async function enrichPagesWithConnectionState({ projectId, pages }) {
 export default {
   listFacebookAccounts, getActiveFacebookAccount, getActiveInstagramAccount, getExpiredFacebookAccount, getExpiredInstagramAccount,
   setActiveFacebookAccount, persistDiscoveredFacebookPages, enrichPagesWithConnectionState,
+  reconcileMissingFacebookPages, verifyActiveFacebookIfStale,
 };

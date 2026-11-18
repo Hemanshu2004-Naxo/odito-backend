@@ -11,6 +11,7 @@ import SocialAccount from '../model/SocialAccount.js';
 import { listFacebookAccounts, getActiveFacebookAccount, setActiveFacebookAccount, persistDiscoveredFacebookPages } from '../service/facebookAccountService.js';
 import { getFacebookAccountsHandler, switchFacebookAccountHandler } from './facebookController.js';
 import metaInstagramService from '../service/metaInstagramService.js';
+import { installDebugTokenStub } from '../testSupport/metaDebugTokenStub.js';
 
 /**
  * Switch Account feature — added after a real report that only one of
@@ -28,8 +29,11 @@ import metaInstagramService from '../service/metaInstagramService.js';
  */
 
 let mongoAvailable = false;
+// A reconnect now asks Meta (debug_token) about Pages it did not return; keep these tests offline.
+let restoreDebugToken = () => {};
 
 before(async () => {
+  restoreDebugToken = installDebugTokenStub();
   try {
     await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 1500 });
     mongoAvailable = true;
@@ -39,6 +43,7 @@ before(async () => {
 });
 
 after(async () => {
+  restoreDebugToken();
   if (mongoAvailable) await mongoose.connection.close();
 });
 
