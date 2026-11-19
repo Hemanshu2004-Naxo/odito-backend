@@ -3,6 +3,7 @@ import { CONCEPT_SIZES, MAX_IMAGE_PIXELS } from '../designConfig.js';
 import { SINGLE_LAYOUTS, BANNED_CLICHES, QC_MAX_RETRIES, MAX_WORDS_PER_IMAGE, STYLE_RULES, imageCostUsd, claudeCostUsd } from './conceptConfig.js';
 import { generateCreativeBrief, reviseConcept, normalise } from './creativeBrief.js';
 import { composeConcept } from './conceptLayouts.js';
+import { stripWebAddresses } from './webAddress.js';
 import { checkDesignQuality } from './conceptQuality.js';
 import { assessRaster } from '../designQuality.js';
 
@@ -60,7 +61,7 @@ export async function referenceFrom(picture) {
 const costOf = (call) => (call.kind === 'image' ? imageCostUsd(call.usage) : claudeCostUsd(call.model, call.usage));
 /**
  * WHY a design failed, which decides the retry:
- *   meaning    the idea does not land (does not match the big idea, unclear symbols, a strong sensitive reading, stock look, an invented
+ *   meaning    the idea does not land (does not match the big idea, does not support the headline's MESSAGE, unclear symbols, a strong sensitive reading, stock look, an invented
  *              fact) -> a CONCEPT retry: back to the brief with the QC feedback for a different, more literal idea, then a new picture
  *   execution  the idea is fine but the picture is not (hands / artifacts, mixed styles, text over detail, cut-off text) -> a PICTURE
  *              retry: the same concept, a new picture told what to fix
@@ -69,7 +70,7 @@ const costOf = (call) => (call.kind === 'image' ? imageCostUsd(call.usage) : cla
 export function classifyFailure(qc) {
   const c = qc.checks || {};
   const strongSensitive = (qc.issues || []).some((i) => /^sensitive reading:/.test(i));
-  if (c.matches_big_idea === false || (c.unclear_symbols || []).length || strongSensitive || c.looks_stock_or_template === true || (c.invented_facts || []).length) return 'meaning';
+  if (c.matches_big_idea === false || c.supports_message === false || (c.unclear_symbols || []).length || strongSensitive || c.looks_stock_or_template === true || (c.invented_facts || []).length) return 'meaning';
   if ((c.ai_artifacts || []).length || c.mixed_styles || c.text_over_busy_area || c.cut_off_text || c.readable_at_phone_size === false
     || (qc.deterministic?.problems || []).some((x) => /busy|cut off|shortened|outside/.test(x))) return 'execution';
   if (headlineOnly(qc)) return 'headline';
@@ -148,35 +149,40 @@ export async function renderConcept({
     const headline = headlines[0];
     const labelWords = (current.image_labels || []).reduce((s, l) => s + words(l.text).length, 0);
     const budget = words(headline).length + words(current.subline).length + words(current.cta).length + labelWords;
-    let brief = { ...current, hook_headline: headline, kicker: kicker && budget + words(kicker).length <= MAX_WORDS_PER_IMAGE ? kicker : undefined };
+    // no web address is ever drawn as words: the brief's texts are cleaned, and a website the brief wanted shown becomes the bare
+    // domain in small footer text - only on a single image or the carousel's CTA slide (once per post)
+    const web = stripWebAddresses({ ...current, hook_headline: headline, kicker: kicker && budget + words(kicker).length <= MAX_WORDS_PER_IMAGE ? kicker : undefined });
+    let brief = web.brief;
+    const footerDomain = web.domain && (!slide || brief.layout === 'carousel_cta') ? web.domain : null;
     // eslint-disable-next-line no-await-in-loop
     await stage('text');
     let composed = null;
     let dropped = null;
     try {
       // eslint-disable-next-line no-await-in-loop
-      composed = await composeConcept({ brief, image: picture, size, brand, logo, slide });
+      composed = await composeConcept({ brief, image: picture, size, brand, logo, slide, footerDomain });
     } catch (error) {
       if (error?.code !== 'TEXT_DOES_NOT_FIT') throw error;
       if (['subline', 'stack'].includes(error.reason) && brief.subline) {
         brief = { ...brief, subline: '' };
         dropped = 'subline';
         // eslint-disable-next-line no-await-in-loop
-        composed = await composeConcept({ brief, image: picture, size, brand, logo, slide });
+        composed = await composeConcept({ brief, image: picture, size, brand, logo, slide, footerDomain });
       } else if (error.reason === 'cta' && brief.cta) {
         brief = { ...brief, cta: '' };
         dropped = 'cta';
         // eslint-disable-next-line no-await-in-loop
-        composed = await composeConcept({ brief, image: picture, size, brand, logo, slide });
+        composed = await composeConcept({ brief, image: picture, size, brand, logo, slide, footerDomain });
       } else throw error;
     }
     // eslint-disable-next-line no-await-in-loop
     await stage('quality');
+    const expected = composed.report.footerDomain ? [...extraExpected, composed.report.footerDomain] : extraExpected;
     // a Compare PREVIEW is not quality-checked (it is a low-quality sketch of a concept; the chosen one is rendered and checked)
     // eslint-disable-next-line no-await-in-loop
     const qc = skipQc
       ? { score: null, passed: true, hardFail: false, checks: null, issues: [], deterministic: { problems: [], wordCount: null }, call: null }
-      : await checkDesignQuality({ png: composed.buffer, brief, report: composed.report, caption, facts, brand, context: qcContext, extraExpected });
+      : await checkDesignQuality({ png: composed.buffer, brief, report: composed.report, caption, facts, brand, context: qcContext, extraExpected: expected });
     if (qc.call) calls.push({ kind: 'text', ...qc.call });
     const result = { png: composed.buffer, brief, report: composed.report, imagePrompt, image: { ...imageCall }, qc, dropped, picture, concept: current };
     const kind = qc.passed ? null : classifyFailure(qc);

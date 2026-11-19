@@ -4,11 +4,12 @@ import mongoose from 'mongoose';
 import { renderMetrics } from './metrics.js';
 import './socialAiMetrics.js'; // registers the Social AI metrics and their scrape-time collectors
 import { LoggerUtil } from '../utils/LoggerUtil.js';
+import { buildInfo } from './buildInfo.js';
 
 /**
  * Liveness, readiness and metrics - mounted at the root AND under /api (a reverse proxy often forwards only /api).
  *
- *   GET /healthz   LIVENESS. 200 while the process can answer. It never touches MongoDB or a provider: a database outage must not make an
+ *   GET /healthz   LIVENESS. 200 while the process can answer. Also `build`: { commit, shortCommit, builtAt, source, dirty, startedAt }. It never touches MongoDB or a provider: a database outage must not make an
  *                  orchestrator restart a healthy API (which would only add load and lose in-flight work).
  *   GET /readyz    READINESS. 200 only when startup has finished AND MongoDB answers a bounded ping; otherwise 503. Use it to decide whether
  *                  to send traffic. The body names the failing check ("database" / "startup") and nothing else - no host, no driver
@@ -66,7 +67,8 @@ const router = express.Router();
 
 router.get('/healthz', (req, res) => {
   noStore(res);
-  res.status(200).json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
+  // build: which commit this process runs and when it was built (see buildInfo.js) - so "is production on the latest code?" has an answer
+  res.status(200).json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()), build: buildInfo() });
 });
 
 router.get('/readyz', async (req, res) => {

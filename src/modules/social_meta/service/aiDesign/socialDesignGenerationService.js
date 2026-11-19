@@ -22,6 +22,7 @@ import { conceptPipelineActive, conceptFallbackAllowed, produceConceptDesign, co
 import { imageCostUsd } from './concept/conceptConfig.js';
 import { CREATIVE_TYPES } from './designStrategy.js';
 import { DESIGN_STALE_MS, PLATFORM_DESIGN, MAX_REFERENCE_IMAGES } from './designConfig.js';
+import { syncPlannedFormat } from './designFormatSync.js';
 import { LoggerUtil } from '../../../../utils/LoggerUtil.js';
 
 /**
@@ -437,7 +438,8 @@ export async function runDesignGeneration(generationId, lockedBy, userId = null)
       try {
         const recentRecords = await SocialDesignGeneration.find({ project_id: rec.project_id, status: 'ready', 'creative.pipeline': PIPELINE.CONCEPT }).sort({ createdAt: -1 }).limit(5).select('creative.concept').lean();
         const made = await produceConceptDesign({
-          pub, snapshotData: context.snapshotData, liveProfile: context.liveProfile, recent: recentConcepts(recentRecords), provider: getProvider(), logo: assets.logo,
+          pub, snapshotData: context.snapshotData, liveProfile: context.liveProfile, recent: recentConcepts(recentRecords), provider: getProvider(), logo: assets.logo, // this path makes ONE image: a carousel is started by conceptStudioService.startPostDesign, where the format is resolved
+          format: 'single',
           onStage: (stage) => SocialDesignGeneration.updateOne(lock, { $set: { 'generation.stage': stage } }),
         });
         concept = { ...made, fields: conceptRecordFields(made) };
@@ -516,10 +518,12 @@ export async function runDesignGeneration(generationId, lockedBy, userId = null)
       baseDesignVersion: rec.baseDesignVersion,
       baseApprovalState: rec.baseApprovalState,
       media: [{ url: media.url, type: 'image' }],
-      design: { generationId, model: providerResult.model },
+      design: { generationId, model: providerResult.model, format: 'single' },
     });
     if (!result.success) throw Object.assign(new Error(result.error.code), { code: 'DESIGN_STALE', reason: result.error.code });
     attached = true;
+    // the calendar shows the format that was actually made (a single image for an item planned as a carousel -> static_post)
+    await syncPlannedFormat(pub, 'single');
 
     // 7. A FIRST design goes to review through the workflow's own transition (never a hand-set state).
     //    A replacement inside design_review / design_approved is already handled by the version rules.

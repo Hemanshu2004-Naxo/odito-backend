@@ -192,14 +192,45 @@ async function drawStack(scene, stack, { x, y, w, gap, align = 'left', over = nu
   return { plate };
 }
 
-/** The accent rule under a text block - only with calm space around it (never floating, never over detail, never with a plate). */
-async function accentRule(scene, ctx, { x, y, plate }) {
+/**
+ * The accent rule - drawn ONLY directly under the HEADLINE, when the headline is the last line of the stack (no subline / CTA under
+ * it) and the space around the rule is calm. Under a subline or a CTA it reads as a floating underline (live report, Nov 2026), so
+ * it is not drawn there. Returns the rule's rectangle (and what it sits under) or null.
+ */
+export function accentRulePlacement(stack, { x, y: stackTop, gap, u }) {
+  const last = stack.parts[stack.parts.length - 1];
+  if (!last || last.label !== 'headline') return null;
+  const headlineBottom = stackTop + stack.parts.slice(0, -1).reduce((s, p) => s + p.r.height + (p.label === 'headline' ? gap * 1.5 : gap), 0) + last.r.height;
+  return { x, y: headlineBottom + 2.4 * u, w: 14 * u, h: 0.7 * u, under: 'headline', gapAbove: 2.4 * u };
+}
+async function accentRule(scene, ctx, { stack, x, y, gap, plate }) {
   const { u, W, H, pal } = ctx;
-  if (plate || y + 3 * u > H) return false;
-  const around = await busyness(ctx.imageFitted, { x: x - 2 * u, y: y - 1.5 * u, w: 18 * u, h: 4 * u }, W, H);
-  if (around.busy) return false;
-  scene.rect({ x, y, w: 14 * u, h: 0.7 * u, fill: pal.accent, radius: 0.35 * u });
-  return true;
+  const place = accentRulePlacement(stack, { x, y, gap, u });
+  if (!place || plate || place.y + 3 * u > H) return null;
+  const around = await busyness(ctx.imageFitted, { x: x - 2 * u, y: place.y - 1.5 * u, w: 18 * u, h: 4 * u }, W, H);
+  if (around.busy) return null;
+  scene.rect({ x: place.x, y: place.y, w: place.w, h: place.h, fill: pal.accent, radius: 0.35 * u });
+  return place;
+}
+
+/**
+ * The website as its BARE domain, small, in the footer (bottom-right) - only when the brief wanted the site shown, and only on a single
+ * image or the carousel's CTA slide. Skipped (never squeezed) when it would touch another text.
+ */
+async function footerDomainText(scene, ctx, domain) {
+  const { W, H, u, fonts, pal } = ctx;
+  const r = await fitStrict({ text: domain, family: fonts.body, weight: 600, width: W * 0.4, maxHeight: 3.6 * u, maxSize: Math.round(2.1 * u), minSize: Math.round(18 * (W / 1080)), color: '#ffffff' });
+  if (!r) return null;
+  const x = W - 6 * u - r.width; const y = H - 2.6 * u - r.height;
+  const box = { x: x - 1.2 * u, y: y - 0.8 * u, w: r.width + 2.4 * u, h: r.height + 1.6 * u };
+  const touches = (scene.report.texts || []).some((t) => t.x != null && t.x < box.x + box.w && t.x + t.width > box.x && t.y < box.y + box.h && t.y + t.height > box.y);
+  if (touches) return null;
+  const leg = await legibilityFor(ctx.imageFitted, box, W, H, { ratio: 4.5, brandDark: darken(pal.primary, 0.55) });
+  const colored = await fitStrict({ text: domain, family: fonts.body, weight: 600, width: W * 0.4, maxHeight: 3.6 * u, maxSize: Math.round(2.1 * u), minSize: Math.round(18 * (W / 1080)), color: leg.color });
+  if (leg.scrim) scene.rect({ x: box.x, y: box.y, w: box.w, h: box.h, radius: 1 * u, fill: leg.scrim.color, opacity: Math.max(0.7, leg.scrim.opacity) });
+  await scene.add(colored.buffer, x, y);
+  scene.report.texts.push({ label: 'domain', size: colored.size, width: colored.width, height: colored.height, x, y });
+  return domain;
 }
 
 /** Image labels as chips inside `area` (the picture's frame on the canvas), plus an arrow between a left and a right label. */
@@ -286,7 +317,7 @@ const LAYOUTS = {
     ctx.legibility = leg;
     if (kicker) { await scene.add(kicker.buffer, x, top); scene.report.texts.push({ label: 'kicker', size: kicker.size, width: kicker.width, height: kicker.height, x, y: top }); }
     const drawn = await drawStack(scene, stack, { x, y: stackTop, w, gap, over: ctx });
-    ctx.rule = await accentRule(scene, ctx, { x, y: stackTop + stack.height + 2.4 * u, plate: drawn.plate });
+    ctx.rule = await accentRule(scene, ctx, { stack, x, y: stackTop, gap, plate: drawn.plate });
     await imageLabels(scene, ctx, { x: 0, y: stackTop + stack.height + 6 * u, w: W, h: H - (stackTop + stack.height + 6 * u) });
     ctx.mark = await brandMark(scene, ctx, null);
   },
@@ -433,7 +464,7 @@ const LAYOUTS = {
  * Returns { buffer (PNG at W x H), report: { layout, texts, legibility, mark, fonts, notes } }. Throws TEXT_DOES_NOT_FIT (never draws a
  * cut text). `size` = { width, height } of the delivered design (1080x1350 / 1080x1080).
  */
-export async function composeConcept({ brief, image, size, brand = {}, logo = null, slide = null }) {
+export async function composeConcept({ brief, image, size, brand = {}, logo = null, slide = null, footerDomain = null }) {
   const layout = LAYOUTS[brief.layout];
   if (!layout) throw Object.assign(new Error('COMPOSE_INVALID'), { code: 'COMPOSE_INVALID', reason: `unknown_layout_${brief.layout}` });
   const W = size.width; const H = size.height;
@@ -448,12 +479,14 @@ export async function composeConcept({ brief, image, size, brand = {}, logo = nu
   };
   const scene = new Scene(W, H, '#ffffff');
   await layout(scene, ctx);
+  // the bare domain only where it belongs (the caller decides: a single image, or the carousel's CTA slide)
+  const domainDrawn = footerDomain && (!slide || brief.layout === 'carousel_cta') ? await footerDomainText(scene, ctx, footerDomain) : null;
   const buffer = await scene.render();
   return {
     buffer,
     report: {
       layout: brief.layout, width: W, height: H, texts: scene.report.texts, legibility: ctx.legibility || null, mark: ctx.mark || null,
-      busy: ctx.busy || [], plate: (ctx.busy || []).some((b) => b.busy), rule: !!ctx.rule, arrow: !!ctx.arrow,
+      busy: ctx.busy || [], plate: (ctx.busy || []).some((b) => b.busy), rule: !!ctx.rule, rulePlacement: ctx.rule || null, arrow: !!ctx.arrow, footerDomain: domainDrawn || null,
       fonts: { heading: typography.heading, body: typography.body, headingFromBrand: typography.headingFromBrand, bodyFromBrand: typography.bodyFromBrand, headingUploaded: !!typography.headingUploaded, bodyUploaded: !!typography.bodyUploaded },
       notes: [...(typography.brandFontUnavailable ? ['brand_font_unavailable'] : []), ...(ctx.mark?.kind === 'wordmark' ? ['wordmark_used'] : []), ...((ctx.busy || []).some((b) => b.busy) ? ['busy_area_plate'] : [])],
     },

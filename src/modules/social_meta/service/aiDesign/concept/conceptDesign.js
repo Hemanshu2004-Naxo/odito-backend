@@ -47,11 +47,18 @@ export async function withBrandFonts(brand, liveProfile) {
   return keys.heading || keys.body ? { ...brand, customFonts: keys } : brand;
 }
 
-/** The pipeline input for a post. `recent` = the project's latest concept designs, newest first (for style/layout rotation). */
-export function conceptInput(pub, snapshotData, recent = []) {
+/** The design format ('single' | 'carousel', decided by designFormat.resolveDesignFormat) as the creative brief names it. */
+export const BRIEF_FORMAT = Object.freeze({ single: 'single_image', carousel: 'carousel' });
+
+/**
+ * The pipeline input for a post. `recent` = the project's latest concept designs, newest first (for style/layout rotation).
+ * `format` is the RESOLVED design format; a carousel's slides are written by carousel.js, so its hook concept is briefed as one image.
+ */
+export function conceptInput(pub, snapshotData, recent = [], { format = 'single' } = {}) {
+  if (!BRIEF_FORMAT[format]) throw Object.assign(new Error(`unknown design format ${format}`), { code: 'GENERATION_FAILED' });
   return {
     caption: pub.content, pillar: pub.generation?.contentPillar || '', platform: pub.platform, objective: pub.generation?.objective || '',
-    audience: snapshotData?.audience?.primary || '', facts: snapshotFactsText(snapshotData).slice(0, 3500), recent, format: 'single_image',
+    audience: snapshotData?.audience?.primary || '', facts: snapshotFactsText(snapshotData).slice(0, 3500), recent, designFormat: format, format: BRIEF_FORMAT.single,
   };
 }
 
@@ -65,9 +72,11 @@ export const recentConcepts = (records) => (records || [])
  * ONE concept design for a post. Returns { png, option, run } (the rendered option and the whole run, for the record) or throws
  * (BRIEF_INVALID, CLAUDE_*, an image-provider error, TEXT_DOES_NOT_FIT, CONCEPT_FAILED).
  */
-export async function produceConceptDesign({ pub, snapshotData, liveProfile, recent, provider, logo = null, quality = 'medium', onStage = null }) {
+export async function produceConceptDesign({ pub, snapshotData, liveProfile, recent, provider, logo = null, quality = 'medium', onStage = null, format }) {
+  // ONE image: a carousel is made by conceptStudioService.startConceptCarousel (the format is resolved before this is called)
+  if (format !== 'single') throw Object.assign(new Error(`produceConceptDesign makes one image, not ${format}`), { code: 'DESIGN_FORMAT_INVALID' });
   const brand = await withBrandFonts(conceptBrand(snapshotData, liveProfile), liveProfile);
-  const run = await generateConceptOptions({ input: conceptInput(pub, snapshotData, recent), count: 1, provider, brand, logo, shape: 'portrait', quality, onStage });
+  const run = await generateConceptOptions({ input: conceptInput(pub, snapshotData, recent, { format }), count: 1, provider, brand, logo, shape: 'portrait', quality, onStage });
   const option = run.options[0];
   if (option?.cause && typeof option.cause === 'object') { option.cause.costUsd = run.costUsd; throw option.cause; }
   if (!option || option.error) {

@@ -60,13 +60,13 @@ test('a bulleted list of 3-6 counts as the points (•, -, *, ✅)', () => {
   }
 });
 
-test('the real caption (7 bullets in two groups) is not a 3-6 list, but is long enough to be split: carousel allowed via outline', () => {
-  assert.equal(captionPoints(REAL_CAPTION).length, 0);
-  assert.deepEqual(carouselEligibility(REAL_CAPTION), { allowed: true, points: null, source: 'outline' });
+test('the real caption (7 bullets in two groups) is now a 7-point list: one slide per bullet (Instagram room: 8 points + hook + CTA)', () => {
+  assert.equal(captionPoints(REAL_CAPTION).length, 7);
+  assert.deepEqual(carouselEligibility(REAL_CAPTION), { allowed: true, points: 7, source: 'caption', style: 'bullets' });
 });
 
 test('eligibility: own list -> caption; too short -> not allowed (hashtags do not count as words)', () => {
-  assert.deepEqual(carouselEligibility('Tips:\n• A b\n• C d\n• E f'), { allowed: true, points: 3, source: 'caption' });
+  assert.deepEqual(carouselEligibility('Tips:\n• A b\n• C d\n• E f'), { allowed: true, points: 3, source: 'caption', style: 'bullets' });
   assert.equal(carouselEligibility('Short caption. #a #b #c #d #e #f #g #h #i #j #k #l #m #n #o #p #q #r #s #t #u #v #w #x #y #z #aa #bb #cc #dd #ee #ff #gg #hh #ii #jj #kk #ll #mm #nn').allowed, false);
 });
 

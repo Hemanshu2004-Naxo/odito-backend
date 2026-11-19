@@ -47,13 +47,15 @@ function qcToolSchema() {
   const list = (d) => ({ type: 'array', items: { type: 'string', maxLength: 160 }, maxItems: 8, description: d });
   return {
     type: 'object', additionalProperties: false,
-    required: ['score', 'readable_at_phone_size', 'spelling_errors', 'word_count', 'matches_big_idea', 'ai_artifacts', 'looks_stock_or_template', 'on_brand', 'invented_facts', 'cut_off_text', 'text_over_busy_area', 'sensitive_reading', 'mixed_styles', 'unclear_symbols', 'headline_awkward', 'issues'],
+    required: ['score', 'readable_at_phone_size', 'spelling_errors', 'word_count', 'matches_big_idea', 'supports_message', 'message_mismatch', 'ai_artifacts', 'looks_stock_or_template', 'on_brand', 'invented_facts', 'cut_off_text', 'text_over_busy_area', 'sensitive_reading', 'mixed_styles', 'unclear_symbols', 'headline_awkward', 'issues'],
     properties: {
       score: { type: 'integer', minimum: 1, maximum: 10, description: 'Overall quality as a strong social agency would judge it (7 = good enough to post).' },
       readable_at_phone_size: bool('Is every text readable when the image is shown about 375 px wide on a phone?'),
       spelling_errors: list('Misspelled words in the image text, exactly as they appear; [] if none.'),
       word_count: { type: 'integer', minimum: 0, description: 'How many words of text you can see on the image.' },
       matches_big_idea: bool('Does the picture actually show the big idea?'),
+      supports_message: bool('Does the visual support the headline\'s MESSAGE, not just its keywords? Judge what a viewer would take from the picture. Example of a FAIL: the headline "Three things holding your website back" (= problems dragging it down) over a three-legged stool (= stability, balance): it matches the word "three" but says the opposite. Another FAIL: "Stop losing leads" over a magnet pulling people in. A picture that shows the message (something weighed down, held back, blocked) passes.'),
+      message_mismatch: { type: 'string', maxLength: 200, description: 'When supports_message is false: what the picture says instead, in plain words (e.g. "a stool means stability, the headline is about problems"); "" otherwise.' },
       ai_artifacts: list('Visible AI artifacts: warped hands or fingers, distorted faces, melted or impossible objects, garbled pseudo-text in the picture; [] if none.'),
       looks_stock_or_template: bool('Does it look like a generic stock photo or a flat template (e.g. a smiling team around a laptop, a fake dashboard)?'),
       on_brand: bool('Do the colours and type feel like the brand described?'),
@@ -112,6 +114,8 @@ export async function checkDesignQuality({ png, brief, report, caption, facts, b
   }
 
   const soft = [
+    // the picture matches the headline's keywords but not its message (e.g. a stool = stability, for "things holding you back"): a concept retry
+    ...(visual?.supports_message === false ? [`meaning mismatch: the picture does not support the headline's message${visual.message_mismatch ? ` (${visual.message_mismatch})` : ''}`] : []),
     ...(visual?.mixed_styles ? ['mixes visual styles - keep one style (illustrated / rendered / solid background for non-photo styles)'] : []),
     ...(visual?.headline_awkward ? ['the headline reads awkwardly'] : []),
     ...(visual?.text_over_busy_area ? ['text sits on a busy part of the picture'] : []),
@@ -131,6 +135,7 @@ export async function checkDesignQuality({ png, brief, report, caption, facts, b
     score, passed, hardFail,
     checks: visual ? {
       readable_at_phone_size: visual.readable_at_phone_size, spelling_errors: visual.spelling_errors, word_count: visual.word_count, matches_big_idea: visual.matches_big_idea,
+      supports_message: visual.supports_message, message_mismatch: visual.message_mismatch || '',
       ai_artifacts: visual.ai_artifacts, looks_stock_or_template: visual.looks_stock_or_template, on_brand: visual.on_brand, invented_facts: visual.invented_facts, cut_off_text: visual.cut_off_text,
       text_over_busy_area: visual.text_over_busy_area, sensitive_reading: visual.sensitive_reading, mixed_styles: visual.mixed_styles, unclear_symbols: visual.unclear_symbols, headline_awkward: visual.headline_awkward,
     } : null,

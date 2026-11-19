@@ -61,8 +61,9 @@ const FORMAT_LABELS = Object.freeze({
 });
 
 /** The post text split into the caption and its trailing hashtag block (hashtags are part of the real publication text). */
-import { usesConceptStudio, latestConceptRecord, toApiConceptGeneration, getDesignCosts } from './conceptStudioService.js';
+import { usesConceptStudio, latestConceptRecord, toApiConceptGeneration, getDesignCosts, postDesignFormat, toApiDesignFormat } from './conceptStudioService.js';
 import { carouselEligibility } from './concept/carousel.js';
+import { FORMAT_MESSAGES } from './concept/designFormat.js';
 import { matchFamily } from './compose/designFonts.js';
 
 export function splitContent(text) {
@@ -187,7 +188,7 @@ export async function getStudioState(projectId, publicationId, { now = new Date(
     },
     format: {
       platform: pub.platform, size: PLATFORM_DESIGN[pub.platform]?.size || null, aspectRatio: spec.aspectRatio, mediaType: 'image', label: spec.label, plannedFormat,
-      note: plannedFormat === 'reel' || plannedFormat === 'video' ? 'The plan calls for a video: Creative Studio creates the still image for it.' : plannedFormat === 'carousel' ? 'The plan calls for a carousel: Creative Studio creates one cover image that summarises it.' : null,
+      note: plannedFormat === 'reel' || plannedFormat === 'video' ? 'The plan calls for a video: Creative Studio creates the still image for it.' : plannedFormat === 'carousel' ? 'The plan calls for a carousel.' : null,
     },
     currentDesign: currentMediaUrl(pub) ? {
       url: currentMediaUrl(pub), designVersion: pub.designVersion, approvalState: pub.approvalState ?? null, source: pub.design?.source === 'ai' && pub.design.designVersion === pub.designVersion ? 'ai' : 'upload',
@@ -201,15 +202,17 @@ export async function getStudioState(projectId, publicationId, { now = new Date(
 async function conceptStudioState(pub, ctx, projectId, rec) {
   const concept = await usesConceptStudio(pub, ctx?.liveProfile || null);
   if (!concept) return { pipeline: 'rules', generation: toApiStudioGeneration(rec, pub) };
-  // a numbered/bulleted 3-6 point list, or a caption long enough for Claude to split into 3-6 slides
+  // a 3-10 item list of the caption (numbered, bullets, emoji numbers, steps, bold headings...), or a caption long enough for Claude to split
   const eligible = carouselEligibility(pub.content);
   const carouselAllowed = eligible.allowed;
   const points = eligible.points;
   const latest = await latestConceptRecord(projectId, String(pub._id));
   const costs = await getDesignCosts(projectId, { publicationId: String(pub._id) });
+  // the picker's default: the same rule as Content Approvals (the plan's format, else the caption's list) - not "single"
+  const recommended = toApiDesignFormat(await postDesignFormat(pub));
   return {
     pipeline: 'concept',
-    formats: { single: { allowed: true }, carousel: { allowed: carouselAllowed, points, source: eligible.source, reason: carouselAllowed ? null : 'This caption is too short to split into carousel slides.' } },
+    formats: { single: { allowed: true }, carousel: { allowed: carouselAllowed, points, source: eligible.source, style: eligible.style || null, reason: carouselAllowed ? null : FORMAT_MESSAGES.CHOSEN_NO_POINTS }, recommended },
     costs: { currency: costs.currency, post: costs.post, month: costs.month },
     generation: toApiConceptGeneration(latest, pub),
   };

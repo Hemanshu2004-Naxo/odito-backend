@@ -2,7 +2,7 @@ import { startDesignGeneration, getDesignGenerationStatus } from '../service/aiD
 import { getStudioState, startStudioGeneration, selectStudioCandidate } from '../service/aiDesign/socialDesignStudioService.js';
 import {
   studioPipelineFor, startConceptCompare, regenerateConceptPreview, startConceptRender, regenerateCarouselSlide, reorderCarouselSlides, deleteCarouselSlide,
-  getCarouselSlides, getDesignCosts, getDesignJobs,
+  getCarouselSlides, getDesignCosts, getDesignJobs, startPostDesign, designFormatFor,
 } from '../service/aiDesign/conceptStudioService.js';
 import { ResponseUtil } from '../../../utils/ResponseUtil.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
@@ -45,6 +45,7 @@ const ERROR_STATUS = {
   DESIGN_VERSION_MISMATCH: 409,
   DESIGN_FILE_MISSING: 409,
   CAROUSEL_NEEDS_POINTS: 422,
+  CAROUSEL_UNAVAILABLE: 422,
   CANDIDATE_NOT_READY: 409,
   SLIDE_NOT_FOUND: 404,
   TOO_FEW_SLIDES: 422,
@@ -56,18 +57,20 @@ const serverError = (res, message) => res.status(500).json(ResponseUtil.error(me
 
 export async function generateAIDesignHandler(req, res) {
   const projectId = req.projectId;
-  const { publicationId, contentVersion, replaceApproved } = req.body || {};
+  const { publicationId, contentVersion, replaceApproved, format } = req.body || {};
   try {
-    const result = await startDesignGeneration(projectId, req.userId, { publicationId, contentVersion, replaceApproved });
+    // the format is decided on the server on EVERY call: the person's choice (format), else the calendar plan, else the caption
+    const result = await startPostDesign(projectId, req.userId, { publicationId, contentVersion, replaceApproved, format: format === 'single' || format === 'carousel' ? format : null });
     if (!result.success) {
       const status = ERROR_STATUS[result.error.code] || 400;
-      const { code, message, currentContentVersion } = result.error;
-      return res.status(status).json(ResponseUtil.error(message, status, { code, ...(currentContentVersion ? { currentContentVersion } : {}) }));
+      const { code, message, currentContentVersion, format: designFormat } = result.error;
+      return res.status(status).json(ResponseUtil.error(message, status, { code, ...(currentContentVersion ? { currentContentVersion } : {}), ...(designFormat ? { format: designFormat } : {}) }));
     }
     return res.status(202).json(ResponseUtil.success({
       status: 'generating',
       generationId: result.generation?.id || null,
       alreadyRunning: result.alreadyRunning,
+      format: result.format || 'single',
       generation: result.generation,
     }));
   } catch (error) {
@@ -87,7 +90,9 @@ export async function getAIDesignStatusHandler(req, res) {
       return res.status(status).json(ResponseUtil.error(result.error.message, status, { code: result.error.code }));
     }
     const { status, generation, publication } = result;
-    return res.json(ResponseUtil.success({ status, generation, publication }));
+    // the format the next Generate / Regenerate would make (the Single / Carousel switch's default) and any mismatch with the plan
+    const designFormat = publicationId ? await designFormatFor(projectId, publicationId).catch(() => null) : null;
+    return res.json(ResponseUtil.success({ status, generation, publication, designFormat }));
   } catch (error) {
     LoggerUtil.error('[SOCIAL_AI_DESIGN] Failed to load status', { message: error.message }, { projectId });
     return serverError(res, 'Failed to load the design generation status');

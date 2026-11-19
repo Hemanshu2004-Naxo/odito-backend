@@ -114,7 +114,8 @@ const socialDesignGenerationSchema = new mongoose.Schema({
     format: { type: String, enum: ['single', 'carousel', null], default: null },
     pickedCandidateId: { type: mongoose.Schema.Types.ObjectId, default: null },
     slideKey: { type: String, default: null, maxlength: 20 }, // the slide a 'slide' job regenerates
-    action: { type: String, enum: ['generate_all', 'regenerate', 'render', 'regenerate_slide', null], default: null },
+    // 'auto_carousel' (additive): a carousel from Content Approvals - one hook concept written and picked by Odito, no Compare step
+    action: { type: String, enum: ['generate_all', 'regenerate', 'render', 'regenerate_slide', 'auto_carousel', null], default: null },
     candidateId: { type: mongoose.Schema.Types.ObjectId, default: null },
     instruction: { type: String, default: null, maxlength: 400 },
     productMediaIds: { type: [mongoose.Schema.Types.ObjectId], default: [] }, // the product photos the person chose for the design

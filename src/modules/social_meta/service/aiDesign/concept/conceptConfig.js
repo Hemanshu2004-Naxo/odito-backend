@@ -21,7 +21,10 @@ export const MAX_CAROUSEL_SLIDES = 8;
 /** A carousel "point" slide: one idea, at most this many words (its big number not counted). */
 export const MAX_POINT_SLIDE_WORDS = 12;
 export const MIN_CAROUSEL_POINTS = 3;
-export const MAX_CAROUSEL_POINTS = 6;
+/** Point slides in one carousel: Instagram allows 10 slides, and the hook + CTA take two of them. */
+export const MAX_CAROUSEL_POINTS = 8;
+/** A caption list of up to this many items is still a carousel: 9-10 items are merged (by Claude) into at most MAX_CAROUSEL_POINTS. */
+export const MAX_LISTED_POINTS = 10;
 
 /** The brief writes this many headline candidates per image; an independent judge picks the most natural one. */
 export const HEADLINE_CANDIDATES = 5;

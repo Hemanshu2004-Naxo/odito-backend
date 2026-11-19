@@ -19,7 +19,9 @@ import { createPublication, submitContentForApproval, approveContent, approveDes
 import { setDesignProviderOverride, resetDesignProviderOverride } from './socialDesignGenerationService.js';
 import {
   startConceptCompare, startConceptRender, regenerateCarouselSlide, reorderCarouselSlides, deleteCarouselSlide, getCarouselSlides, getDesignCosts, getDesignJobs, studioPipelineFor,
+  startPostDesign, designFormatFor,
 } from './conceptStudioService.js';
+import SocialContentCalendarItem from '../../model/SocialContentCalendarItem.js';
 import { getStudioState } from './socialDesignStudioService.js';
 import { setBriefProviderOverride } from './concept/creativeBrief.js';
 import { setQualityProviderOverride } from './concept/conceptQuality.js';
@@ -82,12 +84,18 @@ const QC = (score = 8, extra = {}) => ({ score, readable_at_phone_size: true, sp
 
 function claude({ qcFor = () => QC() } = {}) {
   const log = [];
+  let single = 0;
   const done = (parsed) => ({ parsed, model: 'claude-sonnet-4-6', usage: { inputTokens: 1000, outputTokens: 300 }, durationMs: 1 });
   const brief = {
     log,
     async generateStructured(req) {
       log.push(req.tool.name);
-      if (req.tool.name === 'emit_design_concepts') return done({ concepts: [0, 1, 2].map(concept) });
+      // one concept at a time rotates (the brief refuses a layout + style the project's latest design just used)
+      if (req.tool.name === 'emit_design_concepts') {
+        const n = req.tool.schema.properties.concepts.minItems;
+        if (n === 1) { single += 1; return done({ concepts: [concept((single - 1) % 3)] }); }
+        return done({ concepts: [0, 1, 2].map(concept) });
+      }
       if (req.tool.name === 'emit_carousel_look' || req.tool.name === 'emit_carousel_slide') return done(splitAnswer(CAROUSEL(), req));
       if (req.tool.name === 'emit_carousel_points') return done(OUTLINE_ANSWER);
       if (req.tool.name === 'judge_headlines') {
@@ -160,7 +168,8 @@ describe('Concept Studio (real MongoDB + sharp + storage; Claude and the image m
     resetDesignProviderOverride(); setBriefProviderOverride(null); setQualityProviderOverride(null);
     for (const key of Object.keys(original || {})) { const [p, m] = key.split('.'); adapters[p][m] = original[key]; }
     if (!mongoAvailable) return;
-    const ids = created.map((d) => d._id);
+    await SocialContentCalendarItem.collection.deleteMany({ _id: { $in: created.filter((d) => d.isPlanItem).map((d) => d._id) } });
+    const ids = created.filter((d) => !d.isPlanItem).map((d) => d._id);
     await Promise.all([SocialDesignGeneration.deleteMany({ project_id: { $in: ids } }), SocialPublication.deleteMany({ project_id: { $in: ids } }), SocialAIStrategy.deleteMany({ project_id: { $in: ids } }), SocialApprovalSettings.deleteMany({ project_id: { $in: ids } }), SocialAccount.deleteMany({ project_id: { $in: ids } }), SocialBusinessProfile.deleteMany({ project_id: { $in: ids } })]);
     await SeoProject.deleteMany({ _id: { $in: ids } });
     for (const id of ids) await removeProjectMedia(id);
@@ -252,6 +261,110 @@ describe('Concept Studio (real MongoDB + sharp + storage; Claude and the image m
     const r = await startConceptCompare(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'carousel' }, { background: false });
     assert.equal(r.success, false);
     assert.equal(r.error?.code || r.code, 'CAROUSEL_NEEDS_POINTS');
+  });
+
+  // ── Content Approvals: the format rule (choice -> calendar plan -> caption), carousels from Generate / Regenerate ──────────────
+
+  async function planItem(pub, format) {
+    const _id = new mongoose.Types.ObjectId();
+    // raw insert: only the fields the design path reads (the calendar's own validation is tested elsewhere)
+    await SocialContentCalendarItem.collection.insertOne({ _id, project_id: project._id, calendar_id: new mongoose.Types.ObjectId(), format, topic: 'Signs of a growth ceiling', platforms: ['facebook'] });
+    created.push({ _id, isPlanItem: true });
+    await SocialPublication.updateOne({ _id: pub.id }, { $set: { 'generation.calendarItemId': _id } });
+    return _id;
+  }
+  const scripted = () => { const { brief, qc } = claude(); setBriefProviderOverride(brief); setQualityProviderOverride(qc); const provider = imageProvider(); setDesignProviderOverride(provider); return { brief, qc, provider }; };
+  const planFormat = async (id) => (await SocialContentCalendarItem.collection.findOne({ _id: id }))?.format;
+
+  test('A1: Approvals Generate on a post PLANNED as Carousel makes a carousel (hook + 3 points + CTA), no format sent', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const { brief } = scripted();
+    const pub = await seedPost();
+    const item = await planItem(pub, 'carousel');
+    const before = await designFormatFor(pid, pub.id);
+    assert.deepEqual([before.recommended, before.source, before.plannedFormat, before.needsChoice], ['carousel', 'plan', 'carousel', false]);
+    const r = await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1 }, { background: false });
+    assert.equal(r.success, true, JSON.stringify(r));
+    assert.equal(r.format, 'carousel');
+    assert.equal(r.generation.status, 'ready', JSON.stringify(r.generation.failure));
+    assert.deepEqual(r.generation.slides.map((s) => s.key), ['hook', 'p1', 'p2', 'p3', 'cta']);
+    assert.equal(brief.log.filter((n) => n === 'emit_design_concepts').length, 1, 'one hook concept, no Compare');
+    const after = await row(pub.id);
+    assert.equal(after.media.length, 5);
+    assert.equal(after.design.format, 'carousel');
+    assert.equal(after.approvalState, 'design_review');
+    assert.equal(await planFormat(item), 'carousel');
+    const slides = await getCarouselSlides(pid, pub.id);
+    assert.equal(slides.generation.slides.length, 5, 'Approvals reads the carousel slides');
+  });
+
+  test('A2: Regenerate re-checks the format every time: an explicit Single overrides the plan (calendar follows), then no choice -> the caption list', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    scripted();
+    const pub = await seedPost();
+    const item = await planItem(pub, 'carousel');
+    const single = await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'single' }, { background: false });
+    assert.equal(single.success, true, JSON.stringify(single));
+    assert.equal(single.format, 'single');
+    let now = await row(pub.id);
+    assert.equal(now.media.length, 1);
+    assert.equal(now.design.format, 'single');
+    assert.equal(await planFormat(item), 'static_post', 'the calendar shows the format that was made');
+    // no choice now: the plan says static_post -> single (the earlier carousel plan is not remembered)
+    assert.equal((await designFormatFor(pid, pub.id)).recommended, 'single');
+    // explicit carousel: re-checked, made, and the calendar follows again
+    const carousel = await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'carousel' }, { background: false });
+    assert.equal(carousel.success, true, JSON.stringify(carousel));
+    now = await row(pub.id);
+    assert.equal(now.media.length, 5);
+    assert.equal(await planFormat(item), 'carousel');
+  });
+
+  test('A3: no plan: a caption list -> carousel by default; a Regenerate after a single image does not inherit "single"', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    scripted();
+    const pub = await seedPost();
+    assert.equal((await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'single' }, { background: false })).format, 'single');
+    const again = await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1 }, { background: false });
+    assert.equal(again.format, 'carousel');
+    assert.equal(again.generation.status, 'ready', JSON.stringify(again.generation.failure));
+    assert.equal((await row(pub.id)).media.length, 5);
+  });
+
+  test('A4: planned carousel with no clear points -> the question (422 code), nothing made; "Make a single image" then works', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const { provider } = scripted();
+    const pub = await seedPost('Big news this week. Stay tuned.');
+    await planItem(pub, 'carousel');
+    const r = await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1 }, { background: false });
+    assert.equal(r.success, false);
+    assert.equal(r.error.code, 'CAROUSEL_NEEDS_POINTS');
+    assert.equal(r.error.message, 'Planned as carousel, but the caption has no clear points. Make a single image or edit the caption?');
+    assert.equal(r.error.format.needsChoice, true);
+    assert.equal(await SocialDesignGeneration.countDocuments({ publication_id: pub.id }), 0, 'no generation was started');
+    assert.equal(provider.calls.length, 0);
+    assert.equal((await row(pub.id)).media.length, 0, 'never a quiet single image');
+    const single = await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'single' }, { background: false });
+    assert.equal(single.success, true, JSON.stringify(single));
+    assert.equal((await row(pub.id)).media.length, 1);
+  });
+
+  test('A5: an existing single image on a post planned as carousel is flagged (mismatch), not changed; Studio defaults to carousel', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    scripted();
+    const pub = await seedPost();
+    await startPostDesign(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'single' }, { background: false });
+    const before = await row(pub.id);
+    // the plan says carousel (an old design made before formats were followed)
+    const item = await planItem(pub, 'carousel');
+    const f = await designFormatFor(pid, pub.id);
+    assert.deepEqual([f.mismatch, f.current, f.recommended], [true, 'single', 'carousel']);
+    const after = await row(pub.id);
+    assert.equal(after.designVersion, before.designVersion, 'nothing is changed automatically');
+    assert.equal(await planFormat(item), 'carousel');
+    const st = await getStudioState(pid, pub.id);
+    assert.equal(st.formats.recommended.recommended, 'carousel');
+    assert.equal(st.format.note, 'The plan calls for a carousel.');
   });
 
   test('3: approving the design approves the WHOLE carousel; regenerating one slide makes a new design version back in Design Review, same position', async (t) => {

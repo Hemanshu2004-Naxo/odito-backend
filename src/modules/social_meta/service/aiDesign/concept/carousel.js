@@ -1,5 +1,5 @@
 import {
-  CAROUSEL_BRIEF_VERSION, MAX_HEADLINE_WORDS, MAX_SUBLINE_WORDS, MAX_CTA_WORDS, MAX_POINT_SLIDE_WORDS, MIN_CAROUSEL_POINTS, MAX_CAROUSEL_POINTS, MAX_WORDS_PER_IMAGE,
+  CAROUSEL_BRIEF_VERSION, MAX_HEADLINE_WORDS, MAX_SUBLINE_WORDS, MAX_CTA_WORDS, MAX_POINT_SLIDE_WORDS, MIN_CAROUSEL_POINTS, MAX_CAROUSEL_POINTS, MAX_LISTED_POINTS, MAX_WORDS_PER_IMAGE,
   VISUAL_STYLES, CONCEPT_TEXT_MODEL, CONCEPT_TIMEOUT_MS, CONCEPT_MAX_OUTPUT_TOKENS, QC_MAX_RETRIES, CAROUSEL_CONCURRENCY, CAROUSEL_RATE_LIMITED_CONCURRENCY, claudeCostUsd,
 } from './conceptConfig.js';
 import {
@@ -20,38 +20,122 @@ import { PROVIDER_ERROR } from '../../aiContent/providers/contentProviderErrors.
 export const CAROUSEL_TOOL = 'emit_carousel';
 const str = (description, maxLength) => ({ type: 'string', description, ...(maxLength ? { maxLength } : {}) });
 
-/** The numbered points of a caption ("1. ...", "2) ..."), in order - the carousel gets one slide per point. */
-// A bullet line: "• ...", "- ...", "* ...", "– ...", "✓ ...", "✅ ...", "→ ..." (the marker, then a space).
-const BULLET_RE = /^(?:[•●▪◦‣∙·*✓✔✅➤►→▶-]|[–—])️?\s+(.+)$/u;
+// ── list detection ───────────────────────────────────────────────────────────
+// A caption's list, in order - the carousel gets one slide per item. Each style below is tried in turn; the first that yields
+// 3-10 items wins (9-10 items are merged into at most MAX_CAROUSEL_POINTS by Claude, see carouselEligibility).
+//   numbered        "1. ...", "2) ..."                         emoji numbers   "1️⃣ ...", "🔟 ..."
+//   steps           "Step 1: ...", "Step 2 - ..."               bullets         "• ...", "- ...", "* ...", "✅ ...", "→ ..."
+//   bold headings   "**Slow pages**", "𝗦𝗹𝗼𝘄 𝗽𝗮𝗴𝗲𝘀" (a line that is all bold)
+//   label lines     "Speed: visitors leave..." / "Slow pages:" (3+ short labels ending in a colon)
+//   plain list      3+ short lines in a row with no marker and no sentence punctuation, between blank lines
 
-export function captionPoints(caption) {
-  const lines = String(caption || '').split(/\n/).map((l) => l.trim());
-  const numbered = [];
+const BULLET_RE = /^(?:(?:[•●▪◦‣∙·*✓✔✅☑➤►→▶➡◆◇■□-]|[–—])️?\s+|(?:👉|🔹|🔸)️?\s*)(.+)$/u;
+const KEYCAP_RE = /^(?:(10|[0-9])️?⃣|(🔟))\s*[.):\-–—]?\s*(.+)$/u;
+const STEP_RE = /^(?:step|tip|sign|reason|mistake|rule|way|lesson|day)\s+(\d{1,2})\s*[:.)\-–—]\s*(.+)$/iu;
+const NUMBERED_RE = /^(\d{1,2})[.)]\s+(.+)$/;
+const MD_BOLD_RE = /^(?:\*\*|__)(.+?)(?:\*\*|__)\s*[:.\-–—]?\s*(.*)$/u;
+// Mathematical bold / sans-bold letters and digits (what "bold" fonts in captions are made of)
+const MATH_BOLD_RE = /[\u{1D400}-\u{1D433}\u{1D5D4}-\u{1D607}\u{1D63C}-\u{1D66F}\u{1D7CE}-\u{1D7FF}]/gu;
+const LABEL_RE = /^([A-Z0-9][^:.!?#]{1,48}):\s*(.*)$/u;
+const HASHTAG_LINE_RE = /^(?:#\S+\s*)+$/u;
+const MAX_LIST_LINE_WORDS = 10;
+
+const plain = (s) => String(s || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+const countWords = (s) => plain(s).split(' ').filter(Boolean).length;
+const numbered = (texts) => texts.map((text, i) => ({ number: i + 1, text: plain(text) })).filter((p) => p.text);
+const inRange = (n) => n >= MIN_CAROUSEL_POINTS && n <= MAX_LISTED_POINTS;
+
+/** "Label: rest" or a bold heading -> the slide text (the heading alone; with its line's text when that is short). */
+const headingText = (head, rest) => {
+  const h = plain(head).replace(/[:\s]+$/, '');
+  const r = plain(rest);
+  return r && countWords(`${h} ${r}`) <= MAX_POINT_SLIDE_WORDS ? `${h}: ${r}` : h;
+};
+
+function detectNumbered(lines) {
+  const found = lines.map((l) => l.match(NUMBERED_RE)).filter(Boolean).map((m) => ({ n: Number(m[1]), text: m[2] }));
+  const inOrder = found.filter((p, i) => p.n === i + 1);
+  return inOrder.map((p) => p.text);
+}
+function detectKeycaps(lines) {
+  const found = lines.map((l) => l.match(KEYCAP_RE)).filter(Boolean).map((m) => ({ n: m[2] ? 10 : Number(m[1]), text: m[3] }));
+  const start = found.length && found[0].n === 0 ? 0 : 1; // some captions start at 0️⃣
+  return found.filter((p, i) => p.n === i + start).map((p) => p.text);
+}
+function detectSteps(lines) {
+  const found = lines.map((l) => l.match(STEP_RE)).filter(Boolean).map((m) => ({ n: Number(m[1]), text: m[2] }));
+  return found.filter((p, i) => p.n === i + 1).map((p) => p.text);
+}
+const detectBullets = (lines) => lines.map((l) => l.match(BULLET_RE)?.[1]).filter((t) => t && t.trim());
+function detectBoldHeadings(lines) {
+  const out = [];
   for (const line of lines) {
-    const m = line.match(/^(\d{1,2})[.)]\s+(.+)$/);
-    if (m) numbered.push({ number: Number(m[1]), text: m[2].trim() });
+    const md = line.match(MD_BOLD_RE);
+    if (md && countWords(md[1]) <= MAX_LIST_LINE_WORDS) { out.push(headingText(md[1], md[2])); continue; }
+    // a unicode-bold heading: most of the line's letters are mathematical-bold characters
+    const letters = line.replace(/[\s\p{P}\p{S}]/gu, '');
+    const bold = (line.match(MATH_BOLD_RE) || []).length;
+    if (letters.length >= 3 && bold / [...letters].length >= 0.6 && countWords(line) <= MAX_LIST_LINE_WORDS) out.push(headingText(line, ''));
   }
-  const inOrder = numbered.filter((p, i) => p.number === i + 1);
-  if (inOrder.length >= MIN_CAROUSEL_POINTS && inOrder.length <= MAX_CAROUSEL_POINTS) return inOrder;
-  // A bulleted list counts the same way (most captions use bullets, not numbers).
-  const bullets = lines.map((l) => l.match(BULLET_RE)?.[1]?.trim()).filter(Boolean);
-  if (bullets.length >= MIN_CAROUSEL_POINTS && bullets.length <= MAX_CAROUSEL_POINTS) return bullets.map((text, i) => ({ number: i + 1, text }));
-  return inOrder;
+  return out;
+}
+function detectLabels(lines) {
+  const found = [];
+  for (const line of lines) {
+    const m = line.match(LABEL_RE);
+    if (m && countWords(m[1]) <= 6 && !/https?$/i.test(m[1])) found.push(headingText(m[1], m[2]));
+  }
+  return found;
+}
+function detectPlainList(lines) {
+  // blocks of consecutive non-empty lines; a block (not the opening one) of 3+ short marker-free lines without sentence punctuation
+  const blocks = [];
+  let cur = [];
+  for (const line of [...lines, '']) {
+    if (line) cur.push(line); else if (cur.length) { blocks.push(cur); cur = []; }
+  }
+  for (const block of blocks.slice(1)) {
+    if (block.length < MIN_CAROUSEL_POINTS || block.length > MAX_LISTED_POINTS) continue;
+    const ok = block.every((l) => countWords(l) <= MAX_LIST_LINE_WORDS && !/[.!?…]$/.test(l) && !HASHTAG_LINE_RE.test(l) && !/:$/.test(l));
+    if (ok) return block;
+  }
+  return [];
 }
 
-/** A caption with no 3-6 point list can still become a carousel when it says enough to split into slides. */
+const DETECTORS = [
+  ['numbered', detectNumbered], ['emoji_numbers', detectKeycaps], ['steps', detectSteps], ['bullets', detectBullets],
+  ['bold_headings', detectBoldHeadings], ['labels', detectLabels], ['plain_list', detectPlainList],
+];
+
+/** The caption's list as { style, points: [{ number, text }] } - the first list style with 3-10 items; points [] when none. */
+export function detectCaptionList(caption) {
+  const lines = String(caption || '').split(/\r?\n/).map((l) => l.trim());
+  for (const [style, detect] of DETECTORS) {
+    const pts = numbered(detect(lines));
+    if (inRange(pts.length)) return { style, points: pts };
+  }
+  return { style: null, points: [] };
+}
+
+/** The caption's own 3-10 item list (numbered, emoji numbers, steps, bullets, bold headings, label lines, a plain list), in order. */
+export const captionPoints = (caption) => detectCaptionList(caption).points;
+
+/** A caption with no list can still become a carousel when it says enough to split into slides. */
 export const MIN_OUTLINE_WORDS = 40;
 
 /**
- * Can this caption become a carousel, and how: { allowed, points, source: 'caption' | 'outline' | null }.
- * 'caption' = its own numbered/bulleted 3-6 points; 'outline' = Claude splits the caption into 3-6 points (outlineCaptionPoints).
+ * Can this caption become a carousel, and how: { allowed, points, source: 'caption' | 'merge' | 'outline' | null, style }.
+ *   'caption' = its own list of 3-8 items, one slide each;
+ *   'merge'   = its own list of 9-10 items: Claude merges them into at most 8 slides (Instagram's 10 minus hook and CTA);
+ *   'outline' = no list, but 40+ words: Claude splits the caption into 3-8 points (outlineCaptionPoints).
  */
 export function carouselEligibility(caption) {
-  const listed = captionPoints(caption);
-  if (listed.length >= MIN_CAROUSEL_POINTS && listed.length <= MAX_CAROUSEL_POINTS) return { allowed: true, points: listed.length, source: 'caption' };
+  const { style, points } = detectCaptionList(caption);
+  if (points.length >= MIN_CAROUSEL_POINTS && points.length <= MAX_CAROUSEL_POINTS) return { allowed: true, points: points.length, source: 'caption', style };
+  if (points.length > MAX_CAROUSEL_POINTS) return { allowed: true, points: points.length, source: 'merge', style };
   const body = String(caption || '').replace(/(^|\s)#\S+/g, ' ');
-  if (words(body).length >= MIN_OUTLINE_WORDS) return { allowed: true, points: null, source: 'outline' };
-  return { allowed: false, points: listed.length, source: null };
+  if (words(body).length >= MIN_OUTLINE_WORDS) return { allowed: true, points: null, source: 'outline', style: null };
+  return { allowed: false, points: 0, source: null, style: null };
 }
 
 const OUTLINE_TOOL = 'emit_carousel_points';
@@ -76,13 +160,16 @@ const OUTLINE_SCHEMA = {
  * quote the caption words it comes from (verbatim), add no figure the caption doesn't have, stay short, and not repeat another point.
  * One repair. Returns { points: [{ number, text }], calls }. Throws CAROUSEL_NEEDS_POINTS (with calls) when it can't.
  */
-export async function outlineCaptionPoints({ caption }) {
+export async function outlineCaptionPoints({ caption, listed = null }) {
   const calls = [];
   let feedback = [];
+  const merge = Array.isArray(listed) && listed.length > MAX_CAROUSEL_POINTS
+    ? ` The caption lists ${listed.length} items, more than the ${MAX_CAROUSEL_POINTS} slides a carousel has room for: merge closely related items into one point so that every item is still covered.`
+    : '';
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // eslint-disable-next-line no-await-in-loop
     const res = await briefProvider().generateStructured({
-      system: `You split a social media caption into the points of an Instagram/Facebook carousel: ${MIN_CAROUSEL_POINTS} to ${MAX_CAROUSEL_POINTS} points, one slide each, in the caption's order. Each point restates ONE idea that the caption itself makes - no new facts, figures, names, promises or advice. Skip the hook line, the call to action, questions to the audience and hashtags. Group small related items (e.g. a list of examples) into one point rather than dropping them.`,
+      system: `You split a social media caption into the points of an Instagram/Facebook carousel: ${MIN_CAROUSEL_POINTS} to ${MAX_CAROUSEL_POINTS} points, one slide each, in the caption's order. Each point restates ONE idea that the caption itself makes - no new facts, figures, names, promises or advice. Skip the hook line, the call to action, questions to the audience and hashtags. Group small related items (e.g. a list of examples) into one point rather than dropping them.${merge}`,
       user: `<caption>\n${caption}\n</caption>${feedback.length ? `\n\nYour previous answer broke these rules - fix them:\n- ${feedback.join('\n- ')}` : ''}`,
       tool: { name: OUTLINE_TOOL, description: 'Emit the carousel points. Call this exactly once.', schema: OUTLINE_SCHEMA },
       model: CONCEPT_TEXT_MODEL, maxTokens: 1200, timeoutMs: CONCEPT_TIMEOUT_MS, retries: 1,

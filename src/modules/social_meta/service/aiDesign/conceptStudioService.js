@@ -9,8 +9,11 @@ import mediaStorageService from '../media/mediaStorageService.js';
 import { processAndStoreDesign } from './designMedia.js';
 import {
   loadBriefContext, loadDesignAssets, activeAccountFor, DESIGNABLE_STATES, getDesignProvider, isDesignProviderOverridden, recoverStaleDesignGenerations, designFailureFor, DESIGN_FAILURE_MESSAGES,
+  startDesignGeneration,
 } from './socialDesignGenerationService.js';
-import { loadDesignablePost } from './socialDesignStudioService.js';
+import { loadDesignablePost, loadPlan } from './socialDesignStudioService.js';
+import { resolveDesignFormat, currentDesignFormat, formatMismatch, FORMAT_MESSAGES } from './concept/designFormat.js';
+import { syncPlannedFormat } from './designFormatSync.js';
 import { conceptPipelineActive, conceptBrand, conceptInput, recentConcepts, withBrandFonts, PIPELINE } from './concept/conceptDesign.js';
 import { generateCreativeBrief, reviseConcept, words } from './concept/creativeBrief.js';
 import { renderConcept } from './concept/conceptPipeline.js';
@@ -48,7 +51,7 @@ export const MAX_CAROUSEL_SLIDES = 10;
 const STYLE_LABELS = { photo: 'Photo', '3d_render': '3D render', editorial_illustration: 'Editorial illustration', bold_typographic: 'Bold type' };
 
 export const CONCEPT_STUDIO_MESSAGES = Object.freeze({
-  NOT_A_LIST: 'This caption is too short to split into carousel slides. Use a single image, or write a longer caption.',
+  NOT_A_LIST: 'This caption has no clear points to split into carousel slides. Make a single image or edit the caption?',
   CANDIDATE_NOT_READY: 'That concept is not ready yet.',
   SLIDE_NOT_FOUND: 'That slide was not found.',
   TOO_FEW_SLIDES: 'A carousel needs at least 2 slides.',
@@ -367,7 +370,113 @@ async function attachMedia(rec, pub, userId, mediaUrls, format, model) {
   });
   if (!attach.success) return attach;
   if (attach.publication.approvalState === 'content_approved') await submitDesignForApproval(rec.project_id, rec.publication_id, userId || rec.requestedBy);
+  // the calendar shows the format that was actually made
+  await syncPlannedFormat(pub, format);
   return attach;
+}
+
+// ── which format (Content Approvals + Creative Studio) ────────────────────
+
+/**
+ * The post's design format by the shared rule (the person's choice -> the calendar plan -> the caption's list), plus what the post
+ * carries now and whether that disagrees with its plan. Cheap: no image is read (it runs on every status poll).
+ */
+export async function postDesignFormat(pub, { explicit = null } = {}) {
+  const { planItem, product } = await loadPlan(pub);
+  // carousels are made on the concept pipeline, which cannot place real product photos yet
+  const carouselAvailable = conceptPipelineActive({ imageProviderOverridden: isDesignProviderOverridden() }) && !(product?.images || []).length;
+  const resolved = resolveDesignFormat({ explicit, plannedFormat: planItem?.format || null, caption: pub.content, carouselAvailable });
+  return { ...resolved, current: currentDesignFormat(pub), mismatch: formatMismatch(pub, planItem?.format || null) };
+}
+
+/** postDesignFormat for a post of this project, in its API shape (null when the post is not in the project). */
+export async function designFormatFor(projectId, publicationId) {
+  if (typeof publicationId !== 'string' || !mongoose.Types.ObjectId.isValid(publicationId)) return null;
+  const pub = await SocialPublication.findOne({ _id: toId(publicationId), project_id: toId(projectId) }).lean();
+  return pub ? toApiDesignFormat(await postDesignFormat(pub)) : null;
+}
+
+/** The API shape of postDesignFormat (no caption text). */
+export const toApiDesignFormat = (f) => (f ? {
+  recommended: f.format, source: f.source, plannedFormat: f.plannedFormat, current: f.current, mismatch: f.mismatch,
+  carousel: { allowed: f.carousel.allowed && f.carousel.available, available: f.carousel.available, points: f.carousel.points, source: f.carousel.source, style: f.carousel.style },
+  needsChoice: f.needsChoice, code: f.code, message: f.message,
+} : null);
+
+/**
+ * Content Approvals' "Generate design" / "Regenerate design": the format is worked out again on every call (never inherited from the
+ * previous version). Single -> the one-image pipeline; carousel -> one hook concept, then the carousel (hook, points, CTA), attached
+ * to the post like Creative Studio's. A carousel that cannot be made is refused with the question to ask - never quietly a single image.
+ * input: { publicationId, contentVersion, replaceApproved?, format?: 'single' | 'carousel' }
+ */
+export async function startPostDesign(projectId, userId, input = {}, { background = true } = {}) {
+  const { publicationId } = input || {};
+  const pub = typeof publicationId === 'string' && mongoose.Types.ObjectId.isValid(publicationId)
+    ? await SocialPublication.findOne({ _id: toId(publicationId), project_id: toId(projectId) }).lean() : null;
+  // not found / invalid: the one-image path returns the right error
+  if (!pub) return startDesignGeneration(projectId, userId, { publicationId, contentVersion: input?.contentVersion, replaceApproved: input?.replaceApproved }, { background });
+  const resolved = await postDesignFormat(pub, { explicit: input?.format });
+  LoggerUtil.info(`${EVENT} design_format_resolved`, { event: 'design_format_resolved', projectId: String(projectId), publicationId: String(pub._id), format: resolved.format, source: resolved.source, plannedFormat: resolved.plannedFormat, needsChoice: resolved.needsChoice, carouselSource: resolved.carousel.source });
+  if (resolved.needsChoice) return fail(resolved.code, resolved.message, { format: toApiDesignFormat(resolved) });
+  if (resolved.format === 'single') {
+    const r = await startDesignGeneration(projectId, userId, { publicationId, contentVersion: input?.contentVersion, replaceApproved: input?.replaceApproved }, { background });
+    return r.success ? { ...r, format: 'single' } : r;
+  }
+  return startConceptCarousel(projectId, userId, input, { background });
+}
+
+/** A carousel without the Compare step: ONE hook concept is written and picked, then rendered as the carousel (runConceptRender). */
+export async function startConceptCarousel(projectId, userId, input = {}, { background = true } = {}) {
+  const checked = await loadDesignablePost(projectId, input?.publicationId, input?.contentVersion);
+  if (!checked.success) return checked;
+  const { pub } = checked;
+  if (pub.approvalState === 'design_approved' && (pub.media || []).length && input?.replaceApproved !== true) return fail('DESIGN_ALREADY_APPROVED', 'This design is already approved. Replacing it sends the post back to design review.');
+  if (!carouselEligibility(pub.content).allowed) return fail('CAROUSEL_NEEDS_POINTS', FORMAT_MESSAGES.CHOSEN_NO_POINTS);
+  if (!getDesignProvider()?.isAvailable?.()) return fail('AI_UNAVAILABLE', DESIGN_FAILURE_MESSAGES.AI_UNAVAILABLE);
+  await recoverStaleDesignGenerations(projectId, { publicationId: String(pub._id) });
+  const running = await SocialDesignGeneration.findOne({ publication_id: pub._id, active: true }).lean();
+  if (running) return { success: true, started: false, alreadyRunning: true, format: 'carousel', generation: running.studio?.pipeline === 'concept' ? toApiConceptGeneration(running, pub) : null };
+
+  const lockedBy = `${INSTANCE}:${crypto.randomUUID()}`;
+  let rec;
+  try {
+    rec = await SocialDesignGeneration.create({
+      project_id: pub.project_id, publication_id: pub._id, status: 'generating', active: true, mode: 'studio', platform: pub.platform, contentVersion: pub.contentVersion,
+      baseDesignVersion: pub.designVersion, baseApprovalState: pub.approvalState, replaceApproved: input?.replaceApproved === true, provider: 'openai', size: CONCEPT_SIZES.portrait.request,
+      studio: { pipeline: 'concept', phase: 'render', format: 'carousel', action: 'auto_carousel' },
+      candidates: [{ slot: 0, status: 'pending' }],
+      generation: { startedAt: new Date(), lockedBy, stage: 'concept', promptVersion: 'concept-studio-v1' }, cost: { usd: 0, calls: [] }, requestedBy: userId || null,
+    });
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+    const active = await SocialDesignGeneration.findOne({ publication_id: pub._id, active: true }).lean();
+    return { success: true, started: false, alreadyRunning: true, format: 'carousel', generation: active ? toApiConceptGeneration(active, pub) : null };
+  }
+  LoggerUtil.info(`${EVENT} auto_carousel_started`, { event: 'auto_carousel_started', projectId: String(projectId), publicationId: String(pub._id), generationId: String(rec._id) });
+  const job = async () => {
+    const lock = { _id: rec._id, active: true, 'generation.lockedBy': lockedBy };
+    const ids = { projectId: String(projectId), publicationId: String(pub._id), generationId: String(rec._id) };
+    try {
+      const { brand, input: pin } = await pipelineContext(pub);
+      const brief = await generateCreativeBrief({ ...pin, count: 1, brand, format: 'single_image', direction: 'This is the HOOK concept of a carousel: the cover slide that makes people swipe.' });
+      await recordCalls(lock, ids, brief.calls.map((c) => ({ kind: 'text', ...c })));
+      const concept = brief.concepts[0];
+      const picked = await SocialDesignGeneration.findOneAndUpdate(lock, { $set: { 'candidates.0.status': 'ready', 'candidates.0.concept': concept, 'candidates.0.label': `${STYLE_LABELS[concept.visual_style] || concept.visual_style} · ${concept.layout.replace(/_/g, ' ')}` } }, { new: true }).lean();
+      if (!picked) return null;
+      await SocialDesignGeneration.updateOne(lock, { $set: { 'studio.pickedCandidateId': picked.candidates[0]._id } });
+    } catch (error) {
+      if (error?.calls) await recordCalls(lock, ids, error.calls.map((c) => ({ kind: 'text', ...c })));
+      const f = designFailureFor(error);
+      await SocialDesignGeneration.updateOne(lock, { $set: { status: 'failed', active: false, 'generation.stage': null, 'generation.finishedAt': new Date(), failure: { code: f.code, message: f.message, at: new Date() } } });
+      LoggerUtil.error(`${EVENT} auto_carousel_failed`, { event: 'auto_carousel_failed', ...ids, failureCode: f.code, providerCode: error?.code || null });
+      return null;
+    }
+    return runConceptRender(rec._id, lockedBy, userId);
+  };
+  const done = runInBackground(job, background);
+  if (done) await done;
+  const fresh = await SocialDesignGeneration.findById(rec._id).lean();
+  return { success: true, started: true, alreadyRunning: false, format: 'carousel', generation: toApiConceptGeneration(fresh, await SocialPublication.findById(pub._id).lean()) };
 }
 
 export async function runConceptRender(generationId, lockedBy, userId = null) {
@@ -417,10 +526,11 @@ export async function runConceptRender(generationId, lockedBy, userId = null) {
         let pointsSource = 'caption';
         if (listed.length >= MIN_CAROUSEL_POINTS && listed.length <= MAX_CAROUSEL_POINTS) carouselPoints = listed;
         else {
-          const outlined = await outlineCaptionPoints({ caption: input.caption });
+          // 9-10 listed items are merged into at most 8 (Instagram: 10 slides with the hook and CTA); no list -> Claude outlines the caption
+          const outlined = await outlineCaptionPoints({ caption: input.caption, listed: listed.length ? listed : null });
           await recordCalls(lock, ids, outlined.calls.map((c) => ({ kind: 'text', ...c })));
           carouselPoints = outlined.points;
-          pointsSource = 'outline';
+          pointsSource = listed.length > MAX_CAROUSEL_POINTS ? 'merge' : 'outline';
         }
         await SocialDesignGeneration.updateOne(lock, { $set: { 'carousel.points': carouselPoints, 'carousel.pointsSource': pointsSource } });
       }

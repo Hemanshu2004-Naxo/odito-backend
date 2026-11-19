@@ -21,7 +21,8 @@ export const BRIEF_TOOL = 'emit_design_concepts';
 export const JUDGE_TOOL = 'judge_headlines';
 
 export const words = (s) => String(s || '').trim().split(/\s+/).filter(Boolean);
-export const normalise = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9%$€£ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+// NFKC first: "bold" caption letters (mathematical bold 𝗦𝗹𝗼𝘄) compare as the plain letters they stand for
+export const normalise = (s) => String(s || '').normalize('NFKC').toLowerCase().replace(/[^a-z0-9%$€£ ]+/g, ' ').replace(/\s+/g, ' ').trim();
 /** Removes negated clauses ("no handshake, no lightbulb", "never a glass ceiling") before a banned-word check. */
 export const withoutNegations = (s) => String(s || '').replace(/\b(no|not|never|avoid|without|instead of|rather than|replace[sd]?)\b[^.;]*/gi, '');
 
@@ -79,6 +80,8 @@ export function briefToolSchema(count) {
 export const SHARED_RULES = `- NO MADE-UP FACTS. Never state a number, statistic, percentage, price, result, client name, award, ranking or promise ("guaranteed", "#1", "double your...") unless it appears in the caption or the business facts. When in doubt, leave it out.
 - Banned visual clichés (never in an idea or an image prompt): ${BANNED_CLICHES.join('; ')}.
 - NO SENSITIVE METAPHORS: never use an image with a strong social, political, religious or identity reading - e.g. a "glass ceiling" (reads as gender/racial discrimination, especially with a woman), chains or shackles, prison bars, border walls, flags, protests, weapons, disability as a metaphor. Choose a neutral, literal business scene that cannot be misread (a cramped low-ceilinged office, a stack of client work that has hit the ceiling).
+- THE PICTURE CARRIES THE MESSAGE, NOT THE KEYWORDS: a viewer must take the headline's meaning from the picture. "Three things holding your website back" needs something held back, weighed down or blocked - not a three-legged stool (that reads as stability, the opposite). Never pick an object only because it matches a word or a number in the headline.
+- NO WEB ADDRESSES as words in the idea: the website is never part of the picture or the headline (Odito adds the bare domain itself where it belongs).
 - ONE STYLE PER IMAGE: a photo is a real photo throughout; an editorial illustration has an illustrated or solid-colour background (never a blurred photo, bokeh or depth of field); a 3D render has a rendered or solid background.
 - READABLE SYMBOLS: prefer a literal scene whose meaning is obvious. Declare every object that stands for something in "symbols" - at most ${MAX_SYMBOLS} (never a row of five icons); when objects must stand for things (services, tasks, problems), use at most two, give each a clear, simple pictogram icon in the picture or name it with an image label of 1-2 words. Never build the idea on something that would need WRITING inside the picture (a sign, a sticky note, a "No Vacancy" card, a label on a folder) - the picture has no text, so it would be blank. A before/after or split comparison: the image_prompt must describe a picture split into two clearly different halves (left = before, right = after), and the concept gets two image labels ("Before" / "After" or similar) - Odito adds the arrow.
 - HEADLINES: write ${HEADLINE_CANDIDATES} different candidates, then pick the most natural. Natural spoken English with a clear subject and verb, readable in one second. No riddles ("Your ceiling isn't clients."), no personified abstractions ("Delivery work is running you."), no puns that need the caption to make sense.
