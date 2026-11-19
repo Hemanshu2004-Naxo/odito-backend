@@ -14,7 +14,7 @@ import { loadDesignablePost } from './socialDesignStudioService.js';
 import { conceptPipelineActive, conceptBrand, conceptInput, recentConcepts, withBrandFonts, PIPELINE } from './concept/conceptDesign.js';
 import { generateCreativeBrief, reviseConcept, words } from './concept/creativeBrief.js';
 import { renderConcept } from './concept/conceptPipeline.js';
-import { planCarousel, regenerateSlides, captionPoints, getSlide } from './concept/carousel.js';
+import { planCarousel, regenerateSlides, captionPoints, carouselEligibility, outlineCaptionPoints, getSlide } from './concept/carousel.js';
 import { referenceFrom } from './concept/conceptPipeline.js';
 import { claudeCostUsd, imageCostUsd, MIN_CAROUSEL_POINTS, MAX_CAROUSEL_POINTS } from './concept/conceptConfig.js';
 import { CONCEPT_SIZES } from './designConfig.js';
@@ -48,7 +48,7 @@ export const MAX_CAROUSEL_SLIDES = 10;
 const STYLE_LABELS = { photo: 'Photo', '3d_render': '3D render', editorial_illustration: 'Editorial illustration', bold_typographic: 'Bold type' };
 
 export const CONCEPT_STUDIO_MESSAGES = Object.freeze({
-  NOT_A_LIST: 'A carousel needs a caption with 3 to 6 numbered points. Use a single image, or add the points to the caption.',
+  NOT_A_LIST: 'This caption is too short to split into carousel slides. Use a single image, or write a longer caption.',
   CANDIDATE_NOT_READY: 'That concept is not ready yet.',
   SLIDE_NOT_FOUND: 'That slide was not found.',
   TOO_FEW_SLIDES: 'A carousel needs at least 2 slides.',
@@ -207,8 +207,7 @@ export async function startConceptCompare(projectId, userId, input = {}, { backg
   if (!checked.success) return checked;
   const { pub } = checked;
   if (format === 'carousel') {
-    const n = captionPoints(pub.content).length;
-    if (n < MIN_CAROUSEL_POINTS || n > MAX_CAROUSEL_POINTS) return fail('CAROUSEL_NEEDS_POINTS', CONCEPT_STUDIO_MESSAGES.NOT_A_LIST);
+    if (!carouselEligibility(pub.content).allowed) return fail('CAROUSEL_NEEDS_POINTS', CONCEPT_STUDIO_MESSAGES.NOT_A_LIST);
   }
   await recoverStaleDesignGenerations(projectId, { publicationId: String(pub._id) });
   const running = await SocialDesignGeneration.findOne({ publication_id: pub._id, active: true }).lean();
@@ -350,8 +349,7 @@ export async function startConceptRender(projectId, userId, input = {}, { backgr
   if (!cand || cand.status !== 'ready' || !cand.concept) return fail('CANDIDATE_NOT_READY', CONCEPT_STUDIO_MESSAGES.CANDIDATE_NOT_READY);
   const format = input?.format === 'carousel' || input?.format === 'single' ? input.format : (rec.studio?.format || 'single');
   if (format === 'carousel') {
-    const n = captionPoints(pub.content).length;
-    if (n < MIN_CAROUSEL_POINTS || n > MAX_CAROUSEL_POINTS) return fail('CAROUSEL_NEEDS_POINTS', CONCEPT_STUDIO_MESSAGES.NOT_A_LIST);
+    if (!carouselEligibility(pub.content).allowed) return fail('CAROUSEL_NEEDS_POINTS', CONCEPT_STUDIO_MESSAGES.NOT_A_LIST);
   }
   const claim = await claimExisting(rec, pub, { 'studio.phase': 'render', 'studio.format': format, 'studio.action': 'render', 'studio.pickedCandidateId': cand._id, replaceApproved: input?.replaceApproved === true, 'generation.stage': 'concept', slides: [] });
   if (!claim) return fail('GENERATION_IN_PROGRESS', CONCEPT_STUDIO_MESSAGES.GENERATION_IN_PROGRESS);
@@ -412,9 +410,23 @@ export async function runConceptRender(generationId, lockedBy, userId = null) {
       // CAROUSEL: the chosen concept is the hook
       await SocialDesignGeneration.updateOne(lock, { $set: { 'generation.stage': 'concept' } });
       const c0 = cand.concept;
+      // the points: stored ones (same caption version), else the caption's own 3-6 point list, else Claude's outline of the caption
+      let carouselPoints = Array.isArray(rec.carousel?.points) && rec.carousel.points.length ? rec.carousel.points : null;
+      if (!carouselPoints) {
+        const listed = captionPoints(input.caption);
+        let pointsSource = 'caption';
+        if (listed.length >= MIN_CAROUSEL_POINTS && listed.length <= MAX_CAROUSEL_POINTS) carouselPoints = listed;
+        else {
+          const outlined = await outlineCaptionPoints({ caption: input.caption });
+          await recordCalls(lock, ids, outlined.calls.map((c) => ({ kind: 'text', ...c })));
+          carouselPoints = outlined.points;
+          pointsSource = 'outline';
+        }
+        await SocialDesignGeneration.updateOne(lock, { $set: { 'carousel.points': carouselPoints, 'carousel.pointsSource': pointsSource } });
+      }
       // the SPLIT brief: the look + hook first (the hook picture starts at once), the other slides written in parallel meanwhile
       const plan = await planCarousel({
-        ...input, brand,
+        ...input, brand, points: carouselPoints,
         direction: `Hook slide: use THIS chosen concept - idea: ${c0.big_idea}; visual style: ${c0.visual_style}; headline: "${c0.hook_headline}"; picture: ${c0.image_prompt}. Every other slide continues the same world and style.`,
       });
       await recordCalls(lock, ids, plan.calls.map((c) => ({ kind: 'text', ...c })));
@@ -524,7 +536,7 @@ export async function regenerateCarouselSlide(projectId, userId, input = {}, { b
       if (slide.key !== 'hook' && !reference) throw Object.assign(new Error('reference missing'), { code: 'DESIGN_FILE_MISSING' });
       await SocialDesignGeneration.updateOne({ ...lock, 'slides.key': slide.key }, { $set: { 'slides.$.status': 'generating', 'slides.$.stage': 'image' } });
       const c = rec.carousel.brief;
-      const [out] = await regenerateSlides({ carousel: c, ids: [slide.key], reference, provider: getDesignProvider(), brand, input: pin, points: captionPoints(pub.content), quality: FINAL_QUALITY });
+      const [out] = await regenerateSlides({ carousel: c, ids: [slide.key], reference, provider: getDesignProvider(), brand, input: pin, points: Array.isArray(rec.carousel?.points) && rec.carousel.points.length ? rec.carousel.points : captionPoints(pub.content), quality: FINAL_QUALITY });
       if (out.error) throw Object.assign(new Error('slide failed'), { code: out.error.code });
       const media = await storeDesign(out.png, String(projectId), pub.platform); stored.push(media.url);
       const picture = await storePicture(out.picture, String(projectId)); stored.push(picture.url);

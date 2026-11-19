@@ -87,8 +87,33 @@ const pendingMetaConnectionSchema = new mongoose.Schema({
         name: { type: String, default: null },
         category: { type: String, default: null },
         picture: { type: String, default: null },
-        accessToken: { type: String, required: true, set: encryptToken, get: decryptToken },
+        // Not required: Meta occasionally lists a Page without a Page token
+        // (task-restricted). It used to fail validation and break the whole
+        // Page list; now it is cached, shown as "can't be connected", and
+        // refused at selection (selectMetaPage's page_missing_token path).
+        accessToken: { type: String, default: null, set: encryptToken, get: decryptToken },
         tasks: { type: [String], default: [] },
+        // Where discovery found it: 'accounts' (/me/accounts), 'granted' (in the
+        // token's granted Page IDs but not listed), 'business' (a granted
+        // Business Portfolio's owned/client Page). Additive.
+        source: { type: String, default: 'accounts' },
+      },
+    ],
+    default: [],
+    _id: false,
+  },
+  // Pages a granted Business Portfolio owns/shares that Meta refused for this
+  // app (not ticked in the consent dialog). Names only — never a token.
+  // Shown greyed in the picker so a Page never silently disappears.
+  unsharedPages: {
+    type: [
+      {
+        id: { type: String, required: true },
+        name: { type: String, default: null },
+        picture: { type: String, default: null },
+        businessId: { type: String, default: null },
+        businessName: { type: String, default: null },
+        reason: { type: String, default: 'NOT_SHARED_WITH_APP' },
       },
     ],
     default: [],

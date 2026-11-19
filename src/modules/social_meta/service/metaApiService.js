@@ -19,7 +19,7 @@ import { LoggerUtil } from '../../../utils/LoggerUtil.js';
 
 const DEFAULT_TIMEOUT_MS = 10000;
 
-function graphApiVersion() {
+export function graphApiVersion() {
   // Single source of truth — every caller gets the version from here,
   // never a literal string embedded in a URL elsewhere in the codebase.
   // Both base URLs below derive from this same function so there is only

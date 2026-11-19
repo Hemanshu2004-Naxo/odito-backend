@@ -6,7 +6,9 @@
 // none of which a fake token can ever produce from the real Meta API.
 import metaApiService from './metaApiService.js';
 import { LoggerUtil } from '../../../utils/LoggerUtil.js';
-import { isAuthenticationFailure } from './metaErrorClassifier.js';
+import { isAuthenticationFailure, isRateLimited } from './metaErrorClassifier.js';
+// Default export (not a named import) so tests can substitute getGrantedTargets.
+import metaTokenService from './metaTokenService.js';
 
 /**
  * MetaPageService — Facebook Page discovery (GET /me/accounts) built on
@@ -103,12 +105,196 @@ export async function getUserPages(userAccessToken) {
 }
 
 function normalizeFailure(result) {
-  LoggerUtil.service('MetaPages', 'get_user_pages', 'failed', { status: result.status });
+  LoggerUtil.service('MetaPages', 'get_user_pages', 'failed', { status: result.status, code: result.data?.error?.code ?? null });
+
+  // Throttled (e.g. code 4 'Application request limit reached', sent as HTTP 403): the token is fine — say so, never 'invalid or expired'.
+  if (isRateLimited(result)) {
+    return { success: false, pages: [], error: { code: 'META_RATE_LIMITED', message: 'Meta is limiting requests from Odito right now. Wait a few minutes, then try again.' } };
+  }
 
   if (isAuthenticationFailure(result)) {
     return { success: false, pages: [], error: { code: 'META_PAGE_ACCESS_DENIED', message: 'Meta access token is invalid or expired' } };
   }
   return { success: false, pages: [], error: { code: 'META_PAGES_FETCH_FAILED', message: 'Failed to retrieve Facebook Pages' } };
+}
+
+// ── Extended discovery: granted Pages /me/accounts omits + Business Portfolio Pages ──
+//
+// /me/accounts lists the Pages the person has a role on. It is NOT the full
+// set the app was granted: a Page reachable only through a Business
+// Portfolio assignment is granted (pages_show_list target_ids) and loadable
+// by ID with its Page token, yet absent from /me/accounts. And Pages a
+// granted portfolio owns but that were not ticked in the consent dialog
+// silently vanished, with nothing telling the user why. Both paths below use
+// only the USER token and documented Graph edges (GET /debug_token,
+// GET /{page-id}, GET /me/businesses, GET /{business-id}/owned_pages and
+// /client_pages — business_management), live-verified on v21.0.
+//
+// Best-effort by design: any failure here only means fewer extra Pages; the
+// /me/accounts result is never lost because of it.
+
+const PAGE_LOOKUP_FIELDS = 'id,name,category,picture{url},access_token';
+const BUSINESS_PAGE_FIELDS = 'id,name,picture{url}';
+const MAX_BUSINESSES = 50;
+const MAX_DIRECT_LOOKUPS = 100;
+const MAX_EDGE_BATCHES = 10;
+// One call for every portfolio and both of its Page lists (field expansion) instead of 1 + 2 per portfolio.
+const BUSINESS_WITH_PAGES_FIELDS = `id,name,owned_pages.limit(100){${BUSINESS_PAGE_FIELDS}},client_pages.limit(100){${BUSINESS_PAGE_FIELDS}}`;
+
+/** Follows paging.next for a list edge. Returns { ok, items, error }. */
+async function listEdge(path, params, userAccessToken, context) {
+  const items = [];
+  let result = await metaApiService.request({ method: 'GET', path, params: { ...params, limit: 100 }, accessToken: userAccessToken, context });
+  let batches = 0;
+  while (result.success) {
+    const batch = Array.isArray(result.data?.data) ? result.data.data : [];
+    items.push(...batch);
+    batches += 1;
+    const next = result.data?.paging?.next;
+    if (!next || batches >= MAX_EDGE_BATCHES) return { ok: true, items, error: null };
+    result = await metaApiService.requestAbsolute({ method: 'GET', url: next, context: `${context}_page` });
+  }
+  return { ok: false, items, error: { status: result.status, code: result.data?.error?.code ?? null, rateLimited: isRateLimited(result) } };
+}
+
+/** Loads one Page by ID with the user token — succeeds only when the app was granted that Page. */
+async function lookupPage(pageId, userAccessToken) {
+  const result = await metaApiService.request({ method: 'GET', path: `/${pageId}`, params: { fields: PAGE_LOOKUP_FIELDS }, accessToken: userAccessToken, context: 'meta_lookup_granted_page' });
+  if (!result.success || !result.data?.id) return { ok: false, code: result.data?.error?.code ?? null, status: result.status, rateLimited: isRateLimited(result) };
+  const d = result.data;
+  return {
+    ok: true,
+    page: { id: String(d.id), name: d.name || null, category: d.category || null, picture: d.picture?.data?.url || null, accessToken: d.access_token || null, tasks: [] },
+  };
+}
+
+/**
+ * Every Business Portfolio with its owned + client Pages. Preferred: ONE call
+ * with field expansion (owned_pages{...},client_pages{...} on /me/businesses).
+ * If Meta rejects that form (anything but a rate limit), falls back to the
+ * per-portfolio edges. An absent edge key just means "no Pages there".
+ * Returns { ok, businesses: [{ id, name, pages: [{ id, name, picture }] }], error, calls }.
+ */
+async function listBusinessesWithPages(userAccessToken) {
+  const toPages = (edge) => (Array.isArray(edge?.data) ? edge.data : []).map((x) => ({ id: String(x.id), name: x.name || null, picture: x.picture?.data?.url || null }));
+  const expanded = await listEdge('/me/businesses', { fields: BUSINESS_WITH_PAGES_FIELDS }, userAccessToken, 'meta_list_businesses_with_pages');
+  if (expanded.ok) {
+    return {
+      ok: true,
+      calls: 'expanded',
+      businesses: expanded.items.slice(0, MAX_BUSINESSES).map((b) => ({ id: String(b.id), name: b.name || null, pages: [...toPages(b.owned_pages), ...toPages(b.client_pages)] })),
+      error: null,
+    };
+  }
+  if (expanded.error?.rateLimited) return { ok: false, calls: 'expanded', businesses: [], error: expanded.error };
+
+  // Fallback: 1 + 2 calls per portfolio.
+  const plain = await listEdge('/me/businesses', { fields: 'id,name' }, userAccessToken, 'meta_list_businesses');
+  if (!plain.ok) return { ok: false, calls: 'per_edge', businesses: [], error: plain.error };
+  const businesses = [];
+  const errors = [];
+  for (const b of plain.items.slice(0, MAX_BUSINESSES)) {
+    const pages = [];
+    for (const edge of ['owned_pages', 'client_pages']) {
+      const list = await listEdge(`/${b.id}/${edge}`, { fields: BUSINESS_PAGE_FIELDS }, userAccessToken, `meta_list_business_${edge}`);
+      if (!list.ok) {
+        errors.push({ step: edge, businessId: String(b.id), ...list.error });
+        if (list.error.rateLimited) return { ok: false, calls: 'per_edge', businesses, error: list.error, errors };
+      }
+      pages.push(...list.items.map((x) => ({ id: String(x.id), name: x.name || null, picture: x.picture?.data?.url || null })));
+    }
+    businesses.push({ id: String(b.id), name: b.name || null, pages });
+  }
+  return { ok: true, calls: 'per_edge', businesses, error: null, errors };
+}
+
+/**
+ * Finds Pages beyond /me/accounts. Returns
+ *   { pages: [{ ...page, source }], unsharedPages: [{ id, name, picture, businessId, businessName, reason }], diagnostics, excluded }
+ * `pages` are connectable (granted, Page token issued or not — a missing
+ * token is shown, never hidden); `unsharedPages` belong to a granted
+ * Business Portfolio but were not shared with this app in the consent dialog.
+ *
+ * Call budget (Meta rate-limits the whole app per rolling hour — code 4,
+ * live-hit Nov 2026): 1 debug_token + 1 portfolio call + one lookup per
+ * granted-but-unlisted Page. A portfolio Page outside a RESTRICTED grant is
+ * reported as not shared without a lookup (Meta would refuse it anyway);
+ * only an unrestricted grant needs lookups. The first rate-limit answer
+ * stops everything that is left. Never throws.
+ */
+export async function discoverAdditionalPages(userAccessToken, { knownPageIds = [] } = {}) {
+  const known = new Set(knownPageIds.map(String));
+  const pages = [];
+  const unsharedPages = [];
+  const excluded = [];
+  const diagnostics = { grantedTargets: null, grantedAdded: 0, businesses: null, businessCalls: null, businessPages: 0, businessAdded: 0, unshared: 0, lookups: 0, rateLimited: false, errors: [] };
+
+  if (process.env.META_EXTENDED_PAGE_DISCOVERY === 'off') return { pages, unsharedPages, diagnostics: { ...diagnostics, skipped: 'disabled' }, excluded };
+
+  try {
+    // 1. Pages the token was granted that /me/accounts did not list.
+    const granted = await metaTokenService.getGrantedTargets(userAccessToken);
+    const grantedIds = granted.success ? granted.byScope.pages_show_list : null;
+    const restricted = Array.isArray(grantedIds);
+    if (!granted.success) diagnostics.errors.push({ step: 'granted_targets', reason: granted.reason });
+    diagnostics.grantedTargets = restricted ? grantedIds.length : (granted.success ? 'unrestricted' : null);
+    const grantedSet = new Set(restricted ? grantedIds : []);
+
+    const tried = new Set();
+    const tryAdd = async (pageId, source) => {
+      if (known.has(pageId) || tried.has(pageId) || diagnostics.lookups >= MAX_DIRECT_LOOKUPS || diagnostics.rateLimited) return null;
+      tried.add(pageId);
+      diagnostics.lookups += 1;
+      const found = await lookupPage(pageId, userAccessToken);
+      if (found.rateLimited) diagnostics.rateLimited = true;
+      if (found.ok) {
+        known.add(pageId);
+        pages.push({ ...found.page, source });
+        if (!found.page.accessToken) excluded.push({ id: pageId, reason: 'NO_PAGE_TOKEN' });
+      }
+      return found;
+    };
+
+    for (const id of restricted ? grantedIds : []) {
+      if (diagnostics.rateLimited) break;
+      const found = await tryAdd(id, 'granted');
+      if (found?.ok) diagnostics.grantedAdded += 1;
+      else if (found) excluded.push({ id, reason: found.rateLimited ? 'RATE_LIMITED' : `GRANTED_LOOKUP_FAILED_${found.code ?? found.status}` });
+    }
+
+    // 2. Pages owned by / shared with the granted Business Portfolios.
+    if (!diagnostics.rateLimited) {
+      const portfolio = await listBusinessesWithPages(userAccessToken);
+      diagnostics.businessCalls = portfolio.calls;
+      if (portfolio.error) {
+        diagnostics.errors.push({ step: 'businesses', ...portfolio.error });
+        if (portfolio.error.rateLimited) diagnostics.rateLimited = true;
+      }
+      for (const e of portfolio.errors || []) diagnostics.errors.push(e);
+      diagnostics.businesses = portfolio.businesses.length;
+
+      for (const business of portfolio.businesses) {
+        for (const item of business.pages) {
+          diagnostics.businessPages += 1;
+          if (known.has(item.id) || unsharedPages.some((u) => u.id === item.id)) continue;
+          // Restricted grant: a Page outside it is not shared — no call needed. Unrestricted: ask Meta.
+          if (!restricted || grantedSet.has(item.id)) {
+            const found = await tryAdd(item.id, 'business');
+            if (found?.ok) { diagnostics.businessAdded += 1; continue; }
+            if (found?.rateLimited || diagnostics.rateLimited) continue; // unknown, not "not shared"
+          }
+          if (known.has(item.id)) continue;
+          unsharedPages.push({ id: item.id, name: item.name, picture: item.picture, businessId: business.id, businessName: business.name, reason: 'NOT_SHARED_WITH_APP' });
+          excluded.push({ id: item.id, reason: 'NOT_SHARED_WITH_APP' });
+        }
+      }
+    }
+    diagnostics.unshared = unsharedPages.length;
+  } catch (error) {
+    LoggerUtil.error('[META_PAGES] Extended Page discovery failed', { message: error.message }, {});
+    diagnostics.errors.push({ step: 'unexpected', reason: 'EXCEPTION' });
+  }
+  return { pages, unsharedPages, diagnostics, excluded };
 }
 
 // ── Phase 3: Facebook Page -> Instagram Business/Professional Account ──────
@@ -215,4 +401,4 @@ function normalizeInstagramProfileFailure(result) {
   return { success: false, profile: null, error: { code: 'META_INSTAGRAM_PROFILE_FAILED', message: 'Failed to retrieve the Instagram profile' } };
 }
 
-export default { getUserPages, getPageInstagramAccount, getInstagramProfile };
+export default { getUserPages, discoverAdditionalPages, getPageInstagramAccount, getInstagramProfile };

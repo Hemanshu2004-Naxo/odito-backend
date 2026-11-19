@@ -348,14 +348,15 @@ export async function runGeneration(strategyId, lockedBy) {
     let feedback = [];
     const rejected = []; // sanitized record of every attempt Odito's validation refused: paths + codes + rules, never values
     for (let i = 0; i <= STRATEGY_MAX_REPAIR_ATTEMPTS && !validated; i += 1) {
-      const result = await provider.generateStrategy({ system, user: buildUserPrompt({ snapshotData, profileGaps, previous, repairFeedback: feedback, planning }), generationId: String(strategyId) });
+      const result = await provider.generateStrategy({ system, user: buildUserPrompt({ snapshotData, profileGaps, previous, repairFeedback: feedback, planning }), generationId: String(strategyId), competitorNames: (snapshotData.competitors || []).map((c) => c.name) });
       attempts += result.attempts || 1;
       usage.inputTokens += result.usage?.inputTokens || 0;
       usage.outputTokens += result.usage?.outputTokens || 0;
       model = result.model || model;
       const check = validateStrategyOutput(result.parsed, {
         prohibitedPhrases: snapshotData.prohibitedPhrases,
-        suppliedCompetitors: (snapshotData.competitors || []).map((c) => c.name),
+        // { name, website } so a competitor named by its domain still matches
+        suppliedCompetitors: (snapshotData.competitors || []).map((c) => ({ name: c.name, website: c.website })),
         allowedFactsText: snapshotFactsText(snapshotData),
         expectedPlatforms: planning?.platforms || null,
       });

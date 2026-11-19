@@ -46,6 +46,18 @@ const CAPTION = ['Most agencies hit a growth ceiling - not because of clients, b
   '3. Delivery quality is slipping under volume', 'Quality is the first thing to suffer.', '',
   'Which of these signs sounds familiar? Drop your answer in the comments.'].join('\n');
 
+// The same caption with NO list (prose): Odito must outline it into points with Claude before the carousel can be planned.
+const PROSE_CAPTION = ['Most agencies hit a growth ceiling - not because of clients, but because of capacity.', '',
+  'You\'re turning down new service requests. Your team simply cannot take on more delivery.',
+  'Your team is stretched across too many services. One team can only do so much well.',
+  'Delivery quality is slipping under volume. Quality is the first thing to suffer.', '',
+  'Which of these signs sounds familiar? Drop your answer in the comments.'].join('\n');
+const OUTLINE_ANSWER = { points: [
+  { text: 'You\'re turning down new service requests', source: 'turning down new service requests' },
+  { text: 'Your team is stretched across too many services', source: 'stretched across too many services' },
+  { text: 'Delivery quality is slipping under volume', source: 'Delivery quality is slipping under volume' },
+] };
+
 const PROMPT = 'A real photograph of one cramped low-ceilinged agency office at dusk, warm desk lamp, navy walls, burnt-orange folders, one clear subject on the desk, the bottom 45% of the frame a darker calm desk front with no objects for the text.';
 const heads = (h) => [h, `${h} now`, `So, ${h}`, `${h} today`, `${h} again`];
 const concept = (i) => ({
@@ -77,6 +89,7 @@ function claude({ qcFor = () => QC() } = {}) {
       log.push(req.tool.name);
       if (req.tool.name === 'emit_design_concepts') return done({ concepts: [0, 1, 2].map(concept) });
       if (req.tool.name === 'emit_carousel_look' || req.tool.name === 'emit_carousel_slide') return done(splitAnswer(CAROUSEL(), req));
+      if (req.tool.name === 'emit_carousel_points') return done(OUTLINE_ANSWER);
       if (req.tool.name === 'judge_headlines') {
         const sets = [...req.user.matchAll(/<set id="([^"]+)"[^>]*>\n([\s\S]*?)\n<\/set>/g)].map((m) => ({ id: m[1], scores: m[2].split('\n').map((l) => ({ headline: l.replace(/^- /, ''), natural: 5, clear: 5, fits: 5, issue: '' })) }));
         return done({ sets });
@@ -153,12 +166,12 @@ describe('Concept Studio (real MongoDB + sharp + storage; Claude and the image m
     for (const id of ids) await removeProjectMedia(id);
   });
 
-  async function carouselPost({ qcFor } = {}) {
+  async function carouselPost({ qcFor, content } = {}) {
     const { brief, qc } = claude({ qcFor });
     setBriefProviderOverride(brief); setQualityProviderOverride(qc);
     const provider = imageProvider();
     setDesignProviderOverride(provider);
-    const pub = await seedPost();
+    const pub = await seedPost(content);
     const compare = await startConceptCompare(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'carousel' }, { background: false });
     assert.equal(compare.success, true, JSON.stringify(compare));
     const fresh = await row(pub.id);
@@ -211,6 +224,34 @@ describe('Concept Studio (real MongoDB + sharp + storage; Claude and the image m
     assert.equal(metaCalls.length, 0);
     const slides = await getCarouselSlides(pid, pub.id);
     assert.equal(slides.generation.slides.length, 5);
+  });
+
+  test('2b: a caption with NO list (prose) becomes a carousel: Claude outlines 3 points once, they are stored and used for every slide', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const state0 = await (async () => { const { brief, qc } = claude(); setBriefProviderOverride(brief); setQualityProviderOverride(qc); setDesignProviderOverride(imageProvider()); const pb = await seedPost(PROSE_CAPTION); return { st: await getStudioState(pid, pb.id) }; })();
+    assert.equal(state0.st.formats.carousel.allowed, true, 'the Carousel option is enabled for a caption without a list');
+    assert.equal(state0.st.formats.carousel.source, 'outline');
+    const { render, brief, pub } = await carouselPost({ content: PROSE_CAPTION });
+    const g = render.generation;
+    assert.equal(g.status, 'ready', JSON.stringify(g.failure));
+    assert.deepEqual(g.slides.map((s) => s.key), ['hook', 'p1', 'p2', 'p3', 'cta']);
+    assert.equal(brief.log.filter((n) => n === 'emit_carousel_points').length, 1, 'outlined once');
+    const rec = await SocialDesignGeneration.findById(g.id).lean();
+    assert.equal(rec.carousel.pointsSource, 'outline');
+    assert.deepEqual(rec.carousel.points.map((p) => p.text), OUTLINE_ANSWER.points.map((p) => p.text));
+    assert.ok((rec.cost?.calls || []).some((c) => c.step === 'carousel_outline'), 'the outline call is costed');
+    assert.equal((await row(pub.id)).media.length, 5);
+  });
+
+  test('2c: a too-short caption is refused as a carousel with a clear message', async (t) => {
+    if (!mongoAvailable) return t.skip('local MongoDB not reachable');
+    const { brief, qc } = claude(); setBriefProviderOverride(brief); setQualityProviderOverride(qc); setDesignProviderOverride(imageProvider());
+    const pub = await seedPost('Big news this week. Stay tuned.');
+    const st = await getStudioState(pid, pub.id);
+    assert.equal(st.formats.carousel.allowed, false);
+    const r = await startConceptCompare(pid, userId, { publicationId: pub.id, contentVersion: 1, format: 'carousel' }, { background: false });
+    assert.equal(r.success, false);
+    assert.equal(r.error?.code || r.code, 'CAROUSEL_NEEDS_POINTS');
   });
 
   test('3: approving the design approves the WHOLE carousel; regenerating one slide makes a new design version back in Design Review, same position', async (t) => {

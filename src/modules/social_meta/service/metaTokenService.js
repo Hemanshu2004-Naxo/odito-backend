@@ -231,4 +231,40 @@ export async function verifyProjectAccounts(projectId) {
   return out;
 }
 
-export default { inspectToken, markAccountExpired, applyInspection, verifyAccount, verifyProjectAccounts, REASON_TOKEN_INVALID };
+/**
+ * Which objects a USER token was granted, per permission — Meta's
+ * `granular_scopes` on GET /debug_token. With Business / granular consent the
+ * user picks Pages and Business Portfolios in the dialog, and each permission
+ * then carries `target_ids` (the exact Page / Business IDs). A permission with
+ * no `target_ids` is unrestricted (null here).
+ *
+ * This matters because /me/accounts does NOT list every granted Page: a Page
+ * reachable only through a Business Portfolio assignment is granted (it is in
+ * pages_show_list's target_ids, and GET /{page-id}?fields=access_token works)
+ * but missing from /me/accounts — live-confirmed Nov 2026 (17 granted, 14
+ * listed).
+ *
+ * Never throws. { success:false } when the check could not run.
+ */
+export async function getGrantedTargets(userToken) {
+  const appToken = appAccessToken();
+  if (!userToken || !appToken) return { success: false, reason: appToken ? 'NO_TOKEN' : 'META_APP_NOT_CONFIGURED' };
+  const result = await metaApiService.request({
+    method: 'GET',
+    path: '/debug_token',
+    params: { input_token: userToken },
+    accessToken: appToken,
+    context: 'meta_debug_token_granular',
+  });
+  const data = result.success ? result.data?.data : null;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return { success: false, reason: 'DEBUG_TOKEN_REQUEST_FAILED' };
+
+  const byScope = {};
+  for (const entry of Array.isArray(data.granular_scopes) ? data.granular_scopes : []) {
+    if (!entry?.scope) continue;
+    byScope[entry.scope] = Array.isArray(entry.target_ids) ? entry.target_ids.map(String) : null;
+  }
+  return { success: true, byScope };
+}
+
+export default { inspectToken, markAccountExpired, applyInspection, verifyAccount, verifyProjectAccounts, getGrantedTargets, REASON_TOKEN_INVALID };

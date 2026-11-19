@@ -383,6 +383,8 @@ export async function enrichPagesWithConnectionState({ projectId, pages }) {
       name: page.name,
       category: page.category,
       picture: page.picture,
+      ...(page.source !== undefined ? { source: page.source } : {}),
+      ...(page.canConnect !== undefined ? { canConnect: page.canConnect } : {}),
       alreadyConnected: !!match,
       isActive: !!match?.isActive,
     };

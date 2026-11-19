@@ -90,7 +90,19 @@ export function isAuthenticationFailure(result) {
   const metaError = result?.data?.error || null;
   if (TOKEN_ERROR_CODES.has(metaError?.code) || TOKEN_ERROR_SUBCODES.has(metaError?.error_subcode)) return true;
   if (isPermissionDenied(metaError)) return false;
+  // Meta sends throttling (code 4 "Application request limit reached", 17, 32,
+  // 613, 80000-80014) and transient errors as HTTP 403/400 too. Those say
+  // nothing about the token — treating them as "dead token" showed users
+  // "Meta access token is invalid or expired" and could expire healthy
+  // connections during a rate limit (live incident, Nov 2026).
+  if (isRateLimited(result) || TRANSIENT_CODES.has(metaError?.code)) return false;
   return result?.status === 401 || result?.status === 403;
+}
+
+/** True when Meta is throttling the app / user / Page — retry later; the token is fine. */
+export function isRateLimited(result) {
+  const code = result?.data?.error?.code;
+  return RATE_LIMIT_CODES.has(code) || isBusinessUseCaseRateLimit(code) || result?.status === 429;
 }
 
 /**
@@ -205,4 +217,4 @@ export function classifyMetaFailure(result, { platform = 'facebook', finalPublis
   };
 }
 
-export default { CATEGORY, OUTCOME, classifyMetaFailure, isAuthenticationFailure };
+export default { CATEGORY, OUTCOME, classifyMetaFailure, isAuthenticationFailure, isRateLimited };

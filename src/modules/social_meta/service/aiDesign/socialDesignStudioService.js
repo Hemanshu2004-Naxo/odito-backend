@@ -62,9 +62,8 @@ const FORMAT_LABELS = Object.freeze({
 
 /** The post text split into the caption and its trailing hashtag block (hashtags are part of the real publication text). */
 import { usesConceptStudio, latestConceptRecord, toApiConceptGeneration, getDesignCosts } from './conceptStudioService.js';
-import { captionPoints } from './concept/carousel.js';
+import { carouselEligibility } from './concept/carousel.js';
 import { matchFamily } from './compose/designFonts.js';
-import { MIN_CAROUSEL_POINTS, MAX_CAROUSEL_POINTS } from './concept/conceptConfig.js';
 
 export function splitContent(text) {
   const value = String(text || '');
@@ -202,13 +201,15 @@ export async function getStudioState(projectId, publicationId, { now = new Date(
 async function conceptStudioState(pub, ctx, projectId, rec) {
   const concept = await usesConceptStudio(pub, ctx?.liveProfile || null);
   if (!concept) return { pipeline: 'rules', generation: toApiStudioGeneration(rec, pub) };
-  const points = captionPoints(pub.content).length;
-  const carouselAllowed = points >= MIN_CAROUSEL_POINTS && points <= MAX_CAROUSEL_POINTS;
+  // a numbered/bulleted 3-6 point list, or a caption long enough for Claude to split into 3-6 slides
+  const eligible = carouselEligibility(pub.content);
+  const carouselAllowed = eligible.allowed;
+  const points = eligible.points;
   const latest = await latestConceptRecord(projectId, String(pub._id));
   const costs = await getDesignCosts(projectId, { publicationId: String(pub._id) });
   return {
     pipeline: 'concept',
-    formats: { single: { allowed: true }, carousel: { allowed: carouselAllowed, points, reason: carouselAllowed ? null : 'A carousel needs a caption with 3 to 6 numbered points.' } },
+    formats: { single: { allowed: true }, carousel: { allowed: carouselAllowed, points, source: eligible.source, reason: carouselAllowed ? null : 'This caption is too short to split into carousel slides.' } },
     costs: { currency: costs.currency, post: costs.post, month: costs.month },
     generation: toApiConceptGeneration(latest, pub),
   };

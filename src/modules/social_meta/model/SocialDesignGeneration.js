@@ -129,6 +129,10 @@ const socialDesignGenerationSchema = new mongoose.Schema({
   },
   carousel: {
     brief: { type: mongoose.Schema.Types.Mixed, default: null },
+    // The carousel's points ([{ number, text }]): the caption's own numbered/bulleted list, or Claude's outline of the caption
+    // (pointsSource 'outline'). Stored so every later step (slides, a regenerated slide) uses the same points. Additive.
+    points: { type: mongoose.Schema.Types.Mixed, default: null },
+    pointsSource: { type: String, default: null },
     reference: { url: { type: String, default: null, maxlength: 600 }, storageKey: { type: String, default: null, maxlength: 200 } },
   },
 

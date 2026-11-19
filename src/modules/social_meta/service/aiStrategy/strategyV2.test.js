@@ -193,6 +193,33 @@ describe('strategy schema v2 — competitor analysis', () => {
     assert.equal(check((s) => { s.competitorAnalysis.competitorsConsidered = ['Anyone']; }).ok, true, 'without the supplied list nothing is cross-checked (test seam)');
   });
 
+  test('17b: a supplied competitor matches however the model writes it, and is stored as the business wrote it (live incident Nov 2026)', () => {
+    const ctx = { suppliedCompetitors: [{ name: 'Semrush', website: 'https://www.semrush.com/' }, { name: 'Ahrefs', website: 'https://ahrefs.com/' }] };
+    for (const written of [
+      ['Semrush - https://www.semrush.com/', 'Ahrefs - https://ahrefs.com/'], // the prompt's own line format
+      ['SEMrush', 'ahrefs'],
+      ['Semrush (semrush.com)', 'Ahrefs (ahrefs.com)'],
+      ['semrush.com', 'https://ahrefs.com'],
+      ['Semrush', 'Semrush.com', 'Ahrefs'], // duplicates collapse
+    ]) {
+      const r = check((s) => { s.competitorAnalysis.competitorsConsidered = written; }, ctx);
+      assert.equal(r.ok, true, `${JSON.stringify(written)}: ${JSON.stringify(r.errors)}`);
+      assert.deepEqual(r.strategy.competitorAnalysis.competitorsConsidered, ['Semrush', 'Ahrefs']);
+    }
+    rejects((s) => { s.competitorAnalysis.competitorsConsidered = ['Semrush', 'Moz']; }, /was not supplied by the business/, ctx);
+    rejects((s) => { s.competitorAnalysis.competitorsConsidered = ['Semrush Rival Inc']; }, /was not supplied/, ctx);
+  });
+
+  test('17c: the tool schema only lets the model pick a supplied competitor name (none when none were supplied)', () => {
+    const withNames = buildStrategyToolSchema({ competitorNames: ['Semrush', 'Ahrefs', 'Semrush'] }).properties.competitorAnalysis.properties.competitorsConsidered;
+    assert.deepEqual(withNames.items.enum, ['Semrush', 'Ahrefs']);
+    assert.equal(withNames.maxItems, 2);
+    const none = buildStrategyToolSchema({ competitorNames: [] }).properties.competitorAnalysis.properties.competitorsConsidered;
+    assert.equal(none.maxItems, 0);
+    const legacy = buildStrategyToolSchema().properties.competitorAnalysis.properties.competitorsConsidered;
+    assert.equal(legacy.items.enum, undefined, 'no list given: unchanged free-text schema');
+  });
+
   test('18: opportunities, gaps and recommendations are bounded short lists', () => {
     for (const k of ['differentiationOpportunities', 'contentGaps', 'recommendations']) {
       rejects((s) => { s.competitorAnalysis[k] = Array.from({ length: LIMITS.competitor.itemsMax * 4 }, (_, i) => `x${i}`); }, new RegExp(k));

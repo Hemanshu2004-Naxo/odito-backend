@@ -2,7 +2,9 @@ import { issueMetaOAuthState, consumeMetaOAuthState, readCookie, bindingCookieOp
 import { buildAuthorizationUrl, exchangeCodeForToken, exchangeForLongLivedToken, fetchGrantedScopes } from '../service/metaOAuthService.js';
 import { inspectToken } from '../service/metaTokenService.js';
 import { getFrontendUrl } from '../../../config/env.js';
-import { getUserPages } from '../service/metaPageService.js';
+import crypto from 'crypto';
+import { getUserPages, discoverAdditionalPages } from '../service/metaPageService.js';
+import { graphApiVersion } from '../service/metaApiService.js';
 import { discoverInstagramForPage } from '../service/metaInstagramService.js';
 import { persistDiscoveredFacebookPages, enrichPagesWithConnectionState } from '../service/facebookAccountService.js';
 import PendingMetaConnection, { PENDING_TTL_MS } from '../model/PendingMetaConnection.js';
@@ -296,6 +298,27 @@ export async function handleMetaCallback(req, res) {
  * null — never throws — when there is nothing usable; callers turn that
  * into a stable METHOD-level error response.
  */
+/**
+ * The callback reads granted permissions once (GET /me/permissions). When that
+ * call fails — e.g. Meta rate-limits the app (code 4) right after login — the
+ * pending connection was left with scopes:[] and every Page then persisted as
+ * "not publishing-ready" although the grant was complete. Re-read them here
+ * (the Page list and the Page selection both call this) until they arrive.
+ * Still empty after a failed re-read = honestly unknown, never assumed.
+ */
+async function ensureGrantedScopes(pending, projectId) {
+  if (Array.isArray(pending.scopes) && pending.scopes.length > 0) return pending.scopes;
+  const scopes = await fetchGrantedScopes(pending.userAccessToken);
+  if (scopes.length > 0) {
+    pending.scopes = scopes;
+    await pending.save();
+    LoggerUtil.service('MetaOAuth', 'granted_scopes', 'recovered', { projectId, count: scopes.length });
+  } else {
+    LoggerUtil.service('MetaOAuth', 'granted_scopes', 'still_unavailable', { projectId });
+  }
+  return pending.scopes;
+}
+
 async function loadActivePendingConnection(userId, projectId) {
   const pending = await PendingMetaConnection.findOne({ user_id: userId, project_id: projectId });
   if (!pending) return null;
@@ -330,21 +353,52 @@ export async function getMetaPages(req, res) {
     }
 
     if (pending.pages.length === 0) {
+      await ensureGrantedScopes(pending, projectId);
+      const correlationId = crypto.randomUUID();
+      LoggerUtil.info('META_PAGE_DISCOVERY_START', { correlationId, projectId, apiVersion: graphApiVersion(), methods: ['me_accounts', 'granted_page_ids', 'business_portfolios'] });
+
       const result = await getUserPages(pending.userAccessToken);
       if (!result.success) {
         LoggerUtil.service('MetaPages', 'list', 'discovery_failed', { projectId, code: result.error?.code });
-        return res.status(502).json(ResponseUtil.error(result.error.message, 502, { code: result.error.code }));
+        LoggerUtil.info('META_PAGE_DISCOVERY_COMPLETE', { correlationId, projectId, ok: false, code: result.error?.code });
+        // Rate limited: 429 and the pending connection stays, so "Try again" works once Meta's window clears.
+        const httpStatus = result.error?.code === 'META_RATE_LIMITED' ? 429 : 502;
+        return res.status(httpStatus).json(ResponseUtil.error(result.error.message, httpStatus, { code: result.error.code }));
       }
 
-      pending.pages = result.pages;
+      // /me/accounts misses granted Pages reachable only through a Business
+      // Portfolio, and says nothing about portfolio Pages not shared with this
+      // app — see discoverAdditionalPages. Best-effort: never fails the list.
+      const extra = await discoverAdditionalPages(pending.userAccessToken, { knownPageIds: result.pages.map((p) => p.id) });
+
+      pending.pages = [...result.pages.map((p) => ({ ...p, source: 'accounts' })), ...extra.pages];
+      pending.unsharedPages = extra.unsharedPages;
       await pending.save();
+
+      LoggerUtil.info('META_PAGE_DISCOVERY_COMPLETE', {
+        correlationId,
+        projectId,
+        ok: true,
+        fromAccounts: result.pages.length,
+        ...extra.diagnostics,
+        total: pending.pages.length,
+        withoutPageToken: pending.pages.filter((p) => !p.accessToken).length,
+        pages: pending.pages.map((p) => ({ id: p.id, name: p.name, source: p.source, hasAccessToken: !!p.accessToken })),
+        excluded: extra.excluded,
+      });
     }
 
+    // canConnect: a Page Meta listed WITHOUT a Page token is still shown (never silently dropped) but can't be selected.
     const safePages = pending.pages.map((page) => ({
       id: page.id,
       name: page.name,
       category: page.category,
       picture: page.picture,
+      source: page.source || 'accounts',
+      canConnect: !!page.accessToken,
+    }));
+    const unsharedPages = (pending.unsharedPages || []).map((u) => ({
+      id: u.id, name: u.name, picture: u.picture, businessName: u.businessName, reason: u.reason,
     }));
 
     // Cross-referenced against this project's already-persisted
@@ -355,7 +409,7 @@ export async function getMetaPages(req, res) {
     const enrichedPages = await enrichPagesWithConnectionState({ projectId, pages: safePages });
 
     LoggerUtil.service('MetaPages', 'list', 'completed', { projectId, pageCount: enrichedPages.length });
-    return res.json(ResponseUtil.success({ pages: enrichedPages }));
+    return res.json(ResponseUtil.success({ pages: enrichedPages, unsharedPages }));
   } catch (error) {
     LoggerUtil.error('[META_PAGES] Failed to list Pages', { message: error.message }, { projectId });
     return res.status(500).json(ResponseUtil.error('Failed to load Facebook Pages', 500, { code: 'META_PAGES_FETCH_FAILED' }));
@@ -437,7 +491,7 @@ export async function selectMetaPage(req, res) {
       // The scopes ACTUALLY granted for this connection (fetched from
       // Meta at callback time — see handleMetaCallback), never the
       // requested META_OAUTH_SCOPES list.
-      scopes: pending.scopes,
+      scopes: await ensureGrantedScopes(pending, projectId),
     });
 
     if (!activeAccount) {

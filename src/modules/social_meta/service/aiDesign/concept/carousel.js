@@ -21,13 +21,94 @@ export const CAROUSEL_TOOL = 'emit_carousel';
 const str = (description, maxLength) => ({ type: 'string', description, ...(maxLength ? { maxLength } : {}) });
 
 /** The numbered points of a caption ("1. ...", "2) ..."), in order - the carousel gets one slide per point. */
+// A bullet line: "• ...", "- ...", "* ...", "– ...", "✓ ...", "✅ ...", "→ ..." (the marker, then a space).
+const BULLET_RE = /^(?:[•●▪◦‣∙·*✓✔✅➤►→▶-]|[–—])️?\s+(.+)$/u;
+
 export function captionPoints(caption) {
-  const out = [];
-  for (const line of String(caption || '').split(/\n/)) {
-    const m = line.trim().match(/^(\d{1,2})[.)]\s+(.+)$/);
-    if (m) out.push({ number: Number(m[1]), text: m[2].trim() });
+  const lines = String(caption || '').split(/\n/).map((l) => l.trim());
+  const numbered = [];
+  for (const line of lines) {
+    const m = line.match(/^(\d{1,2})[.)]\s+(.+)$/);
+    if (m) numbered.push({ number: Number(m[1]), text: m[2].trim() });
   }
-  return out.filter((p, i) => p.number === i + 1);
+  const inOrder = numbered.filter((p, i) => p.number === i + 1);
+  if (inOrder.length >= MIN_CAROUSEL_POINTS && inOrder.length <= MAX_CAROUSEL_POINTS) return inOrder;
+  // A bulleted list counts the same way (most captions use bullets, not numbers).
+  const bullets = lines.map((l) => l.match(BULLET_RE)?.[1]?.trim()).filter(Boolean);
+  if (bullets.length >= MIN_CAROUSEL_POINTS && bullets.length <= MAX_CAROUSEL_POINTS) return bullets.map((text, i) => ({ number: i + 1, text }));
+  return inOrder;
+}
+
+/** A caption with no 3-6 point list can still become a carousel when it says enough to split into slides. */
+export const MIN_OUTLINE_WORDS = 40;
+
+/**
+ * Can this caption become a carousel, and how: { allowed, points, source: 'caption' | 'outline' | null }.
+ * 'caption' = its own numbered/bulleted 3-6 points; 'outline' = Claude splits the caption into 3-6 points (outlineCaptionPoints).
+ */
+export function carouselEligibility(caption) {
+  const listed = captionPoints(caption);
+  if (listed.length >= MIN_CAROUSEL_POINTS && listed.length <= MAX_CAROUSEL_POINTS) return { allowed: true, points: listed.length, source: 'caption' };
+  const body = String(caption || '').replace(/(^|\s)#\S+/g, ' ');
+  if (words(body).length >= MIN_OUTLINE_WORDS) return { allowed: true, points: null, source: 'outline' };
+  return { allowed: false, points: listed.length, source: null };
+}
+
+const OUTLINE_TOOL = 'emit_carousel_points';
+const OUTLINE_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['points'],
+  properties: {
+    points: {
+      type: 'array', minItems: MIN_CAROUSEL_POINTS, maxItems: MAX_CAROUSEL_POINTS,
+      items: {
+        type: 'object', additionalProperties: false, required: ['text', 'source'],
+        properties: {
+          text: str(`The point, at most ${MAX_POINT_SLIDE_WORDS} words: a plain restatement of ONE idea of the caption.`, 120),
+          source: str('The caption words this point comes from, copied exactly (at least 3 words).', 300),
+        },
+      },
+    },
+  },
+};
+
+/**
+ * Splits a caption that has no 3-6 point list into 3-6 carousel points, in the caption's order. Checked in code: every point must
+ * quote the caption words it comes from (verbatim), add no figure the caption doesn't have, stay short, and not repeat another point.
+ * One repair. Returns { points: [{ number, text }], calls }. Throws CAROUSEL_NEEDS_POINTS (with calls) when it can't.
+ */
+export async function outlineCaptionPoints({ caption }) {
+  const calls = [];
+  let feedback = [];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const res = await briefProvider().generateStructured({
+      system: `You split a social media caption into the points of an Instagram/Facebook carousel: ${MIN_CAROUSEL_POINTS} to ${MAX_CAROUSEL_POINTS} points, one slide each, in the caption's order. Each point restates ONE idea that the caption itself makes - no new facts, figures, names, promises or advice. Skip the hook line, the call to action, questions to the audience and hashtags. Group small related items (e.g. a list of examples) into one point rather than dropping them.`,
+      user: `<caption>\n${caption}\n</caption>${feedback.length ? `\n\nYour previous answer broke these rules - fix them:\n- ${feedback.join('\n- ')}` : ''}`,
+      tool: { name: OUTLINE_TOOL, description: 'Emit the carousel points. Call this exactly once.', schema: OUTLINE_SCHEMA },
+      model: CONCEPT_TEXT_MODEL, maxTokens: 1200, timeoutMs: CONCEPT_TIMEOUT_MS, retries: 1,
+    });
+    calls.push({ step: attempt === 1 ? 'carousel_outline' : 'carousel_outline_repair', model: res.model, usage: res.usage, durationMs: res.durationMs });
+    const raw = Array.isArray(res.parsed?.points) ? res.parsed.points : [];
+    const errors = [];
+    if (raw.length < MIN_CAROUSEL_POINTS || raw.length > MAX_CAROUSEL_POINTS) errors.push(`give ${MIN_CAROUSEL_POINTS} to ${MAX_CAROUSEL_POINTS} points (you gave ${raw.length})`);
+    const seen = new Set();
+    const points = raw.map((p, i) => {
+      const text = String(p?.text || '').trim();
+      const quote = normalise(p?.source || '');
+      if (!text) errors.push(`point ${i + 1}: empty`);
+      if (words(text).length > MAX_POINT_SLIDE_WORDS) errors.push(`point ${i + 1}: more than ${MAX_POINT_SLIDE_WORDS} words`);
+      if (words(quote).length < 3 || !normalise(caption).includes(quote)) errors.push(`point ${i + 1}: source must copy at least 3 words of the caption exactly`);
+      const claims = unsupportedClaims(text, caption);
+      if (claims.length) errors.push(`point ${i + 1}: states ${claims.join(', ')}, which the caption does not`);
+      const key = normalise(text);
+      if (seen.has(key)) errors.push(`point ${i + 1}: repeats another point`);
+      seen.add(key);
+      return { number: i + 1, text };
+    });
+    if (!errors.length) return { points, calls };
+    feedback = errors.slice(0, 8);
+  }
+  throw Object.assign(new Error('NOT_A_LIST'), { code: 'CAROUSEL_NEEDS_POINTS', reason: 'outline_invalid', errors: feedback, calls });
 }
 
 function carouselSchema(points) {
@@ -255,7 +336,8 @@ export async function withConcurrency(tasks, limit) {
 export { slideIds, getSlide };
 
 export async function generateCarouselBrief(input) {
-  const points = captionPoints(input.caption);
+  // input.points: the carousel's stored points (an outlined caption); else the caption's own list
+  const points = Array.isArray(input.points) && input.points.length ? input.points : captionPoints(input.caption);
   if (points.length < MIN_CAROUSEL_POINTS || points.length > MAX_CAROUSEL_POINTS) throw Object.assign(new Error('NOT_A_LIST'), { code: 'CAROUSEL_NEEDS_POINTS', reason: `points_${points.length}` });
   const tool = { name: CAROUSEL_TOOL, description: 'Emit the carousel. Call this exactly once.', schema: carouselSchema(points.length) };
   const calls = [];
@@ -333,7 +415,8 @@ async function writeSlide({ input, points, look, kind, point = null }) {
  * Returns { look, partial, points, hookJudge, rest: Promise<{ carousel, judge, repairs, calls }>, calls, durationMs }. Throws BRIEF_INVALID / CLAUDE_*.
  */
 export async function planCarousel(input) {
-  const points = captionPoints(input.caption);
+  // input.points: the carousel's stored points (an outlined caption); else the caption's own list
+  const points = Array.isArray(input.points) && input.points.length ? input.points : captionPoints(input.caption);
   if (points.length < MIN_CAROUSEL_POINTS || points.length > MAX_CAROUSEL_POINTS) throw Object.assign(new Error('NOT_A_LIST'), { code: 'CAROUSEL_NEEDS_POINTS', reason: `points_${points.length}` });
   const started = Date.now();
   const calls = [];
@@ -481,4 +564,4 @@ export async function generateCarousel({ input, provider, brand, logo = null, sh
   };
 }
 
-export default { planCarousel, generateCarousel, generateCarouselBrief, regenerateSlides, reviseSlide, validateCarousel, captionPoints, slideOfError, CAROUSEL_TOOL };
+export default { planCarousel, generateCarousel, generateCarouselBrief, regenerateSlides, reviseSlide, validateCarousel, captionPoints, carouselEligibility, outlineCaptionPoints, slideOfError, CAROUSEL_TOOL };

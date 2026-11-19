@@ -73,11 +73,11 @@ export class ClaudeStrategyProvider extends ClaudeCampaignProvider {
   }
 
   /** The AI Strategy call: the strategy tool with the strategy budget. */
-  async generateStrategy({ system, user }) {
+  async generateStrategy({ system, user, competitorNames = null }) {
     return this.generateStructured({
       system,
       user,
-      tool: { name: STRATEGY_TOOL_NAME, description: 'Emit the structured social media strategy. Call this exactly once.', schema: buildStrategyToolSchema() },
+      tool: { name: STRATEGY_TOOL_NAME, description: 'Emit the structured social media strategy. Call this exactly once.', schema: buildStrategyToolSchema({ competitorNames }) },
     });
   }
 

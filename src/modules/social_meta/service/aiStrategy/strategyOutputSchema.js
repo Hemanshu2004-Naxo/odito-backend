@@ -75,9 +75,14 @@ export const LIMITS = Object.freeze({
 const str = (maxLength, description) => ({ type: 'string', maxLength, ...(description ? { description } : {}) });
 const strList = (maxItems, maxLength, minItems = 0) => ({ type: 'array', minItems, maxItems, items: { type: 'string', maxLength } });
 
-export function buildStrategyToolSchema() {
+export function buildStrategyToolSchema({ competitorNames = null } = {}) {
   const L = LIMITS;
-  return {
+  // When the business supplied competitors, the model may only pick from those exact names (and none when none were supplied).
+  const names = Array.isArray(competitorNames) ? [...new Set(competitorNames.map((n) => String(n || '').trim()).filter(Boolean))] : null;
+  const competitorsConsidered = names === null
+    ? strList(L.competitor.namesMax, L.competitor.name)
+    : { type: 'array', maxItems: Math.min(L.competitor.namesMax, names.length), description: names.length ? 'Exactly as written here; only these.' : 'None were supplied: leave empty.', items: names.length ? { type: 'string', enum: names } : { type: 'string' } };
+  const schema = {
     type: 'object',
     additionalProperties: false,
     required: ['summary', 'overview', 'brandAnalysis', 'positioning', 'audience', 'goals', 'contentPillars', 'contentMix', 'trendingTopics', 'workingHooks', 'competitorAnalysis', 'platformStrategy', 'toneAndVoice', 'postingStrategy', 'hashtagStrategy', 'ctaStrategy', 'brandRules', 'recommendations', 'assumptions', 'gaps', 'planOutlook'],
@@ -166,7 +171,7 @@ export function buildStrategyToolSchema() {
         type: 'object', additionalProperties: false, required: ['competitorsConsidered', 'differentiationOpportunities', 'contentGaps', 'recommendations'],
         description: 'ONLY from the competitors the business supplied (names and websites). You cannot see their content: never describe what a competitor actually posts. If none were supplied, return empty lists.',
         properties: {
-          competitorsConsidered: strList(L.competitor.namesMax, L.competitor.name),
+          competitorsConsidered,
           differentiationOpportunities: strList(L.competitor.itemsMax, L.competitor.item),
           contentGaps: strList(L.competitor.itemsMax, L.competitor.item),
           recommendations: strList(L.competitor.itemsMax, L.competitor.item),
@@ -235,6 +240,7 @@ export function buildStrategyToolSchema() {
       },
     },
   };
+  return schema;
 }
 
 // ── server-side validation ───────────────────────────────────────────────────
@@ -398,6 +404,37 @@ function collectStrings(value, out, skipPaths, path = '') {
 }
 
 /**
+ * Comparison key for a competitor name: case, punctuation, a "- website" suffix, a parenthetical, a URL and a
+ * domain's www./TLD are all ignored, so "Semrush - https://www.semrush.com/" and "SEMrush" give the same key.
+ */
+export function competitorKey(value) {
+  let s = String(value ?? '').toLowerCase().trim();
+  s = s.split(/\s+[-–—|:]\s+/)[0]; // "Name - website" (the prompt's own line format)
+  s = s.replace(/\([^)]*\)/g, ' ');
+  s = s.replace(/https?:\/\/(?:www\.)?([a-z0-9-]+)[^\s]*/g, '$1');
+  s = s.replace(/\b(?:www\.)?([a-z0-9-]+)\.[a-z]{2,}(?:\.[a-z]{2})?\b\/?/g, '$1');
+  return s.replace(/[^a-z0-9]+/g, '');
+}
+
+function websiteKey(website) {
+  const m = String(website || '').toLowerCase().match(/^(?:https?:\/\/)?(?:www\.)?([a-z0-9-]+)\./);
+  return m ? m[1].replace(/[^a-z0-9]+/g, '') : '';
+}
+
+/** key -> the competitor's name as the business supplied it. Accepts names, or { name, website } objects. */
+export function suppliedCompetitorIndex(supplied) {
+  const index = new Map();
+  for (const entry of supplied || []) {
+    const name = String(typeof entry === 'object' && entry ? entry.name || '' : entry || '').trim();
+    if (!name) continue;
+    for (const key of [competitorKey(name), typeof entry === 'object' && entry ? websiteKey(entry.website) : '']) {
+      if (key && !index.has(key)) index.set(key, name);
+    }
+  }
+  return index;
+}
+
+/**
  * @param {unknown} raw  the model's tool input
  * @param {object} [context]
  * @param {string[]} [context.prohibitedPhrases]
@@ -540,10 +577,19 @@ export function validateStrategyOutput(raw, { prohibitedPhrases = [], suppliedCo
     recommendations: compList('recommendations'),
   };
   if (Array.isArray(suppliedCompetitors)) {
-    const allowed = new Set(suppliedCompetitors.map((n) => String(n).trim().toLowerCase()).filter(Boolean));
+    // A supplied competitor counts however the model writes it ("SEMrush", "Semrush - https://www.semrush.com/" — the
+    // prompt's own line format —, "Semrush (semrush.com)", "semrush.com") and is stored as the business wrote it. Live
+    // incident Nov 2026: two attempts in a row named exactly the 2 supplied competitors in such a form and the whole
+    // 5-minute strategy failed as AI_BAD_OUTPUT. A competitor that matches nothing supplied is still refused.
+    const allowed = suppliedCompetitorIndex(suppliedCompetitors);
+    const seen = new Set();
+    const canonical = [];
     strategy.competitorAnalysis.competitorsConsidered.forEach((name, i) => {
-      if (!allowed.has(name.toLowerCase())) c.fail(`competitorAnalysis.competitorsConsidered[${i}]`, `"${name}" was not supplied by the business — do not name competitors that were not supplied`);
+      const match = allowed.get(competitorKey(name));
+      if (!match) { c.fail(`competitorAnalysis.competitorsConsidered[${i}]`, `"${name}" was not supplied by the business — do not name competitors that were not supplied`); return; }
+      if (!seen.has(match)) { seen.add(match); canonical.push(match); }
     });
+    strategy.competitorAnalysis.competitorsConsidered = canonical;
   }
 
   if (!Array.isArray(raw.platformStrategy) || raw.platformStrategy.length < 1 || raw.platformStrategy.length > PLATFORMS.length) c.fail('platformStrategy', 'needs 1-2 platforms');
